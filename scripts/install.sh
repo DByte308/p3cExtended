@@ -4,7 +4,7 @@
 #   scripts/install.sh [--check] [--no-envision] [--udev] [--system]
 #
 # default        check build deps, clone/fetch the pinned sources (sources.lock) into PIMAX_SRC, apply
-#                patches/monado on branch pimax-linux and patches/envision on branch pimax, build and install
+#                patches/monado on branch pimax-linux, patches/basalt and patches/envision on branch pimax, build and install
 #                Basalt + Monado + Envision + tools into PIMAX_PREFIX (Envision into PIMAX_PREFIX/opt/envision-pimax),
 #                copy headset configs, the WirePlumber rule and the environment.d file.
 # --check        only report missing build dependencies and exit (0 = nothing missing, 1 = something missing)
@@ -48,6 +48,7 @@ MONADO_BUILD="$PIMAX_CACHE/monado-build"
 ENVISION_BUILD="$PIMAX_CACHE/envision-build"
 ENVISION_PREFIX="$PIMAX_PREFIX/opt/envision-pimax"
 MONADO_BRANCH=pimax-linux
+BASALT_BRANCH=pimax
 ENVISION_BRANCH=pimax
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -368,7 +369,7 @@ missing (Pimax driver: Corrosion, Ceres, OpenCV; compositor: Vulkan, glslangVali
 # Steps
 # ---------------------------------------------------------------------------------------------------------------
 build_basalt() {
-    step "Basalt (${PIN_BRANCH[basalt]} @ ${PIN_REV[basalt]:0:12}) -> $PIMAX_PREFIX"
+    step "Basalt (${PIN_BRANCH[basalt]} @ ${PIN_REV[basalt]:0:12} + patches) -> $PIMAX_PREFIX"
     info "updating submodules"
     g "$BASALT_SRC" submodule sync -q --recursive
     g "$BASALT_SRC" submodule update -q --init --recursive
@@ -529,7 +530,7 @@ report_deps || die "install the missing dependencies first (nothing was changed)
 
 step "Sources -> $PIMAX_SRC"
 checkout_pinned pimax-configs "$CONFIGS_SRC"
-checkout_pinned basalt "$BASALT_SRC"
+checkout_patched basalt "$BASALT_SRC" "$BASALT_BRANCH" "$PIMAX_REPO/patches/basalt"
 checkout_patched monado "$MONADO_SRC" "$MONADO_BRANCH" "$PIMAX_REPO/patches/monado"
 [ "$ENVISION" = 1 ] && checkout_patched envision "$ENVISION_SRC" "$ENVISION_BRANCH" "$PIMAX_REPO/patches/envision"
 

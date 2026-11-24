@@ -1,0 +1,61 @@
+From 798d396e31c48b909751d6d03c62dd9b8ff83e15 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:29:19 +0100
+Subject: [PATCH] optical flow: take a new keypoint's patch from its own camera
+
+Keypoints detected in a camera other than cam0 (the areas that do not
+overlap with cam0) stored their tracking patches from cam0's image at the
+same pixel position. Tracking them then compared against unrelated image
+content, so they were lost almost at once and those cameras contributed no
+landmarks. The recall path of the frame-to-frame flow re-sampled patches from
+cam0 the same way when updating a patch viewpoint.
+
+On a four-camera headset the two side cameras had no landmarks at all.
+With the patch taken from the detecting camera they keep 40-70 and 10-60
+landmarks while moving, the trajectory stays within 3 cm of the previous
+one on the same recording, and the run time is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/basalt/optical_flow/frame_to_frame_optical_flow.h | 4 ++--
+ include/basalt/optical_flow/patch_optical_flow.h          | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/include/basalt/optical_flow/frame_to_frame_optical_flow.h b/include/basalt/optical_flow/frame_to_frame_optical_flow.h
+index 87675bd..01e72d1 100644
+--- a/include/basalt/optical_flow/frame_to_frame_optical_flow.h
++++ b/include/basalt/optical_flow/frame_to_frame_optical_flow.h
+@@ -560,7 +560,7 @@ class FrameToFrameOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+         for (int l = 0; l <= config.optical_flow_levels; l++) {
+           Scalar scale = 1 << l;
+           Vector2 pos_scaled = curr_pose.translation() / scale;
+-          lm_patch[l] = PatchT(pyramid->at(0).lvl(l), pos_scaled);
++          lm_patch[l] = PatchT(pyramid->at(cam_id).lvl(l), pos_scaled);
+         }
+       }
+ 
+@@ -593,7 +593,7 @@ class FrameToFrameOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+         for (int l = 0; l <= config.optical_flow_levels; l++) {
+           Scalar scale = 1 << l;
+           Vector2 pos_scaled = pos / scale;
+-          p.emplace_back(pyramid->at(0).lvl(l), pos_scaled);
++          p.emplace_back(pyramid->at(cam_id).lvl(l), pos_scaled);
+         }
+       }
+ 
+diff --git a/include/basalt/optical_flow/patch_optical_flow.h b/include/basalt/optical_flow/patch_optical_flow.h
+index a523778..6e02640 100644
+--- a/include/basalt/optical_flow/patch_optical_flow.h
++++ b/include/basalt/optical_flow/patch_optical_flow.h
+@@ -428,7 +428,7 @@ class PatchOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+       for (int l = 0; l <= config.optical_flow_levels; l++) {
+         Scalar scale = 1 << l;
+         Vector2 pos_scaled = pos / scale;
+-        p.emplace_back(pyramid->at(0).lvl(l), pos_scaled);
++        p.emplace_back(pyramid->at(cam_id).lvl(l), pos_scaled);
+       }
+ 
+       Eigen::AffineCompact2f transform = Eigen::AffineCompact2f::Identity();
+-- 
+2.56.0
+

@@ -1,0 +1,50 @@
+From 3800339a5c8805c4e77837fead7ed61078a81fa5 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:53:30 +0100
+Subject: [PATCH 37/38] t/constellation: count prior-gate rejections per
+ device, with the reason
+
+One counter for all devices made a lopsided device look like a shared
+problem. Report the number of gated solves next to the rejections, and
+whether the angle, the distance or both were too far off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../constellation/t_constellation_tracker.cpp   | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index 08ac21352..7bf642310 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -992,15 +992,22 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 	const float dot = fabsf(math_quat_dot(&Txr_world_device.orientation, &prior.orientation));
+ 	const float angle_deg = 2.0f * acosf(fminf(1.0f, dot)) * (float)(180.0 / M_PI);
+ 	const float dist_cm = m_vec3_len(Txr_world_device.position - prior.position) * 100.0f;
+-	if (angle_deg <= (float)max_deg && dist_cm <= (float)debug_get_num_option_constellation_prior_gate_cm()) {
++	// Per device, so one controller's rejections can be told from the other's.
++	static std::atomic<uint64_t> checked[8], rejected[8];
++	const size_t slot = std::min<size_t>((size_t)device->id, 7);
++	checked[slot]++;
++	const bool angle_ok = angle_deg <= (float)max_deg;
++	const bool dist_ok = dist_cm <= (float)debug_get_num_option_constellation_prior_gate_cm();
++	if (angle_ok && dist_ok) {
+ 		return true;
+ 	}
+ 
+-	static std::atomic<uint64_t> rejected{0};
+-	const uint64_t n = ++rejected;
++	const uint64_t n = ++rejected[slot];
+ 	if (n <= 5 || (n & (n - 1)) == 0) {
+-		CT_WARN(tracker, "Rejected solve #%" PRIu64 " for device %d: %.0f deg / %.0f cm from its prior", n,
+-		        (int)device->id, angle_deg, dist_cm);
++		CT_WARN(tracker,
++		        "Rejected solve #%" PRIu64 " of %" PRIu64 " gated for device %d: %.0f deg / %.0f cm from its prior (%s)",
++		        n, checked[slot].load(), (int)device->id, angle_deg, dist_cm,
++		        !angle_ok && !dist_ok ? "angle and distance" : !angle_ok ? "angle" : "distance");
+ 	}
+ 	return false;
+ }
+-- 
+2.56.0
+

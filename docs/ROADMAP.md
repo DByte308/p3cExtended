@@ -3,14 +3,15 @@
 Open work, roughly in priority order. Status of every feature: [FEATURES.md](FEATURES.md).
 
 ## 1. Tracking
-- **Head SLAM runaway mid-session.** Basalt can degenerate (`Unusually small det(Q1Jl)`) and not recover.
+- **Head SLAM runaway.** Partly fixed (patches/basalt 0001: the side cameras now contribute landmarks). Left:
+  Basalt drops landmarks closer than 0.33 m, so facing a wall or table can still lose the visual anchor; a still
+  headset only gets points from the front stereo pair; and Basalt never resets once it has lost the anchor.
   Plan: a runaway detector in the driver (speed, jump and still-IMU checks) that calls Basalt's reset
-  (`vit_tracker_reset`) and keeps the world from jumping. Then record a session with `SLAM_EUROC_RECORD`
-  (6 still orientations, then normal use) to check the IMU model offline: accel scale terms are ignored,
-  the bias sign may be wrong, noise values are generic.
-- **Controller drift.** The controller IMU's gravity x sign disagrees with the optical orientation on both
-  hands. Plan: a table test (rings down, then on the side) to choose the right `PIMAX_CTRL_IMU_AXES`
-  default. Also log the gyro full scale, and size the fusion's keyframe buffer for 500 Hz controller IMUs.
+  (`vit_tracker_reset`) and keeps the world from jumping.
+- **Controller start-up snaps.** Rubberbanding is fixed (patches 0035–0038). In the first ~10 s the prior gate
+  still rejects about half the solves while the fusion settles, and an accepted solve does not pull the fusion's
+  prediction back quickly. Candidate: gate against the last accepted solve carried
+  forward by the raw gyro.
 - **Controllers held close together.** The left and right LED rings are mirror images, so blobs can be
   given to the wrong controller. Needs arbitration by fit quality instead of "nearest device first".
 - **Fast shakes** can lose a controller (the fast path is skipped above 5 m/s or 1 rev/s).

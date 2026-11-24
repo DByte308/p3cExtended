@@ -1,0 +1,164 @@
+From ab688155422fc786b737223b6825e20bdfe0285b Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:53:30 +0100
+Subject: [PATCH] t/constellation: keep a device's known model-to-IMU rotation
+ fixed
+
+The sensor fusion solved for the rotation between a device's LED model and
+its IMU in every window. Three keyframes barely observe it, so the estimate
+could wander: on a controller whose model is given in its IMU frame (true
+rotation about 1-2 deg) it drifted to 77 and then 178 deg within a minute.
+Every gyro sample was then applied about the wrong axes, the prediction
+diverged during fast motion, and the prior gate rejected the correct optical
+solves, which showed as rubberbanding and an orientation stuck upright.
+
+Add imu_extrinsics_known to the device parameters. When set, the extrinsics
+block stays constant at its seed. Existing drivers leave it unset and keep
+the online estimate. The Pimax controllers set it, since the driver moves
+their LED model into the IMU frame from the controller calibration.
+
+With it, prior-gate rejections dropped from up to 100 % during fast motion
+to 0-2 % once tracking had settled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/constellation/slot/mod.rs       | 2 ++
+ .../gui/gui_scene_constellation_tracker_test.cpp         | 1 +
+ .../tracking/constellation/optimizer/sensor_fusion.cpp   | 9 +++++++--
+ .../tracking/constellation/optimizer/sensor_fusion.hpp   | 7 ++++++-
+ .../tracking/constellation/t_constellation_tracker.cpp   | 8 ++++++--
+ src/xrt/tracking/constellation/t_constellation_tracker.h | 8 ++++++++
+ 6 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
+index 97d713cad..6a2d7300a 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
+@@ -44,6 +44,8 @@ impl Slot {
+         let mut params = t_constellation_tracker_device_params {
+             led_model: model.as_tracker_model(),
+             imu_sink: ptr::null_mut(),
++            // The LED model is moved into the IMU's frame above, using the controller's calibration.
++            imu_extrinsics_known: true,
+         };
+         let ret = unsafe {
+             t_constellation_tracker_add_device(tracker, &mut params, &mut slot.base, &mut slot.id)
+diff --git a/src/xrt/state_trackers/gui/gui_scene_constellation_tracker_test.cpp b/src/xrt/state_trackers/gui/gui_scene_constellation_tracker_test.cpp
+index 1c96ea0a4..dcaaae5ff 100644
+--- a/src/xrt/state_trackers/gui/gui_scene_constellation_tracker_test.cpp
++++ b/src/xrt/state_trackers/gui/gui_scene_constellation_tracker_test.cpp
+@@ -153,6 +153,7 @@ public: // Methods
+ 			t_constellation_tracker_device_params device_params = {
+ 			    .led_model = device.led_model,
+ 			    .imu_sink = nullptr,
++			    .imu_extrinsics_known = false,
+ 			};
+ 
+ 			this->tracker->addDevice(&device_params, &stub_device);
+diff --git a/src/xrt/tracking/constellation/optimizer/sensor_fusion.cpp b/src/xrt/tracking/constellation/optimizer/sensor_fusion.cpp
+index 04e22a400..406f97fa4 100644
+--- a/src/xrt/tracking/constellation/optimizer/sensor_fusion.cpp
++++ b/src/xrt/tracking/constellation/optimizer/sensor_fusion.cpp
+@@ -1782,6 +1782,9 @@ struct SensorFusionProblem
+ 			                              ImuExtrinsics<double>::kNumParameters,        //
+ 			                              &this->quaternion_manifold,                   //
+ 			                              {ParameterBlockRef::Kind::ImuExtrinsics, 0}); //
++			if (fusion.imu_extrinsics_known) {
++				this->problem.SetParameterBlockConstant(imu_extrinsics_block.data());
++			}
+ 
+ 			// Add one device keyframe for each state the IMU chain reaches
+ 			auto &device_keyframe_blocks = blocks.keyframes;
+@@ -2724,13 +2727,15 @@ SensorFusion::SensorFusion(ceres::Context *context,
+                            bool deterministic,
+                            t_constellation_device_id_t id,
+                            const t_constellation_tracker_led_model *led_model,
+-                           double world_gravity_mag)
++                           double world_gravity_mag,
++                           bool imu_extrinsics_known)
+     : context(context),                                    //
+       log_level(debug_get_log_option_sensor_fusion_log()), //
+       deterministic(deterministic),                        //
+       device(id, led_model),                               //
+       seed_world_gravity_mag(world_gravity_mag),           //
+-      sample_queue()                                       //
++      sample_queue(),                                      //
++      imu_extrinsics_known(imu_extrinsics_known)           //
+ {
+ 	this->problem = new SensorFusionProblem();
+ 
+diff --git a/src/xrt/tracking/constellation/optimizer/sensor_fusion.hpp b/src/xrt/tracking/constellation/optimizer/sensor_fusion.hpp
+index 0ff7243d9..1bafecc6c 100644
+--- a/src/xrt/tracking/constellation/optimizer/sensor_fusion.hpp
++++ b/src/xrt/tracking/constellation/optimizer/sensor_fusion.hpp
+@@ -590,12 +590,17 @@ public: // Methods
+ 	 *                      thread as the callee's push functions.
+ 	 * @param id            The ID of the constellation device
+ 	 * @param led_model     The LED model of the device
++	 * @param imu_extrinsics_known Keep the model -> IMU rotation at its calibrated value instead of solving for it
+ 	 */
+ 	SensorFusion(ceres::Context *context,
+ 	             bool deterministic,
+ 	             t_constellation_device_id_t id,
+ 	             const t_constellation_tracker_led_model *led_model,
+-	             double world_gravity_mag);
++	             double world_gravity_mag,
++	             bool imu_extrinsics_known);
++
++	//! See @ref t_constellation_tracker_device_params::imu_extrinsics_known.
++	const bool imu_extrinsics_known;
+ 
+ 	~SensorFusion();
+ 
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index 7bf642310..9a9e00bba 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -161,11 +161,14 @@ run_room_calibration_func(void *ptr)
+ 		device->enabled.store(true);
+ 
+ 		if (device->id == result.device_id) {
++			// A known model -> IMU rotation stays at its seed (identity: this is the only place that sets the
++			// stored calibration); the calibration then only refines the IMU intrinsics.
+ 			device->sensor_fusion->setDeviceImuCalibration(sensor_fusion::DeviceImuCalibration{
+ 			    .accel_bias = result.imu.accel_bias,
+ 			    .gyro_bias = result.imu.gyro_bias,
+ 			    .accel_scale = result.imu.accel_scale,
+-			    .Qcv_model_imu = result.imu.Qcv_model_imu,
++			    .Qcv_model_imu =
++			        device->params.imu_extrinsics_known ? (xrt_quat)XRT_QUAT_IDENTITY : result.imu.Qcv_model_imu,
+ 			});
+ 		}
+ 	}
+@@ -1642,7 +1645,8 @@ ConstellationTracker::addDevice(t_constellation_tracker_device_params *params, t
+ 	    this->deterministic,                                                   //
+ 	    id,                                                                    //
+ 	    new_device->search_model->led_model,                                   //
+-	    world_gravity_m_s2);                                                   //
++	    world_gravity_m_s2,                                                    //
++	    new_device->params.imu_extrinsics_known);                              //
+ 
+ 	for (auto &mosaic : this->mosaics) {
+ 		for (auto &camera : mosaic->cameras) {
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.h b/src/xrt/tracking/constellation/t_constellation_tracker.h
+index eeefa7c25..e021ab3bd 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.h
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.h
+@@ -90,6 +90,14 @@ struct t_constellation_tracker_device_params
+ 	 * to the constellation tracker, drivers should send IMU samples to this sink.
+ 	 */
+ 	struct xrt_imu_sink *imu_sink;
++
++	/*!
++	 * The model -> IMU rotation is known, e.g. because the LED model is given in the IMU's frame. The sensor fusion
++	 * then keeps it fixed at its seed (the stored calibration, identity by default) instead of estimating it; a few
++	 * keyframes barely observe it, so an estimate can wander far from the true value and rotate every gyro sample
++	 * with it.
++	 */
++	bool imu_extrinsics_known;
+ };
+ 
+ enum t_constellation_tracker_flags
+-- 
+2.56.0
+

@@ -4,7 +4,7 @@ Run the **Pimax Crystal Super** VR headset on Linux, natively on Wayland, withou
 
 This repository holds patches, scripts and configs on top of:
 - [Monado](https://monado.freedesktop.org/) (OpenXR runtime), the community fork with the Rust driver `pimax_p3c`,
-- [Basalt](https://gitlab.freedesktop.org/ultradev/basalt) (branch `pose-covariance`) for inside-out head tracking (SLAM),
+- [Basalt](https://gitlab.freedesktop.org/ultradev/basalt) (branch `pose-covariance` + patches) for inside-out head tracking (SLAM),
 - [Envision](https://gitlab.com/gabmus/envision) (the VR launcher), patched with Pimax pages,
 - small OpenXR test tools (`tools/`).
 
@@ -148,9 +148,10 @@ Do not use `XRT_COMPOSITOR_DESIRED_MODE` (older Pimax driver only) and never lea
 To check which variables a service really got, start it with `XRT_PRINT_OPTIONS=1`.
 
 ## Known issues
-- **Head tracking can run away**: in a dark room, when the headset is not worn, or mid-session after a few
-  minutes (Basalt does not recover). Restart the session. Fix planned, see [docs/ROADMAP.md](docs/ROADMAP.md).
-- **Controllers drift slowly** between optical fixes (controller IMU axis question, open).
+- **Head tracking can still run away** when the headset faces something closer than about 33 cm (a wall or a
+  table), and in a dark room. Partly fixed (patches/basalt 0001); Basalt still does not reset itself, so restart
+  the session. See [docs/ROADMAP.md](docs/ROADMAP.md).
+- **Controllers can snap back briefly in the first ~10 s** after the session starts, while the tracker settles.
 - **Controllers held close together** can merge; the beam can jump to the other controller (a fix is built,
   untested).
 - A controller can be lost on very fast shakes.
@@ -179,6 +180,7 @@ To check which variables a service really got, start it with `XRT_PRINT_OPTIONS=
 |---|---|
 | `patches/monado/` | Monado fork patches: stereo fixes, eye tracking, foveation, tracking fixes, live settings, diagnostics |
 | `patches/envision/` | Envision patches: sidebar shell and Pimax pages |
+| `patches/basalt/` | Basalt patches: side cameras keep their keypoints (multi-camera tracking fix) |
 | `patches/nvidia/` | NVIDIA open kernel module fix (required for stereo) |
 | `patches/kernel/` | optional kernel EDID non-desktop quirk |
 | `patches/steamvr-resources/` | experimental SteamVR input profile |

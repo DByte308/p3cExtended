@@ -8,7 +8,7 @@ not included: `scripts/install.sh` clones them at the commits pinned in `sources
 | Monado | BSL-1.0 (permissive) | `patches/monado/` may be published under terms compatible with BSL-1.0 |
 | `pimax_p3c` driver (inside the Monado fork) | **no licence file, no SPDX headers** | by default "all rights reserved" by its author(s) (`ultradev`). Several of our Monado patches touch it. |
 | `pimax-protocol` crate | **no licence file** | same issue |
-| Basalt (`ultradev/basalt`) | BSD-3-Clause | used unmodified |
+| Basalt (`ultradev/basalt`) | BSD-3-Clause | **modified**: `patches/basalt/` (BSD-3-Clause, like Basalt) |
 | Envision | AGPL-3.0 | **modified**: `patches/envision/` are AGPL-3.0 derived work; anyone who distributes the patched build must offer its source |
 | NVIDIA open kernel modules patch | MIT / GPL-2.0 (dual, like the open modules) | `patches/nvidia/` is taken from NVIDIA open-gpu-kernel-modules PR #1262 (not merged yet); credit goes to its author |
 | Linux kernel patch | GPL-2.0 | `patches/kernel/` must stay GPL-2.0 |

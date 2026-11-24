@@ -7,8 +7,10 @@ In a mirrored frame the cross product flips sign. So: hold still, tip the headse
 only about the vertical), hold still again. Gravity before and after must be connected by the integrated gyro.
 Both hypotheses (proper / mirrored) are fitted; the gyro scale is fitted too, so it need not be known.
 
-Reads the headset's status HID interface directly; no XR session may be running. Usage:
-    tools/imu_frame_check.py [seconds]        (default 20)
+Reads the headset's HID interfaces directly (other readers, such as a running XR session, are not disturbed).
+    tools/imu_frame_check.py [seconds] [hmd|left|right]      (default 20 s, hmd)
+The headset IMU streams without a session; the controllers only send while a session runs.
+Frames checked: the headset after the driver's (-x, y, -z); a controller after PIMAX_CTRL_IMU_AXES (default raw).
 Then: headset still on the table for 3 s, tip it about 90 deg onto its side (not upside down), hold it there as still
 as you can (or lean it against something) for 3 s.
 The driver's conversion (-x, y, -z) is a proper rotation, so the verdict is about the raw sensor axes as the
@@ -16,31 +18,62 @@ driver reads them.
 """
 import glob, math, os, struct, sys, time
 
-DRIVER_FRAME = (-1.0, 1.0, -1.0)  # the driver's conversion of the raw axes, see to_headset_frame_vec
+DRIVER_FRAME = (-1.0, 1.0, -1.0)  # the driver's conversion of the headset's raw axes, see to_headset_frame_vec
+DEVICE = "hmd"
+CMAP = None  # controller axis map, set once in main()
 
 
-def find_node():
+def controller_map():
+    """(index, sign) per output axis, as the driver's PIMAX_CTRL_IMU_AXES (default raw)."""
+    raw = os.environ.get("PIMAX_CTRL_IMU_AXES", "x,y,z")
+    out = []
+    for t in raw.split(","):
+        t = t.strip()
+        sign, axis = (-1.0, t[1:]) if t.startswith("-") else (1.0, t)
+        if axis not in ("x", "y", "z"):
+            return [(0, 1.0), (1, 1.0), (2, 1.0)]
+        out.append((("x", "y", "z").index(axis), sign))
+    return out if len(out) == 3 else [(0, 1.0), (1, 1.0), (2, 1.0)]
+
+
+def find_nodes():
+    """All HID interfaces of the headset's main USB device (34a4:0040)."""
+    nodes = []
     for d in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
         try:
             ue = open(os.path.join(d, "device/uevent")).read()
         except OSError:
             continue
         props = dict(l.split("=", 1) for l in ue.splitlines() if "=" in l)
-        if props.get("HID_ID") == "0003:000034A4:00000040" and props.get("HID_PHYS", "").endswith("/input2"):
-            return "/dev/" + os.path.basename(d)
-    return None
+        if props.get("HID_ID") == "0003:000034A4:00000040":
+            nodes.append("/dev/" + os.path.basename(d))
+    return nodes
 
 
 def parse(report):
-    """Two (t_us, accel_raw[3], gyro_raw[3]) samples from one 64-byte status report, or []."""
-    if len(report) < 42 or report[0] != 0x53 or report[1] != 0x31:
+    """Two (t_us, accel[3], gyro[3]) samples of DEVICE from one 64-byte status report (in the driver's frame), or []."""
+    if len(report) < 42 or report[0] != 0x53:
         return []
-    t = struct.unpack_from("<Q", report, 4)[0]
-    off = struct.unpack_from("<H", report, 26)[0]
+    if DEVICE == "hmd":
+        if report[1] != 0x31:
+            return []
+        t_at, first, off_at, second = 4, 14, 26, 30
+        conv = lambda v: [DRIVER_FRAME[i] * v[i] for i in range(3)]
+    else:
+        if report[1] != 0x32 or report[3] != (2 if DEVICE == "left" else 3):
+            return []
+        t_at, first, off_at, second = 8, 16, 28, 30
+        cmap = CMAP
+        conv = lambda v: [s * v[i] for i, s in cmap]
+    t = struct.unpack_from("<Q", report, t_at)[0]
+    off = struct.unpack_from("<H", report, off_at)[0]
     out = []
-    for base, ts in ((14, t), (30, t + off)):
+    for base, ts in ((first, t), (second, t + off)):
         v = struct.unpack_from(">6h", report, base)
-        out.append((ts, [DRIVER_FRAME[i] * v[i] for i in range(3)], [DRIVER_FRAME[i] * v[3 + i] for i in range(3)]))
+        # A controller's first samples after connecting carry the lowest raw value on all gyro axes: no data.
+        if v[3] == v[4] == v[5] and v[3] < -8000:
+            continue
+        out.append((ts, conv(v[:3]), conv(v[3:])))
     return out
 
 
@@ -74,21 +107,47 @@ def rot_exp(w):
 
 
 def main():
-    secs = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
-    node = find_node()
-    if not node:
-        sys.exit("headset status interface not found (USB 34a4:0040, interface 2); is the headset on?")
-    fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
-    samples, t_end = [], time.time() + secs
-    print(f"reading {node} for {secs:.0f} s: still 3 s, tip the headset about 90 deg onto its side, still 3 s")
-    while time.time() < t_end:
+    global DEVICE, CMAP
+    args = sys.argv[1:]
+    if args and args[0] in ("hmd", "left", "right"):  # device given without seconds
+        args = ["20"] + args
+    try:
+        secs = float(args[0]) if args else 20.0
+    except ValueError:
+        sys.exit("usage: imu_frame_check.py [seconds] [hmd|left|right]")
+    DEVICE = args[1] if len(args) > 1 else "hmd"
+    CMAP = controller_map()
+    if DEVICE not in ("hmd", "left", "right"):
+        sys.exit("device must be hmd, left or right")
+    nodes = find_nodes()
+    if not nodes:
+        sys.exit("headset not found (USB 34a4:0040); is it on?")
+    fds = []
+    for n in nodes:
         try:
-            samples += parse(os.read(fd, 128))
-        except BlockingIOError:
+            fds.append(os.open(n, os.O_RDONLY | os.O_NONBLOCK))
+        except OSError as e:
+            print(f"skipping {n}: {e.strerror}")
+    if not fds:
+        sys.exit("no readable headset HID interface (check permissions, see the udev rules)")
+    samples, t_end = [], time.time() + secs
+    what = "the headset" if DEVICE == "hmd" else f"the {DEVICE} controller"
+    print(f"reading {what} for {secs:.0f} s: still 3 s, tip it about 90 deg onto its side, still 3 s")
+    while time.time() < t_end:
+        got = False
+        for fd in fds:
+            try:
+                samples += parse(os.read(fd, 128))
+                got = True
+            except BlockingIOError:
+                pass
+        if not got:
             time.sleep(0.001)
-    os.close(fd)
+    for fd in fds:
+        os.close(fd)
     if len(samples) < 1000:
-        sys.exit(f"only {len(samples)} samples; is a session running (it owns the stream)?")
+        hint = "" if DEVICE == "hmd" else " (controllers only send while a session runs and they are switched on)"
+        sys.exit(f"only {len(samples)} samples from {what}{hint}")
     samples.sort(key=lambda s: s[0])
 
     # Stillness per 0.5 s block: gyro magnitude spread.
@@ -149,9 +208,9 @@ def main():
     (pe, ps), (me, _) = res["proper (right-handed)"], res["mirrored"]
     # Hand-held rests add a few degrees of error, so the pass limit is 12 deg with a clear margin to the other fit.
     if pe < 12 and me > 2 * pe + 10:
-        print(f"RESULT: the driver's IMU frame is proper (right-handed); no axis change needed. (gyro {ps:.1f} LSB/dps)")
+        print(f"RESULT: the IMU frame of {DEVICE} as the driver uses it is proper (right-handed); no axis flip. (gyro {ps:.1f} LSB/dps)")
     elif me < 12 and pe > 2 * me + 10:
-        print("RESULT: the driver's IMU frame is MIRRORED: the raw axes are not right-handed as read; SLAM gets a wrong frame.")
+        print(f"RESULT: the IMU frame of {DEVICE} as the driver uses it is MIRRORED (one axis flipped): tracking gets a wrong frame.")
     else:
         print("RESULT: inconclusive; repeat with a clearer tip-over and stiller rests")
 

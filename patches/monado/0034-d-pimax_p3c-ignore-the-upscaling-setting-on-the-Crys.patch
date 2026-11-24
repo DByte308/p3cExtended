@@ -1,0 +1,131 @@
+From e1c47d670b1e55d171494d614da4621016f9445c Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:16:09 +0100
+Subject: [PATCH] d/pimax_p3c: ignore the upscaling setting on the Crystal
+ Super series
+
+Switching upscaling showed no effect on a Crystal Super, so the setting is
+not sent on that series (the bring-up sequence still leaves it off).
+---
+ src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs          | 8 ++++++++
+ src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs  | 6 +++++-
+ src/xrt/drivers/pimax_p3c/src/device/session/command.rs  | 3 ++-
+ src/xrt/drivers/pimax_p3c/src/device/session/controls.rs | 6 +++++-
+ 4 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
+index 9b3f60d50..f2844674e 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
+@@ -25,6 +25,14 @@ pub enum PimaxP3CHmdDisplay {
+ }
+ 
+ impl PimaxP3CHmdDisplay {
++    /// Crystal Super series (all panel variants).
++    pub fn is_crystal_super(self) -> bool {
++        matches!(
++            self,
++            Self::CrystalSuper50PPD | Self::CrystalSuper57PPD | Self::CrystalSuperUltrawide | Self::CrystalSuperOLED
++        )
++    }
++
+     pub fn display_name(self) -> &'static str {
+         match self {
+             Self::DreamAir => "Pimax Dream Air",
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+index 4be460c81..4a72203fb 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+@@ -126,6 +126,7 @@ pub struct Sessions {
+     controller_status_stream: Option<ControllerStatusStream>,
+     log_thread: Option<JoinHandle<()>>,
+     stop: Arc<AtomicBool>,
++    upscale_supported: bool,
+ }
+ 
+ pub fn bring_up(interfaces: Interfaces, identity: &Identity) -> BringUp {
+@@ -180,6 +181,7 @@ pub fn bring_up(interfaces: Interfaces, identity: &Identity) -> BringUp {
+             controller_status_stream,
+             log_thread,
+             stop,
++            upscale_supported: !model.is_crystal_super(),
+         },
+     }
+ }
+@@ -203,6 +205,7 @@ impl Sessions {
+             controller_status_stream,
+             log_thread,
+             stop,
++            upscale_supported,
+         } = self;
+ 
+         let hmd_status_thread =
+@@ -210,7 +213,8 @@ impl Sessions {
+         let controller_status_thread = controller_status_stream
+             .map(|stream| StatusSession::spawn_thread(stream, tracking.clone(), stop.clone()));
+ 
+-        let mut session = CommandSession::new(cmd, required_rate, tracking, status_file, stop.clone());
++        let mut session =
++            CommandSession::new(cmd, required_rate, tracking, status_file, stop.clone(), upscale_supported);
+         let usb_thread = thread::spawn(move || {
+             if let Err(e) = session.run() {
+                 error!("device dropped, restart Monado to reconnect: {e}");
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/command.rs b/src/xrt/drivers/pimax_p3c/src/device/session/command.rs
+index 95d558908..6bb4a1f2f 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/command.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/command.rs
+@@ -33,6 +33,7 @@ impl CommandSession {
+         tracking: Arc<Tracking>,
+         status_file: Option<StatusFile>,
+         stop: Arc<AtomicBool>,
++        upscale_supported: bool,
+     ) -> Self {
+         Self {
+             cmd,
+@@ -41,7 +42,7 @@ impl CommandSession {
+             last_beat: Instant::now(),
+             camera_settings_checked: Instant::now(),
+             status_file,
+-            controls: super::controls::Controls::new(),
++            controls: super::controls::Controls::new(upscale_supported),
+             stop,
+         }
+     }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs b/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+index 4ee98fac3..3f137769e 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+@@ -70,11 +70,13 @@ pub(super) struct Controls {
+     started_ms: u64,
+     brightness: Option<u8>,
+     upscale: Option<bool>,
++    /// False on models where upscaling showed no effect (Crystal Super series): the setting is ignored there.
++    upscale_supported: bool,
+     restarted: bool,
+ }
+ 
+ impl Controls {
+-    pub(super) fn new() -> Self {
++    pub(super) fn new(upscale_supported: bool) -> Self {
+         // The eye-tracking bring-up sequence (extras.rs) switches upscaling off unless it was skipped.
+         let upscale_off_at_start = crate::util::option_bool("PIMAX_EYE_TRACKING", true)
+             && crate::util::option_bool("PIMAX_EYE_BRINGUP", true);
+@@ -83,6 +85,7 @@ impl Controls {
+             started_ms: crate::live::process_started_ms(),
+             brightness: None,
+             upscale: upscale_off_at_start.then_some(false),
++            upscale_supported,
+             restarted: false,
+         }
+     }
+@@ -103,6 +106,7 @@ impl Controls {
+             }
+         }
+         let upscale = match crate::live::get_str(UPSCALE_ENV) {
++            _ if !self.upscale_supported => None,
+             Some(v) => parse_upscale(&v),
+             None => Some(false),
+         };
+-- 
+2.56.0
+

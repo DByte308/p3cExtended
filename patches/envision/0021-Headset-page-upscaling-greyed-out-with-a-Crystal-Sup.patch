@@ -1,0 +1,69 @@
+From 4da9ecb18614a9068571e8dc54392fee4fb10975 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:16:09 +0100
+Subject: [PATCH] Headset page: upscaling greyed out with a Crystal Super
+ connected
+
+Detected by USB product id (0040, 0046), so it also works without a
+running session; the row says why it is unavailable.
+---
+ src/ui/pimax_common.rs | 12 ++++++++++++
+ src/ui/pimax_pages.rs  | 19 +++++++++++++------
+ 2 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index 0614fc8..b53a877 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -88,6 +88,18 @@ pub fn pimax_plugged_in() -> bool {
+     })
+ }
+ 
++/// True when a Crystal Super series headset is connected (USB product 0040 or 0046 of the Pimax vendor id).
++pub fn crystal_super_connected() -> bool {
++    let Ok(dir) = std::fs::read_dir("/sys/bus/usb/devices") else {
++        return false;
++    };
++    let read = |p: &std::path::Path, f: &str| std::fs::read_to_string(p.join(f)).map(|v| v.trim().to_ascii_lowercase());
++    dir.flatten().any(|e| {
++        read(&e.path(), "idVendor").is_ok_and(|v| v == PIMAX_USB_VENDOR.to_ascii_lowercase())
++            && read(&e.path(), "idProduct").is_ok_and(|p| p == "0040" || p == "0046")
++    })
++}
++
+ #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+ #[serde(default)]
+ pub struct EyeTrackingStatus {
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index c5b79bb..5d75f2a 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -295,12 +295,19 @@ impl SimpleComponent for HeadsetPage {
+                 move |adj| c.set("PIMAX_BRIGHTNESS", Some(format!("{:.0}", adj.value()))),
+             )
+         });
+-        display.add(&ctx.choice_row(
+-            "PIMAX_UPSCALE",
+-            "Display upscaling",
+-            "Upscaling in the headset; the session starts with it off. Applies immediately while the session runs",
+-            &[("Off (default)", None), ("On", Some("1"))],
+-        ));
++        display.add(&{
++            const DESC: &str = "Upscaling in the headset; the session starts with it off. Applies immediately while the session runs";
++            let row = ctx.choice_row("PIMAX_UPSCALE", "Display upscaling", DESC, &[("Off (default)", None), ("On", Some("1"))]);
++            // No effect on the Crystal Super series, and the driver ignores the setting there.
++            let update = |row: &adw::ComboRow| {
++                let sup = super::pimax_common::crystal_super_connected();
++                row.set_sensitive(!sup);
++                row.set_subtitle(if sup { "Not supported by the Crystal Super series" } else { DESC });
++            };
++            update(&row);
++            row.connect_map(move |r| update(r));
++            row
++        });
+         content.append(&display);
+ 
+         // Headset controls
+-- 
+2.56.0
+

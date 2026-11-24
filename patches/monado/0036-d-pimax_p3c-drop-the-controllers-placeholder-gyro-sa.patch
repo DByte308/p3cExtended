@@ -1,0 +1,77 @@
+From 1b651e929717de46a0af07a16e09c4dd2fab0406 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:53:30 +0100
+Subject: [PATCH 36/38] d/pimax_p3c: drop the controllers' placeholder gyro
+ samples
+
+For about the first 30 samples after a controller connects, all three gyro
+axes carry the same lowest raw value (about -4000 deg/s). They are no
+measurement, but were pushed to the tracker as one large rotation kick each.
+Drop them and count them in the debug diagnostics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/session/status.rs    | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index 57354c7df..76d937b79 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -20,6 +20,7 @@ pub struct ControllerDiag {
+     pub reports: AtomicU64,
+     pub no_clock: AtomicU64,
+     pub imu_pushed: AtomicU64,
++    pub imu_placeholder: AtomicU64,
+     pub pose_queries: AtomicU64,
+     pub pose_valid: AtomicU64,
+     /// Raw accelerometer sum (g) and count since the last log line.
+@@ -35,6 +36,7 @@ impl ControllerDiag {
+             reports: AtomicU64::new(0),
+             no_clock: AtomicU64::new(0),
+             imu_pushed: AtomicU64::new(0),
++            imu_placeholder: AtomicU64::new(0),
+             pose_queries: AtomicU64::new(0),
+             pose_valid: AtomicU64::new(0),
+             accel_sum: std::sync::Mutex::new([0.0; 4]),
+@@ -126,6 +128,11 @@ fn controller_axes(v: [f64; 3]) -> [f64; 3] {
+     map.map(|(i, s)| v[i] * s)
+ }
+ 
++/// All three gyro axes at the same large negative value: the placeholder a controller sends before its IMU runs.
++fn is_placeholder_gyro(gyro: &[f32; 3]) -> bool {
++    gyro[0] < -1000.0 && gyro[1] == gyro[0] && gyro[2] == gyro[0]
++}
++
+ fn log_controller_diag(now: i64) {
+     let last = DIAG_LAST_NS.load(Ordering::Relaxed);
+     if now - (last as i64) < 1_000_000_000 {
+@@ -143,9 +150,9 @@ fn log_controller_diag(now: i64) {
+     let [l, r] = &CONTROLLER_DIAG;
+     // Diagnostics for controller tracking; once per second, so only at debug level.
+     debug!(
+-        "controllers 1 s: L reports {} no_clock {} imu {} pose {}/{} | R reports {} no_clock {} imu {} pose {}/{} | raw accel g L {:.3?} R {:.3?}",
+-        take(&l.reports), take(&l.no_clock), take(&l.imu_pushed), take(&l.pose_valid), take(&l.pose_queries),
+-        take(&r.reports), take(&r.no_clock), take(&r.imu_pushed), take(&r.pose_valid), take(&r.pose_queries),
++        "controllers 1 s: L reports {} no_clock {} imu {} (placeholder {}) pose {}/{} | R reports {} no_clock {} imu {} (placeholder {}) pose {}/{} | raw accel g L {:.3?} R {:.3?}",
++        take(&l.reports), take(&l.no_clock), take(&l.imu_pushed), take(&l.imu_placeholder), take(&l.pose_valid), take(&l.pose_queries),
++        take(&r.reports), take(&r.no_clock), take(&r.imu_pushed), take(&r.imu_placeholder), take(&r.pose_valid), take(&r.pose_queries),
+         mean(l), mean(r),
+     );
+ }
+@@ -271,6 +278,12 @@ impl OnReport for ControllerStatus {
+                 if sample_ns <= last_ns || sample_ns > now_ns() + 20_000_000 {
+                     continue;
+                 }
++                // The first ~30 samples after a controller connects carry the lowest raw value on all three gyro
++                // axes (about -4000 deg/s each): no measurement, and a large kick to the fusion if pushed.
++                if is_placeholder_gyro(&sample.gyro) {
++                    diag.imu_placeholder.fetch_add(1, Ordering::Relaxed);
++                    continue;
++                }
+                 last_ns = sample_ns;
+                 diag.imu_pushed.fetch_add(1, Ordering::Relaxed);
+                 {
+-- 
+2.56.0
+
