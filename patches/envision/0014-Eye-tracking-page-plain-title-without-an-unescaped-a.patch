@@ -1,0 +1,27 @@
+From 42146f60ef15c629755a5bd77009486fac3155d4 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 13:32:08 +0100
+Subject: [PATCH] Eye tracking page: plain title without an unescaped ampersand
+
+The group title is parsed as markup, so "Calibration & tests" failed to
+render (GTK markup error).
+---
+ src/ui/pimax_eye.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/ui/pimax_eye.rs b/src/ui/pimax_eye.rs
+index 1399ecc..b3073e9 100644
+--- a/src/ui/pimax_eye.rs
++++ b/src/ui/pimax_eye.rs
+@@ -217,7 +217,7 @@ impl SimpleComponent for EyeTrackingPage {
+ 
+         // Tools
+         let tools_group = group(
+-            "Calibration & tests",
++            "Calibration and tests",
+             Some("Put the headset on: these run inside the headset."),
+         );
+         let (r_cal, b_cal) = tool_row(
+-- 
+2.56.0
+
