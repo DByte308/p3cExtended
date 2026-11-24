@@ -77,7 +77,7 @@ Keep a stock kernel installed to boot back.
 
 ## Quick start
 ```sh
-git clone <this repository> pimax-linux && cd pimax-linux
+git clone https://github.com/DByte308/p3cExtended.git && cd p3cExtended
 scripts/install.sh --check        # list missing build dependencies, change nothing
 scripts/install.sh --udev --system
 ```
