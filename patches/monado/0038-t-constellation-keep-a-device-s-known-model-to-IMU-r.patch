@@ -1,8 +1,8 @@
-From ab688155422fc786b737223b6825e20bdfe0285b Mon Sep 17 00:00:00 2001
+From 434b750c414f83af834fef4825c6275eb3fa895f Mon Sep 17 00:00:00 2001
 From: DByte308 <69403407+DByte308@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 19:53:30 +0100
-Subject: [PATCH] t/constellation: keep a device's known model-to-IMU rotation
- fixed
+Subject: [PATCH 38/38] t/constellation: keep a device's known model-to-IMU
+ rotation fixed
 
 The sensor fusion solved for the rotation between a device's LED model and
 its IMU in every window. Three keyframes barely observe it, so the estimate

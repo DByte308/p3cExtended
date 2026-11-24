@@ -1,11 +1,13 @@
-From e1c47d670b1e55d171494d614da4621016f9445c Mon Sep 17 00:00:00 2001
+From f526c20d9de97ea56896b632a3c1a99f8aaed353 Mon Sep 17 00:00:00 2001
 From: DByte308 <69403407+DByte308@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 16:16:09 +0100
-Subject: [PATCH] d/pimax_p3c: ignore the upscaling setting on the Crystal
- Super series
+Subject: [PATCH 34/38] d/pimax_p3c: ignore the upscaling setting on the
+ Crystal Super series
 
 Switching upscaling showed no effect on a Crystal Super, so the setting is
 not sent on that series (the bring-up sequence still leaves it off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs          | 8 ++++++++
  src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs  | 6 +++++-

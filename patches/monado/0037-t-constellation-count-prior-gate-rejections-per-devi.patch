@@ -1,4 +1,4 @@
-From 3800339a5c8805c4e77837fead7ed61078a81fa5 Mon Sep 17 00:00:00 2001
+From 1a8c43eeae0e93347d4e3639dd4a35c923612244 Mon Sep 17 00:00:00 2001
 From: DByte308 <69403407+DByte308@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 19:53:30 +0100
 Subject: [PATCH 37/38] t/constellation: count prior-gate rejections per

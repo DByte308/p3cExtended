@@ -1,4 +1,4 @@
-From 1b651e929717de46a0af07a16e09c4dd2fab0406 Mon Sep 17 00:00:00 2001
+From 4fc05255c0c7bee59f41954ad536fe583a94c3cd Mon Sep 17 00:00:00 2001
 From: DByte308 <69403407+DByte308@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 19:53:30 +0100
 Subject: [PATCH 36/38] d/pimax_p3c: drop the controllers' placeholder gyro

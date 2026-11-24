@@ -1,11 +1,13 @@
-From 4da9ecb18614a9068571e8dc54392fee4fb10975 Mon Sep 17 00:00:00 2001
+From a40453be443acf00b5bee2846a4e3894927f11be Mon Sep 17 00:00:00 2001
 From: DByte308 <69403407+DByte308@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 16:16:09 +0100
-Subject: [PATCH] Headset page: upscaling greyed out with a Crystal Super
+Subject: [PATCH 21/22] Headset page: upscaling greyed out with a Crystal Super
  connected
 
 Detected by USB product id (0040, 0046), so it also works without a
 running session; the row says why it is unavailable.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/ui/pimax_common.rs | 12 ++++++++++++
  src/ui/pimax_pages.rs  | 19 +++++++++++++------
