@@ -152,6 +152,9 @@ To check which variables a service really got, start it with `XRT_PRINT_OPTIONS=
   table), and in a dark room. Partly fixed (patches/basalt 0001); Basalt still does not reset itself, so restart
   the session. See [docs/ROADMAP.md](docs/ROADMAP.md).
 - **Controllers can snap back briefly in the first ~10 s** after the session starts, while the tracker settles.
+- **One controller can lose its rotation for a whole session** (open): it keeps tracking position but its
+  orientation stays fixed. Seen on the left controller in one session after the fixes, with the right one fine.
+  Not yet reproduced with a log; restarting the session may help.
 - **Controllers held close together** can merge; the beam can jump to the other controller (a fix is built,
   untested).
 - A controller can be lost on very fast shakes.

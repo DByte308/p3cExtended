@@ -12,6 +12,10 @@ Open work, roughly in priority order. Status of every feature: [FEATURES.md](FEA
   still rejects about half the solves while the fusion settles, and an accepted solve does not pull the fusion's
   prediction back quickly. Candidate: gate against the last accepted solve carried
   forward by the raw gyro.
+- **Controller orientation stuck for a whole session.** One recorded session after patches 0035–0042: the left
+  controller tracked position but did not rotate at all, the right one was fine. Envision does not keep the
+  service log, so there is no data yet. Next: a session with `PIMAX_LOG=debug` (per-controller IMU sample and
+  placeholder counters, per-device prior-gate rejections) while turning that controller.
 - **Controllers held close together.** The left and right LED rings are mirror images, so blobs can be
   given to the wrong controller. Needs arbitration by fit quality instead of "nearest device first".
 - **Fast shakes** can lose a controller (the fast path is skipped above 5 m/s or 1 rev/s).
