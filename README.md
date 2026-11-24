@@ -1,4 +1,4 @@
-# pimax-linux
+# p3cExtended
 
 Run the **Pimax Crystal Super** VR headset on Linux, natively on Wayland, without proprietary software.
 
@@ -11,6 +11,8 @@ This repository holds patches, scripts and configs on top of:
 The upstream sources are not in this repository. The installer clones them at the commits in `sources.lock`.
 
 **Status: experimental.** It works end to end on the developer's setup. Expect rough edges.
+
+![Envision with the Pimax pages: home screen](docs/screenshots/envision-home.png)
 
 ## What works
 Full list with details: [docs/FEATURES.md](docs/FEATURES.md).
