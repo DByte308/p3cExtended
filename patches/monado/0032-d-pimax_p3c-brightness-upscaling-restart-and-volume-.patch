@@ -1,0 +1,347 @@
+From 2ab9baced65b152cd886b438da53cf507f033f90 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:41:04 +0100
+Subject: [PATCH 1/2] d/pimax_p3c: brightness, upscaling, restart and volume
+ keys
+
+- Live settings PIMAX_BRIGHTNESS (1-100), PIMAX_UPSCALE (0/1) and
+  PIMAX_RESTART_AT (Unix ms; restarts once if newer than the session start),
+  sent from the command loop when they change.
+- The headset's volume keys change the default output volume through pactl
+  on a worker thread (5 % steps, repeat while held, never raised past 100 %).
+  PIMAX_VOLUME_KEYS=0 turns it off; apps still get the keys as inputs.
+---
+ .../pimax_p3c/src/device/session/command.rs   |   3 +
+ .../pimax_p3c/src/device/session/controls.rs  | 132 ++++++++++++++++++
+ .../pimax_p3c/src/device/session/mod.rs       |   2 +
+ .../pimax_p3c/src/device/session/status.rs    |   1 +
+ .../src/device/session/volume_keys.rs         | 118 ++++++++++++++++
+ 5 files changed, 256 insertions(+)
+ create mode 100644 src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+ create mode 100644 src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/command.rs b/src/xrt/drivers/pimax_p3c/src/device/session/command.rs
+index e60947077..95d558908 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/command.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/command.rs
+@@ -22,6 +22,7 @@ pub(super) struct CommandSession {
+     last_beat: Instant,
+     pub(super) camera_settings_checked: Instant,
+     status_file: Option<StatusFile>,
++    controls: super::controls::Controls,
+     stop: Arc<AtomicBool>,
+ }
+ 
+@@ -40,6 +41,7 @@ impl CommandSession {
+             last_beat: Instant::now(),
+             camera_settings_checked: Instant::now(),
+             status_file,
++            controls: super::controls::Controls::new(),
+             stop,
+         }
+     }
+@@ -72,6 +74,7 @@ impl CommandSession {
+     pub(super) fn run(&mut self) -> Result<(), Error> {
+         while !self.stopping() {
+             self.apply_camera_settings()?;
++            self.controls.apply(&self.cmd)?;
+             if let Some(f) = self.status_file.as_mut() {
+                 f.tick(&self.tracking);
+             }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs b/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+new file mode 100644
+index 000000000..18096c806
+--- /dev/null
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+@@ -0,0 +1,132 @@
++//! Headset controls that can change while the session runs (live settings, see `crate::live`):
++//! panel brightness, display upscaling, and restarting the headset.
++//!
++//! - `PIMAX_BRIGHTNESS`  1..=100, sent whenever it changes (unset: the headset keeps its own setting)
++//! - `PIMAX_UPSCALE`     "1" on, "0" off (unset: the headset keeps its own setting)
++//! - `PIMAX_RESTART_AT`  a Unix time in milliseconds; the headset restarts once if it is newer than this session's
++//!   start, so a stored value from an earlier click never restarts it again.
++
++use pimax_protocol::cmd::Command;
++use pimax_protocol::device::PimaxSubDevice;
++use pimax_protocol::{CommandDevice, Error};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++const BRIGHTNESS_ENV: &str = "PIMAX_BRIGHTNESS";
++const UPSCALE_ENV: &str = "PIMAX_UPSCALE";
++const RESTART_ENV: &str = "PIMAX_RESTART_AT";
++
++/// Panel brightness, 1..=100.
++struct SetBrightness(u8);
++
++impl Command for SetBrightness {
++    const ID: u8 = 0x2A;
++    fn cmd_opt(&self) -> PimaxSubDevice {
++        PimaxSubDevice::Hmd
++    }
++    fn write_payload(&self, out: &mut Vec<u8>) {
++        out.push(self.0);
++    }
++}
++
++/// Display upscaling on or off.
++struct SetUpscale(bool);
++
++impl Command for SetUpscale {
++    const ID: u8 = 0x5A;
++    fn cmd_opt(&self) -> PimaxSubDevice {
++        PimaxSubDevice::Vision
++    }
++    fn write_payload(&self, out: &mut Vec<u8>) {
++        out.push(u8::from(self.0));
++    }
++}
++
++/// Restart the headset (no payload).
++struct Restart;
++
++impl Command for Restart {
++    const ID: u8 = 0x28;
++    fn cmd_opt(&self) -> PimaxSubDevice {
++        PimaxSubDevice::Hmd
++    }
++}
++
++fn now_ms() -> u64 {
++    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
++}
++
++fn parse_brightness(v: &str) -> Option<u8> {
++    let n: f64 = v.trim().parse().ok()?;
++    n.is_finite().then(|| n.round().clamp(1.0, 100.0) as u8)
++}
++
++fn parse_upscale(v: &str) -> Option<bool> {
++    match v.trim() {
++        "1" | "on" | "true" => Some(true),
++        "0" | "off" | "false" => Some(false),
++        _ => None,
++    }
++}
++
++pub(super) struct Controls {
++    generation: Option<u64>,
++    started_ms: u64,
++    brightness: Option<u8>,
++    upscale: Option<bool>,
++    restarted: Option<u64>,
++}
++
++impl Controls {
++    pub(super) fn new() -> Self {
++        Self { generation: None, started_ms: now_ms(), brightness: None, upscale: None, restarted: None }
++    }
++
++    /// Sends what changed since the last call. Cheap when nothing changed.
++    pub(super) fn apply(&mut self, cmd: &CommandDevice) -> Result<(), Error> {
++        let generation = crate::live::generation();
++        if self.generation == Some(generation) {
++            return Ok(());
++        }
++        self.generation = Some(generation);
++
++        if let Some(b) = crate::live::get_str(BRIGHTNESS_ENV).as_deref().and_then(parse_brightness) {
++            if self.brightness != Some(b) {
++                info!("panel brightness {b}");
++                cmd.send(&SetBrightness(b))?;
++                self.brightness = Some(b);
++            }
++        }
++        if let Some(on) = crate::live::get_str(UPSCALE_ENV).as_deref().and_then(parse_upscale) {
++            if self.upscale != Some(on) {
++                info!("display upscaling {}", if on { "on" } else { "off" });
++                cmd.send(&SetUpscale(on))?;
++                self.upscale = Some(on);
++            }
++        }
++        if let Some(at) = crate::live::get_str(RESTART_ENV).and_then(|v| v.trim().parse::<u64>().ok()) {
++            if at > self.started_ms && self.restarted != Some(at) {
++                self.restarted = Some(at);
++                warn!("restarting the headset (requested); the session ends when it disconnects");
++                cmd.send(&Restart)?;
++            }
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parsing() {
++        assert_eq!(parse_brightness("0"), Some(1));
++        assert_eq!(parse_brightness("55.4"), Some(55));
++        assert_eq!(parse_brightness("400"), Some(100));
++        assert_eq!(parse_brightness("nan"), None);
++        assert_eq!(parse_brightness("x"), None);
++        assert_eq!(parse_upscale("1"), Some(true));
++        assert_eq!(parse_upscale("0"), Some(false));
++        assert_eq!(parse_upscale(""), None);
++    }
++}
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
+index 9c6c08887..f1659bda1 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
+@@ -1,6 +1,7 @@
+ pub mod bringup;
+ mod calibration;
+ mod command;
++mod controls;
+ mod edid;
+ mod extras;
+ mod log;
+@@ -8,6 +9,7 @@ mod status_file;
+ pub(crate) mod status;
+ pub mod usb_thread;
+ mod video;
++pub(crate) mod volume_keys;
+ 
+ use crate::device::hmd::PimaxP3CHmdDisplay;
+ use crate::util::option_num;
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index f9f97a08f..57354c7df 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -232,6 +232,7 @@ impl OnReport for HmdStatus {
+             trace!("status pushed to SLAM");
+         }
+ 
++        super::volume_keys::on_keys(self.buttons.volume_up(), self.buttons.volume_down());
+         *tracking.hmd_status.lock().unwrap() = Some(Latest {
+             status: self,
+             timestamp_ns: host_ns,
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs b/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
+new file mode 100644
+index 000000000..cb5d92414
+--- /dev/null
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
+@@ -0,0 +1,118 @@
++//! The headset's volume keys change the system output volume (default sound output, via `pactl`, which talks to
++//! PulseAudio and to PipeWire's pulse server). `PIMAX_VOLUME_KEYS=0` turns this off. Apps still see the keys as
++//! OpenXR inputs either way.
++//!
++//! Called for every headset status report, so it only tracks key edges here; `pactl` runs on a worker thread.
++
++use std::process::Command;
++use std::sync::mpsc::{Sender, channel};
++use std::sync::{Mutex, OnceLock};
++use std::time::{Duration, Instant};
++
++const ENABLE_ENV: &str = "PIMAX_VOLUME_KEYS";
++/// Volume change per step, in percent.
++const STEP: i32 = 5;
++/// A held key repeats after this delay, every `REPEAT_EVERY`.
++const REPEAT_AFTER: Duration = Duration::from_millis(500);
++const REPEAT_EVERY: Duration = Duration::from_millis(150);
++
++struct KeyState {
++    /// +1 up, -1 down, 0 none; and since when / last step.
++    held: i32,
++    since: Instant,
++    last_step: Instant,
++}
++
++static STATE: Mutex<Option<KeyState>> = Mutex::new(None);
++
++fn worker() -> Option<&'static Mutex<Sender<i32>>> {
++    static TX: OnceLock<Option<Mutex<Sender<i32>>>> = OnceLock::new();
++    TX.get_or_init(|| {
++        let (tx, rx) = channel::<i32>();
++        let spawned = std::thread::Builder::new().name("pimax-volume".into()).spawn(move || {
++            while let Ok(mut delta) = rx.recv() {
++                // Fold steps that queued up while pactl was running.
++                while let Ok(d) = rx.try_recv() {
++                    delta += d;
++                }
++                change_volume(delta);
++            }
++        });
++        match spawned {
++            Ok(_) => Some(Mutex::new(tx)),
++            Err(e) => {
++                warn!("volume keys: no worker thread: {e}");
++                None
++            }
++        }
++    })
++    .as_ref()
++}
++
++fn pactl(args: &[&str]) -> Option<String> {
++    let out = Command::new("pactl").args(args).env("LC_ALL", "C").output().ok()?;
++    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
++}
++
++/// Highest channel volume of the default output in percent, from `pactl get-sink-volume`.
++fn current_percent() -> Option<i32> {
++    pactl(&["get-sink-volume", "@DEFAULT_SINK@"])?
++        .split('/')
++        .filter_map(|part| part.trim().strip_suffix('%')?.trim().parse::<i32>().ok())
++        .max()
++}
++
++fn change_volume(delta: i32) {
++    let Some(cur) = current_percent() else {
++        warn!("volume keys: pactl not available or no default output");
++        return;
++    };
++    // The keys never raise past 100 % (louder stays possible with the desktop's own controls), and a volume
++    // already above 100 % is only lowered by them, never pulled down by "up".
++    let target = if delta > 0 { if cur >= 100 { cur } else { (cur + delta).min(100) } } else { (cur + delta).max(0) };
++    if target == cur {
++        return;
++    }
++    let arg = format!("{target}%");
++    if pactl(&["set-sink-volume", "@DEFAULT_SINK@", &arg]).is_some() {
++        debug!("volume keys: {cur}% -> {target}%");
++    }
++}
++
++fn send(delta: i32) {
++    if let Some(tx) = worker() {
++        let _ = tx.lock().unwrap().send(delta);
++    }
++}
++
++/// Feed the current key state (from each headset status report).
++pub fn on_keys(up: bool, down: bool) {
++    let dir = match (up, down) {
++        (true, false) => STEP,
++        (false, true) => -STEP,
++        _ => 0,
++    };
++    let now = Instant::now();
++    let mut st = STATE.lock().unwrap();
++    let st = st.get_or_insert(KeyState { held: 0, since: now, last_step: now });
++    if dir != st.held {
++        st.held = dir;
++        st.since = now;
++        st.last_step = now;
++        if dir != 0 && enabled() {
++            send(dir);
++        }
++    } else if dir != 0
++        && now.duration_since(st.since) >= REPEAT_AFTER
++        && now.duration_since(st.last_step) >= REPEAT_EVERY
++    {
++        st.last_step = now;
++        if enabled() {
++            send(dir);
++        }
++    }
++}
++
++fn enabled() -> bool {
++    crate::live::get_str(ENABLE_ENV).is_none_or(|v| v.trim() != "0")
++}
+-- 
+2.56.0
+

@@ -1,0 +1,39 @@
+From fb5eba461fea061e387b17d9dbf42659cc33fd8b Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:47:00 +0100
+Subject: [PATCH 2/2] Headset page: upscaling defaults to off, brightness note
+
+The session starts with upscaling off, so the choice is Off (default) or
+On. The brightness row notes that the headset keeps its own setting until
+it is changed.
+---
+ src/ui/pimax_pages.rs | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 60499c0..c5b79bb 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -287,7 +287,7 @@ impl SimpleComponent for HeadsetPage {
+             let cur = ctx.get("PIMAX_BRIGHTNESS").and_then(|v| v.parse::<f64>().ok()).unwrap_or(100.0);
+             super::preference_rows::spin_row(
+                 "Brightness (%)",
+-                Some("Panel brightness, 1\u{2013}100. Applies immediately while the session runs"),
++                Some("Panel brightness, 1\u{2013}100; the headset keeps its own setting until this is changed. Applies immediately while the session runs"),
+                 cur.clamp(1.0, 100.0),
+                 1.0,
+                 100.0,
+@@ -298,8 +298,8 @@ impl SimpleComponent for HeadsetPage {
+         display.add(&ctx.choice_row(
+             "PIMAX_UPSCALE",
+             "Display upscaling",
+-            "Upscaling in the headset. Applies immediately while the session runs",
+-            &[("Headset default", None), ("On", Some("1")), ("Off", Some("0"))],
++            "Upscaling in the headset; the session starts with it off. Applies immediately while the session runs",
++            &[("Off (default)", None), ("On", Some("1"))],
+         ));
+         content.append(&display);
+ 
+-- 
+2.56.0
+

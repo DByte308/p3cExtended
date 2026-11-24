@@ -1,0 +1,181 @@
+From c79b5d924ed736a46743f35a734e84853eb86516 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:47:00 +0100
+Subject: [PATCH 2/2] d/pimax_p3c: audit fixes for the headset controls
+
+- Upscaling: unset means off, the state the bring-up sequence leaves it
+  in, so going back to the default switches it off again.
+- Restart: read from the live file only (never from the environment or a
+  stored setting), at most once per session, and only for a request newer
+  than the service's start.
+- Volume keys: relative steps keep the channel balance; key changes within
+  40 ms are ignored as bounce.
+---
+ .../pimax_p3c/src/device/session/controls.rs  | 38 ++++++++++++-------
+ .../src/device/session/volume_keys.rs         | 26 +++++++++----
+ src/xrt/drivers/pimax_p3c/src/live.rs         | 13 +++++++
+ 3 files changed, 56 insertions(+), 21 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs b/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+index 18096c806..4ee98fac3 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+@@ -2,14 +2,15 @@
+ //! panel brightness, display upscaling, and restarting the headset.
+ //!
+ //! - `PIMAX_BRIGHTNESS`  1..=100, sent whenever it changes (unset: the headset keeps its own setting)
+-//! - `PIMAX_UPSCALE`     "1" on, "0" off (unset: the headset keeps its own setting)
+-//! - `PIMAX_RESTART_AT`  a Unix time in milliseconds; the headset restarts once if it is newer than this session's
+-//!   start, so a stored value from an earlier click never restarts it again.
++//! - `PIMAX_UPSCALE`     "1" on, "0" or unset off (the bring-up sequence switches upscaling off, so off is the state
++//!   a session starts in; going back to unset switches it off again)
++//! - `PIMAX_RESTART_AT`  a Unix time in milliseconds, read from the live file only (never from the environment or a
++//!   stored setting); the headset restarts at most once per session, and only for a request newer than the
++//!   service's start.
+ 
+ use pimax_protocol::cmd::Command;
+ use pimax_protocol::device::PimaxSubDevice;
+ use pimax_protocol::{CommandDevice, Error};
+-use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ const BRIGHTNESS_ENV: &str = "PIMAX_BRIGHTNESS";
+ const UPSCALE_ENV: &str = "PIMAX_UPSCALE";
+@@ -51,10 +52,6 @@ impl Command for Restart {
+     }
+ }
+ 
+-fn now_ms() -> u64 {
+-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+-}
+-
+ fn parse_brightness(v: &str) -> Option<u8> {
+     let n: f64 = v.trim().parse().ok()?;
+     n.is_finite().then(|| n.round().clamp(1.0, 100.0) as u8)
+@@ -73,12 +70,21 @@ pub(super) struct Controls {
+     started_ms: u64,
+     brightness: Option<u8>,
+     upscale: Option<bool>,
+-    restarted: Option<u64>,
++    restarted: bool,
+ }
+ 
+ impl Controls {
+     pub(super) fn new() -> Self {
+-        Self { generation: None, started_ms: now_ms(), brightness: None, upscale: None, restarted: None }
++        // The eye-tracking bring-up sequence (extras.rs) switches upscaling off unless it was skipped.
++        let upscale_off_at_start = crate::util::option_bool("PIMAX_EYE_TRACKING", true)
++            && crate::util::option_bool("PIMAX_EYE_BRINGUP", true);
++        Self {
++            generation: None,
++            started_ms: crate::live::process_started_ms(),
++            brightness: None,
++            upscale: upscale_off_at_start.then_some(false),
++            restarted: false,
++        }
+     }
+ 
+     /// Sends what changed since the last call. Cheap when nothing changed.
+@@ -96,16 +102,20 @@ impl Controls {
+                 self.brightness = Some(b);
+             }
+         }
+-        if let Some(on) = crate::live::get_str(UPSCALE_ENV).as_deref().and_then(parse_upscale) {
++        let upscale = match crate::live::get_str(UPSCALE_ENV) {
++            Some(v) => parse_upscale(&v),
++            None => Some(false),
++        };
++        if let Some(on) = upscale {
+             if self.upscale != Some(on) {
+                 info!("display upscaling {}", if on { "on" } else { "off" });
+                 cmd.send(&SetUpscale(on))?;
+                 self.upscale = Some(on);
+             }
+         }
+-        if let Some(at) = crate::live::get_str(RESTART_ENV).and_then(|v| v.trim().parse::<u64>().ok()) {
+-            if at > self.started_ms && self.restarted != Some(at) {
+-                self.restarted = Some(at);
++        if let Some(at) = crate::live::get_live_only(RESTART_ENV).and_then(|v| v.trim().parse::<u64>().ok()) {
++            if at > self.started_ms && !self.restarted {
++                self.restarted = true;
+                 warn!("restarting the headset (requested); the session ends when it disconnects");
+                 cmd.send(&Restart)?;
+             }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs b/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
+index cb5d92414..6c7d44a38 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
+@@ -15,6 +15,8 @@ const STEP: i32 = 5;
+ /// A held key repeats after this delay, every `REPEAT_EVERY`.
+ const REPEAT_AFTER: Duration = Duration::from_millis(500);
+ const REPEAT_EVERY: Duration = Duration::from_millis(150);
++/// Key changes closer together than this are contact bounce and ignored.
++const DEBOUNCE: Duration = Duration::from_millis(40);
+ 
+ struct KeyState {
+     /// +1 up, -1 down, 0 none; and since when / last step.
+@@ -68,14 +70,21 @@ fn change_volume(delta: i32) {
+         return;
+     };
+     // The keys never raise past 100 % (louder stays possible with the desktop's own controls), and a volume
+-    // already above 100 % is only lowered by them, never pulled down by "up".
+-    let target = if delta > 0 { if cur >= 100 { cur } else { (cur + delta).min(100) } } else { (cur + delta).max(0) };
+-    if target == cur {
+-        return;
+-    }
+-    let arg = format!("{target}%");
++    // already above 100 % is only lowered by them, never pulled down by "up". Relative steps keep the channel
++    // balance; only the step that reaches 100 % is absolute.
++    let arg = if delta > 0 {
++        if cur >= 100 {
++            return;
++        }
++        if cur + delta >= 100 { "100%".to_string() } else { format!("+{delta}%") }
++    } else {
++        if cur <= 0 {
++            return;
++        }
++        format!("{delta}%")
++    };
+     if pactl(&["set-sink-volume", "@DEFAULT_SINK@", &arg]).is_some() {
+-        debug!("volume keys: {cur}% -> {target}%");
++        debug!("volume keys: {cur}% {arg}");
+     }
+ }
+ 
+@@ -96,6 +105,9 @@ pub fn on_keys(up: bool, down: bool) {
+     let mut st = STATE.lock().unwrap();
+     let st = st.get_or_insert(KeyState { held: 0, since: now, last_step: now });
+     if dir != st.held {
++        if now.duration_since(st.since) < DEBOUNCE {
++            return;
++        }
+         st.held = dir;
+         st.since = now;
+         st.last_step = now;
+diff --git a/src/xrt/drivers/pimax_p3c/src/live.rs b/src/xrt/drivers/pimax_p3c/src/live.rs
+index d02fa4d52..23d8202c5 100644
+--- a/src/xrt/drivers/pimax_p3c/src/live.rs
++++ b/src/xrt/drivers/pimax_p3c/src/live.rs
+@@ -82,6 +82,19 @@ pub fn generation() -> u64 {
+     st.generation
+ }
+ 
++/// Value of `name` from the live file only (no environment fallback): for one-shot requests that must never come
++/// from a stored setting.
++pub fn get_live_only(name: &str) -> Option<String> {
++    let mut st = STATE.lock().unwrap();
++    refresh(&mut st);
++    st.map.get(name).cloned().flatten().filter(|v| !v.is_empty())
++}
++
++/// This process's start time in Unix milliseconds.
++pub fn process_started_ms() -> u64 {
++    started().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
++}
++
+ /// Current value of `name`: the live file if it has the key, else the environment.
+ pub fn get_str(name: &str) -> Option<String> {
+     let mut st = STATE.lock().unwrap();
+-- 
+2.56.0
+

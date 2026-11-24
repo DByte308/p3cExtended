@@ -1,0 +1,104 @@
+From b2a75678f2286d77014758667ae3d071b58d69fa Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:41:04 +0100
+Subject: [PATCH 1/2] Headset page: brightness, display upscaling, volume keys,
+ restart
+
+Brightness and upscaling apply live; the restart button sets a timestamp
+the driver acts on once. All four are live settings.
+---
+ src/ui/pimax_common.rs | 12 +++++++++-
+ src/ui/pimax_pages.rs  | 52 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index 57ef4d9..0614fc8 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -25,7 +25,17 @@ pub enum PimaxOutMsg {
+ 
+ /// Options the driver re-reads while the service runs (from `live_settings_path()`), so no restart is needed.
+ pub const LIVE_KEYS: &[&str] =
+-    &["PIMAX_IPD_OFFSET_MM", "PIMAX_CANT_SCALE", "PIMAX_EYE_CALIB", "PIMAX_EYE_FLIP", "PIMAX_STICK_DEADZONE"];
++    &[
++        "PIMAX_IPD_OFFSET_MM",
++        "PIMAX_CANT_SCALE",
++        "PIMAX_EYE_CALIB",
++        "PIMAX_EYE_FLIP",
++        "PIMAX_STICK_DEADZONE",
++        "PIMAX_BRIGHTNESS",
++        "PIMAX_UPSCALE",
++        "PIMAX_VOLUME_KEYS",
++        "PIMAX_RESTART_AT",
++    ];
+ 
+ pub fn live_settings_path() -> Option<std::path::PathBuf> {
+     std::env::var_os("XDG_RUNTIME_DIR")
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index d6bd907..60499c0 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -281,8 +281,60 @@ impl SimpleComponent for HeadsetPage {
+             "Which GPU vendor the driver should use",
+             &[("Default (NVIDIA)", None), ("AMD", Some("amd"))],
+         ));
++        // Brightness: once touched it is always stored, so going back to 100 is sent too.
++        display.add(&{
++            let c = ctx.clone();
++            let cur = ctx.get("PIMAX_BRIGHTNESS").and_then(|v| v.parse::<f64>().ok()).unwrap_or(100.0);
++            super::preference_rows::spin_row(
++                "Brightness (%)",
++                Some("Panel brightness, 1\u{2013}100. Applies immediately while the session runs"),
++                cur.clamp(1.0, 100.0),
++                1.0,
++                100.0,
++                5.0,
++                move |adj| c.set("PIMAX_BRIGHTNESS", Some(format!("{:.0}", adj.value()))),
++            )
++        });
++        display.add(&ctx.choice_row(
++            "PIMAX_UPSCALE",
++            "Display upscaling",
++            "Upscaling in the headset. Applies immediately while the session runs",
++            &[("Headset default", None), ("On", Some("1")), ("Off", Some("0"))],
++        ));
+         content.append(&display);
+ 
++        // Headset controls
++        let controls = group("Headset controls", None);
++        controls.add(&ctx.choice_row(
++            "PIMAX_VOLUME_KEYS",
++            "Volume keys",
++            "The headset's volume keys change the system output volume (up to 100 %)",
++            &[("On", None), ("Off", Some("0"))],
++        ));
++        controls.add(&{
++            let row = adw::ActionRow::builder()
++                .title("Restart headset")
++                .subtitle("Works while the session runs. The session stops when the headset disconnects; start it again once the headset is back")
++                .subtitle_lines(0)
++                .build();
++            let b = gtk::Button::builder()
++                .label("Restart")
++                .valign(gtk::Align::Center)
++                .css_classes(["pill", "destructive-action"])
++                .build();
++            let c = ctx.clone();
++            b.connect_clicked(move |_| {
++                let ms = std::time::SystemTime::now()
++                    .duration_since(std::time::UNIX_EPOCH)
++                    .map(|d| d.as_millis())
++                    .unwrap_or(0);
++                c.set("PIMAX_RESTART_AT", Some(ms.to_string()));
++            });
++            row.add_suffix(&b);
++            row
++        });
++        content.append(&controls);
++
+         // Audio
+         let audio = group(
+             "Audio",
+-- 
+2.56.0
+
