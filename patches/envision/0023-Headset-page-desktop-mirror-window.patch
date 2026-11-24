@@ -1,0 +1,35 @@
+From 5be25154ed749412f510a663e3f61512f6d12889 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:18:31 +0100
+Subject: [PATCH] Headset page: desktop mirror window
+
+A choice in the Display group sets XRT_WINDOW_PEEK (off, left eye, both
+eyes): a movable desktop window with the headset image, applied when the
+session starts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/pimax_pages.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 284eeb9..34592e6 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -331,6 +331,13 @@ impl SimpleComponent for HeadsetPage {
+             });
+             row
+         });
++        display.add(&ctx.choice_row(
++            "XRT_WINDOW_PEEK",
++            "Desktop mirror window",
++            "A movable window on the desktop that shows the headset image, e.g. for recording. Applies when the \
++             session starts; uses the compositor's graphics path and costs some performance",
++            &[("Off", None), ("Left eye", Some("left")), ("Both eyes", Some("both"))],
++        ));
+         content.append(&display);
+ 
+         // Headset controls
+-- 
+2.56.0
+

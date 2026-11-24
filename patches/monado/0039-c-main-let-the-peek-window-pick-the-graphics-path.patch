@@ -1,0 +1,66 @@
+From 4a56aaf0f1ef98cb6d7278ef9d499981274305b0 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:18:31 +0100
+Subject: [PATCH 39/40] c/main: let the peek window pick the graphics path
+
+The peek window refused to start whenever XRT_COMPOSITOR_COMPUTE was set,
+whatever its value, so XRT_COMPOSITOR_COMPUTE=0 still blocked it. Check the
+compositor's own use_compute setting instead, and when XRT_WINDOW_PEEK is
+set, use the graphics path for that session, since the peek window only
+works there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/compositor/main/comp_settings.c    | 13 +++++++++++++
+ src/xrt/compositor/main/comp_window_peek.c |  3 +--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/compositor/main/comp_settings.c b/src/xrt/compositor/main/comp_settings.c
+index 85b816713..568b9dc9e 100644
+--- a/src/xrt/compositor/main/comp_settings.c
++++ b/src/xrt/compositor/main/comp_settings.c
+@@ -8,7 +8,11 @@
+  * @ingroup comp_main
+  */
+ 
++#include "xrt/xrt_config_build.h"
+ #include "util/u_debug.h"
++#include "util/u_logging.h"
++
++#include <stdlib.h>
+ #include "comp_settings.h"
+ 
+ #ifdef XRT_OS_ANDROID
+@@ -104,6 +108,15 @@ comp_settings_init(struct comp_settings *s, struct xrt_device *xdev)
+ 
+ 	s->use_compute = debug_get_bool_option_compute();
+ 
++#ifdef XRT_FEATURE_WINDOW_PEEK
++	// The peek window only works with the graphics path: asking for it picks that path for this session.
++	const char *peek = getenv("XRT_WINDOW_PEEK");
++	if (s->use_compute && peek != NULL) {
++		U_LOG_W("XRT_WINDOW_PEEK is set: using the graphics compositor path instead of compute");
++		s->use_compute = false;
++	}
++#endif
++
+ 	if (s->use_compute) {
+ 		// Tested working with a PSVR2 and a patched Mesa. Native format of the PSVR2. 10-bit formats should be
+ 		// preferred in all cases for lower colour banding.
+diff --git a/src/xrt/compositor/main/comp_window_peek.c b/src/xrt/compositor/main/comp_window_peek.c
+index d8565ea26..13af442a8 100644
+--- a/src/xrt/compositor/main/comp_window_peek.c
++++ b/src/xrt/compositor/main/comp_window_peek.c
+@@ -123,8 +123,7 @@ window_peek_run_thread(void *ptr)
+ struct comp_window_peek *
+ comp_window_peek_create(struct comp_compositor *c)
+ {
+-	const char *compute = getenv("XRT_COMPOSITOR_COMPUTE");
+-	if (compute) {
++	if (c->settings.use_compute) {
+ 		COMP_WARN(c, "Peek window cannot be enabled on compute compositor");
+ 		return NULL;
+ 	}
+-- 
+2.56.0
+

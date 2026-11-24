@@ -162,6 +162,7 @@ check_deps() {
     need core pc  egl               mesa-libEGL-devel    libglvnd         libegl-dev
     need core pc  x11               libX11-devel         libx11           libx11-dev
     need core pc  xrandr            libXrandr-devel      libxrandr        libxrandr-dev
+    need core pc  sdl2              sdl2-compat-devel    sdl2-compat      libsdl2-dev
     need core so  libopenxr_loader.so.1 openxr-libs      openxr           libopenxr-loader1
     need envision cmd meson         meson                meson            meson
     need envision cmd glib-compile-resources glib2-devel glib2            libglib2.0-dev-bin
@@ -397,7 +398,8 @@ build_monado() {
     cmake -S "$MONADO_SRC" -B "$MONADO_BUILD" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$PIMAX_PREFIX"
-    cmake_require "$MONADO_BUILD" XRT_BUILD_DRIVER_PIMAX_P3C XRT_FEATURE_SLAM XRT_HAVE_VULKAN XRT_FEATURE_STEAMVR_PLUGIN
+    cmake_require "$MONADO_BUILD" XRT_BUILD_DRIVER_PIMAX_P3C XRT_FEATURE_SLAM XRT_HAVE_VULKAN XRT_FEATURE_STEAMVR_PLUGIN \
+        XRT_FEATURE_WINDOW_PEEK
     cmake --build "$MONADO_BUILD" --parallel "$JOBS"
     cmake --install "$MONADO_BUILD" --prefix "$PIMAX_PREFIX"
     # The SteamVR driver tree is installed to the configure-time prefix; make sure the prefix copy is current.

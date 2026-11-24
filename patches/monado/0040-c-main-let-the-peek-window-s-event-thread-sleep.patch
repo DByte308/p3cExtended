@@ -1,0 +1,44 @@
+From d6c040a4903b9e187a9699404f58a318792970bd Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:20:35 +0100
+Subject: [PATCH 40/40] c/main: let the peek window's event thread sleep
+
+The thread polled SDL events in a tight loop and kept one CPU core busy for
+the whole session. Wait for the next event instead, with a 100 ms timeout
+so the loop still notices when it is told to stop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/compositor/main/comp_window_peek.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/compositor/main/comp_window_peek.c b/src/xrt/compositor/main/comp_window_peek.c
+index 13af442a8..058cadd4a 100644
+--- a/src/xrt/compositor/main/comp_window_peek.c
++++ b/src/xrt/compositor/main/comp_window_peek.c
+@@ -82,7 +82,12 @@ window_peek_run_thread(void *ptr)
+ 	w->hidden = false;
+ 	while (w->running) {
+ 		SDL_Event event;
+-		while (SDL_PollEvent(&event)) {
++		// Sleep until an event arrives instead of spinning on a core for the whole session; the timeout keeps the
++		// loop noticing when running is cleared from outside.
++		if (!SDL_WaitEventTimeout(&event, 100)) {
++			continue;
++		}
++		do {
+ 			switch (event.type) {
+ 			case SDL_QUIT: w->running = false; break;
+ 			case SDL_WINDOWEVENT:
+@@ -114,7 +119,7 @@ window_peek_run_thread(void *ptr)
+ 			if (event.type == SDL_QUIT) {
+ 				w->running = false;
+ 			}
+-		}
++		} while (SDL_PollEvent(&event));
+ 	}
+ 
+ 	return NULL;
+-- 
+2.56.0
+

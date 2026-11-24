@@ -1,0 +1,140 @@
+From a505ac3993e697f985b73ab67e96ab9384863968 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:36:19 +0100
+Subject: [PATCH] Headset page: refresh rates from the stored headset EDID,
+ live
+
+The headset display is only up while a session runs, so the refresh-rate
+choices were greyed out whenever the headset was off. Fall back to the EDID
+the driver stores once it has seen the display, and re-check every 2 s while
+the row is shown (redrawn only on a change).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/headset_edid.rs    | 44 +++++++++++++++++++++++++++++++++---------
+ src/ui/pimax_common.rs | 39 ++++++++++++++++++++++++++++++++-----
+ 2 files changed, 69 insertions(+), 14 deletions(-)
+
+diff --git a/src/headset_edid.rs b/src/headset_edid.rs
+index 6bde979..f726af5 100644
+--- a/src/headset_edid.rs
++++ b/src/headset_edid.rs
+@@ -6,6 +6,9 @@
+ //!
+ //! Parsed from the public VESA layouts: detailed timing descriptors in the base block and in CTA-861 extension
+ //! blocks, and DisplayID type I (1.x) / type VII (2.x) timings in DisplayID extension blocks.
++//!
++//! The headset's display is only up while a session runs. The driver stores its EDID once it has seen it
++//! (`<monado config>/pimax_p3c/display/<serial>.edid`), and that copy is used while the headset is off.
+ 
+ use std::collections::BTreeSet;
+ use std::fs;
+@@ -100,16 +103,39 @@ pub fn edid_rates(edid: &[u8]) -> BTreeSet<u32> {
+     out
+ }
+ 
+-/// Refresh rates of the connected headset display, or None if no headset EDID is visible.
++fn rates_of(edid: &[u8]) -> Option<BTreeSet<u32>> {
++    (manufacturer(edid).as_deref() == Some(HEADSET_MANUFACTURER)).then(|| edid_rates(edid)).filter(|r| !r.is_empty())
++}
++
++/// Directory where the driver stores the headset EDIDs.
++fn stored_dir() -> std::path::PathBuf {
++    // The same rule as Monado's config directory: XDG_CONFIG_HOME when set, else ~/.config.
++    let base = std::env::var_os("XDG_CONFIG_HOME")
++        .map(std::path::PathBuf::from)
++        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
++        .unwrap_or_default();
++    base.join("monado/pimax_p3c/display")
++}
++
++/// Refresh rates of the headset display: from the connected display if it is up, else from the newest EDID the
++/// driver stored in an earlier session. None if neither is there.
+ pub fn headset_rates() -> Option<BTreeSet<u32>> {
+-    let mut found: Option<BTreeSet<u32>> = None;
+-    for entry in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+-        let Ok(edid) = fs::read(entry.path().join("edid")) else { continue };
+-        if manufacturer(&edid).as_deref() == Some(HEADSET_MANUFACTURER) {
+-            found.get_or_insert_with(BTreeSet::new).extend(edid_rates(&edid));
+-        }
+-    }
+-    found.filter(|r| !r.is_empty())
++    let live = fs::read_dir("/sys/class/drm")
++        .ok()
++        .into_iter()
++        .flatten()
++        .flatten()
++        .find_map(|e| rates_of(&fs::read(e.path().join("edid")).ok()?));
++    live.or_else(|| {
++        let mut stored: Vec<_> = fs::read_dir(stored_dir())
++            .ok()?
++            .flatten()
++            .filter(|e| e.path().extension().is_some_and(|x| x == "edid"))
++            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
++            .collect();
++        stored.sort();
++        stored.iter().rev().find_map(|(_, p)| rates_of(&fs::read(p).ok()?))
++    })
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index bfe19b4..85e6acb 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -273,7 +273,7 @@ impl Ctx {
+                         r.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+                     ),
+                     None => format!(
+-                        "{DESC}. Headset display not detected (it shows up while the headset is on): only the headset default can be chosen"
++                        "{DESC}. The headset's rates are not known yet: they are read once the headset display has been on in a session; until then only the headset default can be chosen"
+                     ),
+                 };
+                 if allowed(selected) {
+@@ -348,10 +348,39 @@ impl Ctx {
+                 rebind(row);
+             });
+         }
+-        row.connect_map(move |row| {
+-            *rates.borrow_mut() = crate::headset_edid::headset_rates();
+-            row.set_subtitle(&subtitle(row.selected() as usize));
+-            rebind(row);
++        // Read again when shown and every 2 s while shown (the headset display comes and goes with the session);
++        // redrawn only on a change, so an open popup is left alone.
++        let refresh = Rc::new(move |row: &adw::ComboRow, force: bool| {
++            let now = crate::headset_edid::headset_rates();
++            if force || *rates.borrow() != now {
++                *rates.borrow_mut() = now;
++                row.set_subtitle(&subtitle(row.selected() as usize));
++                rebind(row);
++            }
++        });
++        let poll: Rc<RefCell<Option<gtk::glib::SourceId>>> = Default::default();
++        row.connect_map({
++            let poll = poll.clone();
++            move |row| {
++                refresh(row, true);
++                let weak = row.downgrade();
++                let refresh = refresh.clone();
++                let id = gtk::glib::timeout_add_seconds_local(2, move || match weak.upgrade() {
++                    Some(r) => {
++                        refresh(&r, false);
++                        gtk::glib::ControlFlow::Continue
++                    }
++                    None => gtk::glib::ControlFlow::Break,
++                });
++                if let Some(old) = poll.replace(Some(id)) {
++                    old.remove();
++                }
++            }
++        });
++        row.connect_unmap(move |_| {
++            if let Some(id) = poll.take() {
++                id.remove();
++            }
+         });
+         row
+     }
+-- 
+2.56.0
+

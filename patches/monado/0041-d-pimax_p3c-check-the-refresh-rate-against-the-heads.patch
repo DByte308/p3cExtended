@@ -1,0 +1,215 @@
+From 90ac304ad9bd35a616a486f86775ca43680b9bcb Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:36:19 +0100
+Subject: [PATCH] d/pimax_p3c: check the refresh rate against the headset's
+ stored EDID
+
+A requested PIMAX_REFRESH_HZ is only sent when the headset's display lists
+that rate in its EDID. But the display only comes up about a second after
+the rate is sent and video is started, so the EDID was never there in
+time: every session fell back to the model default, whatever was chosen.
+
+Once video has started, wait for the display in the background and store
+its EDID per headset serial in the config directory. Later sessions check
+the requested rate against that copy (or the live EDID, if the display is
+already up), so a rate the panel cannot drive still never reaches it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/session/bringup.rs   |  3 +-
+ .../pimax_p3c/src/device/session/edid.rs      | 67 ++++++++++++++++---
+ .../pimax_p3c/src/device/session/mod.rs       | 32 ++++-----
+ .../pimax_p3c/src/device/session/video.rs     |  5 +-
+ 4 files changed, 80 insertions(+), 27 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+index 4a72203fb..411aad691 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+@@ -147,7 +147,8 @@ pub fn bring_up(interfaces: Interfaces, identity: &Identity) -> BringUp {
+     let calibration = calibration::load(&cmd, serial);
+     let device_info = DeviceInfo::query(&cmd);
+ 
+-    let required_rate = match video::start_video(&cmd, model) {
++    super::set_headset_serial(serial);
++    let required_rate = match video::start_video(&cmd, model, serial) {
+         Ok(rate_hz) => rate_hz,
+         Err(e) => {
+             error!("video bring-up failed: {e}");
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs b/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
+index e94c3479b..8115549cc 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
+@@ -6,9 +6,16 @@
+ //!
+ //! Parsed from the public VESA layouts: detailed timing descriptors in the base block and in CTA-861 extension
+ //! blocks, and DisplayID type I (1.x) / type VII (2.x) timings in DisplayID extension blocks.
++//!
++//! The headset's display only comes up after the rate is sent and video is started, so its EDID can not be read
++//! in time for the rate of the same session. Once it is up, the EDID is stored per headset serial in the driver's
++//! config directory (`display/<serial>.edid`), and later sessions check the requested rate against that copy.
+ 
++use crate::config;
+ use std::collections::BTreeSet;
+ use std::fs;
++use std::thread;
++use std::time::Duration;
+ 
+ /// PnP manufacturer id of the headset display.
+ const HEADSET_MANUFACTURER: &str = "PVR";
+@@ -100,16 +107,60 @@ pub fn edid_rates(edid: &[u8]) -> BTreeSet<u32> {
+     out
+ }
+ 
+-/// Refresh rates of the connected headset display, or None if no headset EDID is visible.
+-pub fn headset_rates() -> Option<BTreeSet<u32>> {
+-    let mut found: Option<BTreeSet<u32>> = None;
+-    for entry in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+-        let Ok(edid) = fs::read(entry.path().join("edid")) else { continue };
+-        if manufacturer(&edid).as_deref() == Some(HEADSET_MANUFACTURER) {
+-            found.get_or_insert_with(BTreeSet::new).extend(edid_rates(&edid));
++/// EDID of the headset display as the kernel shows it, if that display is up.
++fn live_edid() -> Option<Vec<u8>> {
++    fs::read_dir("/sys/class/drm").ok()?.flatten().find_map(|entry| {
++        let edid = fs::read(entry.path().join("edid")).ok()?;
++        (manufacturer(&edid).as_deref() == Some(HEADSET_MANUFACTURER) && !edid_rates(&edid).is_empty()).then_some(edid)
++    })
++}
++
++fn stored_file(serial: &str) -> String {
++    format!("display/{serial}.edid")
++}
++
++/// Refresh rates of this headset's display: from the live EDID if the display is up, else from the copy stored in
++/// an earlier session. The second value says which.
++pub fn headset_rates(serial: &str) -> Option<(BTreeSet<u32>, &'static str)> {
++    if let Some(edid) = live_edid() {
++        return Some((edid_rates(&edid), "its display"));
++    }
++    let edid = fs::read(config::path(stored_file(serial)).ok()?).ok()?;
++    if manufacturer(&edid).as_deref() != Some(HEADSET_MANUFACTURER) {
++        return None;
++    }
++    let rates = edid_rates(&edid);
++    (!rates.is_empty()).then_some((rates, "the copy stored in an earlier session"))
++}
++
++/// After video has started: wait for the headset display, store its EDID for later sessions, and check the rate
++/// this session was started with against it.
++pub fn store_when_up(serial: String, sent_hz: u8) {
++    let spawned = thread::Builder::new().name("pimax-edid".into()).spawn(move || {
++        for _ in 0..60 {
++            let Some(edid) = live_edid() else {
++                thread::sleep(Duration::from_millis(500));
++                continue;
++            };
++            let rates = edid_rates(&edid);
++            info!("headset display modes: {rates:?} Hz");
++            if !rates.contains(&u32::from(sent_hz)) {
++                warn!("the headset display does not list the {sent_hz} Hz this session was started with");
++            }
++            let file = stored_file(&serial);
++            let unchanged = config::path(&file).ok().and_then(|p| fs::read(p).ok()).is_some_and(|old| old == edid);
++            if !unchanged {
++                if let Err(e) = config::write(&file, &edid) {
++                    warn!("could not store the headset EDID: {e}");
++                }
++            }
++            return;
+         }
++        warn!("the headset display did not come up within 30 s; its refresh rates stay unknown");
++    });
++    if let Err(e) = spawned {
++        warn!("headset EDID: no thread: {e}");
+     }
+-    found.filter(|r| !r.is_empty())
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
+index f1659bda1..2685b6ed5 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
+@@ -14,8 +14,6 @@ pub(crate) mod volume_keys;
+ use crate::device::hmd::PimaxP3CHmdDisplay;
+ use crate::util::option_num;
+ use std::sync::OnceLock;
+-use std::thread::sleep;
+-use std::time::Duration;
+ use pimax_protocol::log::LogStream;
+ use pimax_protocol::{CommandDevice, ControllerStatusStream, HmdStatusStream};
+ 
+@@ -33,29 +31,31 @@ fn default_refresh_hz(model: PimaxP3CHmdDisplay) -> u8 {
+         | PimaxP3CHmdDisplay::DreamAir => 90,
+     }
+ }
++static HEADSET_SERIAL: OnceLock<String> = OnceLock::new();
++
++/// The connected headset's serial, set once at bring-up before the rate is resolved.
++pub(super) fn set_headset_serial(serial: &str) {
++    let _ = HEADSET_SERIAL.set(serial.to_string());
++}
++
+ /// The refresh rate sent to the headset. A requested rate (PIMAX_REFRESH_HZ) is only used if the headset's own
+ /// display lists it in its EDID: the rate goes to the headset unchecked, and a rate the panel cannot drive must
+-/// never reach it. Without a readable headset EDID only the model default is used. Resolved once per process,
+-/// first right before the rate is sent (after the headset's video work mode is set, when its display is up).
++/// never reach it. The display only comes up after the rate is sent, so the EDID stored in an earlier session is
++/// used (see `edid`); without one only the model default is used. Resolved once per process.
+ pub fn refresh_hz(model: PimaxP3CHmdDisplay) -> u8 {
+     static RATE: OnceLock<u8> = OnceLock::new();
+     *RATE.get_or_init(|| {
+         let default = default_refresh_hz(model);
+         let requested = option_num(REFRESH_HZ_ENV, 0);
+-        // The headset's display may still be coming up right after power-on.
+-        let mut rates = edid::headset_rates();
+-        for _ in 0..10 {
+-            if rates.is_some() {
+-                break;
+-            }
+-            sleep(Duration::from_millis(300));
+-            rates = edid::headset_rates();
+-        }
++        let rates = HEADSET_SERIAL.get().and_then(|s| edid::headset_rates(s));
+         match &rates {
+-            Some(r) => info!("headset display modes: {r:?} Hz"),
+-            None => warn!("no headset EDID found; refresh rate stays at the model default {default} Hz"),
++            Some((r, from)) => info!("headset display modes from {from}: {r:?} Hz"),
++            None => warn!(
++                "no headset EDID known yet (it is stored once the display is up); refresh rate stays at the model \
++                 default {default} Hz for this session"
++            ),
+         }
+-        let Some(rates) = rates else { return default };
++        let Some((rates, _)) = rates else { return default };
+         let listed = |hz: i64| u32::try_from(hz).is_ok_and(|hz| rates.contains(&hz));
+         if requested > 0 && i64::from(default) != requested {
+             if let (true, Ok(hz)) = (listed(requested), u8::try_from(requested)) {
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/video.rs b/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
+index 8aadccc1d..cdc826236 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
+@@ -25,17 +25,18 @@ fn gpu_type() -> GpuType {
+ }
+ 
+ /// Starts video and returns the refresh rate sent to the headset.
+-pub(super) fn start_video(cmd: &CommandDevice, model: PimaxP3CHmdDisplay) -> Result<u8, Error> {
++pub(super) fn start_video(cmd: &CommandDevice, model: PimaxP3CHmdDisplay, serial: &str) -> Result<u8, Error> {
+     cmd.query(&CmdVideoCtrl::SetWorkMode(gpu_type()))?;
+     match cmd.query(&CmdGetVideoCtrlInfo) {
+         Ok(payload) => debug!("GetVideoCtrlInfo -> {payload:02X?}"),
+         Err(e) => warn!("GetVideoCtrlInfo: {e}"),
+     }
+     sleep(Duration::from_secs(6));
+-    // Resolved here, not earlier: the headset display (and its EDID) may only be up after the work mode is set.
+     let rate_hz = super::refresh_hz(model);
+     cmd.query(&CmdVideoCtrl::SetRate(rate_hz))?;
+     cmd.query(&CmdVideoCtrl::Start)?;
++    // The headset display comes up about a second after this; keep its EDID for the next session's rate.
++    super::edid::store_when_up(serial.to_string(), rate_hz);
+     Ok(rate_hz)
+ }
+ 
+-- 
+2.56.0
+

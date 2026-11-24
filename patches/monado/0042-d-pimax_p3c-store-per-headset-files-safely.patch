@@ -1,0 +1,147 @@
+From 5e2ad67932257aebfb953e53c6779b153a40b5de Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:39:04 +0100
+Subject: [PATCH] d/pimax_p3c: store per-headset files safely
+
+The headset serial (raw bytes from the device) went straight into the
+calibration and EDID file names: an empty serial gave one shared file, and a
+slash or dots would leave the directory. Use it only when it is 1-64 ASCII
+letters, digits, '-' or '_'; otherwise nothing is stored for that headset.
+Config files are now written through a temporary file and a rename, so a
+reader never sees a half-written one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/pimax_p3c/src/config.rs       | 23 ++++++++++++++++++-
+ .../src/device/session/calibration.rs         | 17 ++++++++------
+ .../pimax_p3c/src/device/session/edid.rs      | 11 +++++----
+ 3 files changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/config.rs b/src/xrt/drivers/pimax_p3c/src/config.rs
+index 70cb8ca18..bec0e98fc 100644
+--- a/src/xrt/drivers/pimax_p3c/src/config.rs
++++ b/src/xrt/drivers/pimax_p3c/src/config.rs
+@@ -32,10 +32,31 @@ pub fn read(relative: impl AsRef<Path>) -> io::Result<String> {
+     fs::read_to_string(&path).map_err(|e| with_path(&path, e))
+ }
+ 
++/// Writes through a temporary file and a rename, so a reader never sees a half-written file.
+ pub fn write(relative: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
+     let path = path(relative)?;
+     if let Some(parent) = path.parent() {
+         fs::create_dir_all(parent).map_err(|e| with_path(parent, e))?;
+     }
+-    fs::write(&path, contents).map_err(|e| with_path(&path, e))
++    let mut tmp = path.clone().into_os_string();
++    tmp.push(format!(".tmp{}", std::process::id()));
++    let tmp = PathBuf::from(tmp);
++    fs::write(&tmp, contents).map_err(|e| with_path(&tmp, e))?;
++    fs::rename(&tmp, &path).map_err(|e| {
++        let _ = fs::remove_file(&tmp);
++        with_path(&path, e)
++    })
++}
++
++/// `<dir>/<serial>.<ext>` for a per-headset file, or None when the serial (raw bytes from the device) is empty or
++/// has characters that do not belong in a file name; nothing is stored for such a headset then.
++pub fn per_headset_file(dir: &str, serial: &str, ext: &str) -> Option<String> {
++    let ok = !serial.is_empty()
++        && serial.len() <= 64
++        && serial.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
++    if !ok {
++        static WARNED: std::sync::Once = std::sync::Once::new();
++        WARNED.call_once(|| warn!("headset serial {serial:?} is not usable as a file name; nothing is stored for it"));
++    }
++    ok.then(|| format!("{dir}/{serial}.{ext}"))
+ }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/calibration.rs b/src/xrt/drivers/pimax_p3c/src/device/session/calibration.rs
+index 6a7f83fae..a74f13a04 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/calibration.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/calibration.rs
+@@ -2,8 +2,8 @@ use crate::config;
+ use pimax_protocol::CommandDevice;
+ use pimax_protocol::calibration::{SlamCalibration, read_slam_calibration_xml};
+ 
+-fn calibration_file(serial: &str) -> String {
+-    format!("calibration/{serial}.xml")
++fn calibration_file(serial: &str) -> Option<String> {
++    config::per_headset_file("calibration", serial, "xml")
+ }
+ 
+ pub(super) fn load(cmd: &CommandDevice, serial: &str) -> Option<SlamCalibration> {
+@@ -11,11 +11,12 @@ pub(super) fn load(cmd: &CommandDevice, serial: &str) -> Option<SlamCalibration>
+ }
+ 
+ fn from_file(serial: &str) -> Option<SlamCalibration> {
+-    let file = config::read(calibration_file(serial)).ok()?;
++    let name = calibration_file(serial)?;
++    let file = config::read(&name).ok()?;
+     match SlamCalibration::parse_xml(&file) {
+         Ok(c) => Some(c),
+         Err(e) => {
+-            warn!("{}: {e}; reading the device instead", calibration_file(serial));
++            warn!("{name}: {e}; reading the device instead");
+             None
+         }
+     }
+@@ -28,9 +29,11 @@ fn read_from_device(cmd: &CommandDevice) -> Option<String> {
+ }
+ 
+ fn store_and_parse(serial: &str, calibration_doc: String) -> Option<SlamCalibration> {
+-    if let Err(e) = config::write(calibration_file(serial), calibration_doc.as_bytes()) {
+-        warn!("Failed to store the SLAM calibration: {e}");
+-    };
++    if let Some(name) = calibration_file(serial) {
++        if let Err(e) = config::write(name, calibration_doc.as_bytes()) {
++            warn!("Failed to store the SLAM calibration: {e}");
++        }
++    }
+ 
+     SlamCalibration::parse_xml(&calibration_doc)
+         .inspect_err(|e| warn!("Failed to parse slam calibration document: {:?}", e))
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs b/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
+index 8115549cc..5bd40f1c0 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
+@@ -107,7 +107,8 @@ pub fn edid_rates(edid: &[u8]) -> BTreeSet<u32> {
+     out
+ }
+ 
+-/// EDID of the headset display as the kernel shows it, if that display is up.
++/// EDID of the headset display as the kernel shows it, if that display is up. With two headsets connected this is
++/// the first one found, which need not be the one being brought up.
+ fn live_edid() -> Option<Vec<u8>> {
+     fs::read_dir("/sys/class/drm").ok()?.flatten().find_map(|entry| {
+         let edid = fs::read(entry.path().join("edid")).ok()?;
+@@ -115,8 +116,8 @@ fn live_edid() -> Option<Vec<u8>> {
+     })
+ }
+ 
+-fn stored_file(serial: &str) -> String {
+-    format!("display/{serial}.edid")
++fn stored_file(serial: &str) -> Option<String> {
++    config::per_headset_file("display", serial, "edid")
+ }
+ 
+ /// Refresh rates of this headset's display: from the live EDID if the display is up, else from the copy stored in
+@@ -125,7 +126,7 @@ pub fn headset_rates(serial: &str) -> Option<(BTreeSet<u32>, &'static str)> {
+     if let Some(edid) = live_edid() {
+         return Some((edid_rates(&edid), "its display"));
+     }
+-    let edid = fs::read(config::path(stored_file(serial)).ok()?).ok()?;
++    let edid = fs::read(config::path(stored_file(serial)?).ok()?).ok()?;
+     if manufacturer(&edid).as_deref() != Some(HEADSET_MANUFACTURER) {
+         return None;
+     }
+@@ -147,7 +148,7 @@ pub fn store_when_up(serial: String, sent_hz: u8) {
+             if !rates.contains(&u32::from(sent_hz)) {
+                 warn!("the headset display does not list the {sent_hz} Hz this session was started with");
+             }
+-            let file = stored_file(&serial);
++            let Some(file) = stored_file(&serial) else { return };
+             let unchanged = config::path(&file).ok().and_then(|p| fs::read(p).ok()).is_some_and(|old| old == edid);
+             if !unchanged {
+                 if let Err(e) = config::write(&file, &edid) {
+-- 
+2.56.0
+
