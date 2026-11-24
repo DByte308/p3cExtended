@@ -1,0 +1,65 @@
+From 953d690bd796d5e8ff0c338c87fabd82b1e4a188 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:09:41 +0100
+Subject: [PATCH 13/28] d/pimax_p3c: status file reports the resolved model;
+ skip the MCU soft-version query
+
+The MCU does not answer CmdSoftVer, and the model passed to bring_up was
+the pre-engine-resolution one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/pimax_p3c/src/device/mod.rs             | 2 +-
+ src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs | 9 ++++++---
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/mod.rs
+index 7034e8c36..cf1a50f4f 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/mod.rs
+@@ -40,7 +40,7 @@ pub(crate) fn create_devices(xp: *mut xrt_prober, interfaces: Interfaces) -> Vec
+         }
+     };
+ 
+-    let headset = bringup::bring_up(interfaces, &identity.serial);
++    let headset = bringup::bring_up(interfaces, &identity);
+ 
+     let tracking = Arc::new(Tracking::new(config.display_in_imu()));
+     let usb_threads = headset.sessions.start(tracking.clone());
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+index cafc24a72..f45637ebf 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+@@ -76,7 +76,8 @@ fn printable_or_hex(bytes: &[u8]) -> String {
+ impl DeviceInfo {
+     fn query(cmd: &CommandDevice) -> Self {
+         let mut firmware = Vec::new();
+-        for (name, device) in [("HMD", PimaxSubDevice::Hmd), ("MCU", PimaxSubDevice::MCU)] {
++        // The MCU does not answer this command.
++        for (name, device) in [("HMD", PimaxSubDevice::Hmd)] {
+             match cmd.query(&CmdSoftVer { cmd_opt: device }) {
+                 Ok(payload) => {
+                     let text = printable_or_hex(&payload);
+@@ -127,15 +128,17 @@ pub struct Sessions {
+     stop: Arc<AtomicBool>,
+ }
+ 
+-pub fn bring_up(interfaces: Interfaces, serial: &str) -> BringUp {
++pub fn bring_up(interfaces: Interfaces, identity: &Identity) -> BringUp {
++    let serial = identity.serial.as_str();
+     let Interfaces {
+         cmd,
+         mut hmd_status_stream,
+         mut controller_status_stream,
+         mcu_log,
+         panel_log,
+-        model,
++        model: _,
+     } = interfaces;
++    let model = identity.model;
+ 
+     let stop = Arc::new(AtomicBool::new(false));
+     let log_thread = LogSession::spawn(mcu_log, panel_log, stop.clone());
+-- 
+2.56.0
+

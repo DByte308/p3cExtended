@@ -1,0 +1,282 @@
+From 57b3f5d5df892e8a938fc08462fbb9ac3f0994fe Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:23:28 +0100
+Subject: [PATCH 07/13] Move Pimax settings out of the preferences dialog
+
+Remove pimax_prefs.rs (now on the Pimax pages), register new modules,
+mark pimax_box.rs deprecated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/mod.rs                |   4 +-
+ src/ui/pimax_box.rs          |   2 +
+ src/ui/pimax_prefs.rs        | 217 -----------------------------------
+ src/ui/preferences_window.rs |   1 -
+ 4 files changed, 5 insertions(+), 219 deletions(-)
+ delete mode 100644 src/ui/pimax_prefs.rs
+
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index b828967..64c022b 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -19,7 +19,9 @@ mod preferences_window;
+ mod profile_editor;
+ mod steam_launch_options_box;
+ mod pimax_box;
+-mod pimax_prefs;
++mod pimax_common;
++mod pimax_eye;
++mod pimax_pages;
+ mod steamvr_calibration_box;
+ mod term_widget;
+ mod util;
+diff --git a/src/ui/pimax_box.rs b/src/ui/pimax_box.rs
+index 86c8c91..1a28c14 100644
+--- a/src/ui/pimax_box.rs
++++ b/src/ui/pimax_box.rs
+@@ -1,5 +1,7 @@
+ #![allow(unused_assignments)] // vars named in view! macro are not correctly recognized as used
+ 
++// DEPRECATED: replaced by the pages in pimax_pages.rs / pimax_eye.rs (sidebar shell); kept until the shell drops it.
++
+ //! Pimax tools card on the main view: eye-tracking calibration, gaze test, foveation test.
+ //! The tools are the pimax-linux clients in ~/.local/bin (tools/xrgaze in the pimax-linux repo); they are OpenXR
+ //! apps, so the XR service must be running.
+diff --git a/src/ui/pimax_prefs.rs b/src/ui/pimax_prefs.rs
+deleted file mode 100644
+index 4d9ba0e..0000000
+--- a/src/ui/pimax_prefs.rs
++++ /dev/null
+@@ -1,217 +0,0 @@
+-//! "Pimax" page of the preferences dialog. Every row is a global env var read by the pimax_p3c Monado driver
+-//! (or the Monado compositor); unset = driver default. Changes apply when the XR service is (re)started.
+-
+-use crate::{
+-    config::Config,
+-    ui::{
+-        pimax_box::EYE_CALIB_VAR,
+-        preference_rows::{combo_row, entry_row, spin_row, switch_row},
+-    },
+-};
+-use adw::prelude::*;
+-use std::{cell::RefCell, rc::Rc};
+-
+-type Cfg = Rc<RefCell<Config>>;
+-
+-fn get(cfg: &Cfg, k: &str) -> Option<String> {
+-    cfg.borrow().global_preferences.env_vars.get(k).cloned()
+-}
+-
+-fn set(cfg: &Cfg, k: &str, v: Option<String>) {
+-    let mut c = cfg.borrow_mut();
+-    match v {
+-        Some(v) => c.global_preferences.env_vars.insert(k.into(), v),
+-        None => c.global_preferences.env_vars.remove(k),
+-    };
+-}
+-
+-fn bool_var(cfg: &Cfg, k: &str, default: bool) -> bool {
+-    match get(cfg, k).as_deref() {
+-        Some("0" | "false" | "off" | "no") => false,
+-        Some(_) => true,
+-        None => default,
+-    }
+-}
+-
+-/// Switch for a boolean driver option; writes the var only when it differs from the driver default.
+-fn bool_row(cfg: &Cfg, k: &'static str, title: &str, desc: &str, default: bool) -> adw::SwitchRow {
+-    let c = cfg.clone();
+-    switch_row(title, Some(desc), bool_var(cfg, k, default), move |_, v| {
+-        set(&c, k, (v != default).then(|| if v { "1" } else { "0" }.to_string()));
+-    })
+-}
+-
+-/// Spin row for a numeric option; `unset` (shown as that value) removes the var.
+-fn num_row(cfg: &Cfg, k: &'static str, title: &str, desc: &str, unset: f64, min: f64, max: f64, step: f64) -> adw::SpinRow {
+-    let c = cfg.clone();
+-    let val = get(cfg, k).and_then(|v| v.parse().ok()).unwrap_or(unset);
+-    spin_row(title, Some(desc), val, min, max, step, move |adj| {
+-        let v = adj.value();
+-        set(&c, k, (v != unset).then(|| if step >= 1.0 { format!("{v:.0}") } else { format!("{v}") }));
+-    })
+-}
+-
+-fn group(title: &str, desc: Option<&str>) -> adw::PreferencesGroup {
+-    let g = adw::PreferencesGroup::builder().title(title).build();
+-    if let Some(d) = desc {
+-        g.set_description(Some(d));
+-    }
+-    g
+-}
+-
+-pub fn pimax_page(cfg: Cfg) -> adw::PreferencesPage {
+-    let page = adw::PreferencesPage::builder()
+-        .title("Pimax")
+-        .icon_name("video-display-symbolic")
+-        .build();
+-
+-    // Display
+-    let display = group("Display", Some("Applied when the XR service starts."));
+-    {
+-        const RATES: [&str; 4] = ["Default (90 Hz)", "72 Hz", "90 Hz", "120 Hz"];
+-        let cur = match get(&cfg, "PIMAX_REFRESH_HZ").as_deref() {
+-            Some("72") => RATES[1],
+-            Some("90") => RATES[2],
+-            Some("120") => RATES[3],
+-            _ => RATES[0],
+-        };
+-        let c = cfg.clone();
+-        display.add(&combo_row(
+-            "Refresh rate",
+-            Some("72 Hz saves GPU time; 120 Hz is not offered by every model"),
+-            cur,
+-            RATES.iter().map(|s| s.to_string()).collect(),
+-            move |row| {
+-                let v = match row.selected() {
+-                    1 => Some("72"),
+-                    2 => Some("90"),
+-                    3 => Some("120"),
+-                    _ => None,
+-                };
+-                set(&c, "PIMAX_REFRESH_HZ", v.map(String::from));
+-            },
+-        ));
+-    }
+-    display.add(&num_row(
+-        &cfg,
+-        "XRT_COMPOSITOR_SCALE_PERCENTAGE",
+-        "Render resolution (%)",
+-        "Compositor render scale; 100 = native panel resolution",
+-        100.0,
+-        30.0,
+-        200.0,
+-        5.0,
+-    ));
+-    page.add(&display);
+-
+-    // Advanced hardware
+-    let hw = group("Advanced hardware", None);
+-    hw.add(&num_row(
+-        &cfg,
+-        "PIMAX_STICK_DEADZONE",
+-        "Thumbstick dead zone (%)",
+-        "Ignore small thumbstick movement; 0 = none",
+-        0.0,
+-        0.0,
+-        50.0,
+-        1.0,
+-    ));
+-    {
+-        const GPUS: [&str; 2] = ["Default (NVIDIA)", "AMD"];
+-        let cur = if get(&cfg, "PIMAX_GPU").as_deref() == Some("amd") { GPUS[1] } else { GPUS[0] };
+-        let c = cfg.clone();
+-        hw.add(&combo_row(
+-            "GPU",
+-            Some("Which GPU vendor the driver should use"),
+-            cur,
+-            GPUS.iter().map(|s| s.to_string()).collect(),
+-            move |row| set(&c, "PIMAX_GPU", (row.selected() == 1).then(|| "amd".to_string())),
+-        ));
+-    }
+-    page.add(&hw);
+-
+-    // IPD
+-    let ipd = group(
+-        "IPD (lens distance)",
+-        Some("The Crystal Super moves its lenses with motors (58–72 mm). Set your IPD so your pupils sit on the lens centres; the rendered eye distance follows the lenses."),
+-    );
+-    ipd.add(&num_row(
+-        &cfg,
+-        "PIMAX_IPD_MM",
+-        "IPD (mm)",
+-        "0 = leave the lenses where they are",
+-        0.0,
+-        0.0,
+-        72.0,
+-        0.5,
+-    ));
+-    ipd.add(&num_row(
+-        &cfg,
+-        "PIMAX_IPD_OFFSET_MM",
+-        "Render IPD offset (mm)",
+-        "Added to the rendered eye distance only (world scale); 0 = none",
+-        0.0,
+-        -5.0,
+-        5.0,
+-        0.5,
+-    ));
+-    page.add(&ipd);
+-
+-    // Eye tracking
+-    let et = group(
+-        "Eye Tracking",
+-        Some("Calibrate from the main window (Pimax Crystal → Recalibrate) while the XR service runs."),
+-    );
+-    et.add(&bool_row(&cfg, "PIMAX_EYE_TRACKING", "Eye tracking", "Tobii eye tracker for gaze input and foveation", true));
+-    {
+-        let c = cfg.clone();
+-        let row = entry_row("Calibration", &get(&cfg, EYE_CALIB_VAR).unwrap_or_default(), move |r| {
+-            let t = r.text().trim().to_string();
+-            set(&c, EYE_CALIB_VAR, (!t.is_empty()).then_some(t));
+-        });
+-        row.set_tooltip_text(Some("Six numbers written by Recalibrate; clear to use the raw tracker output"));
+-        et.add(&row);
+-    }
+-    {
+-        const FLIPS: [&str; 4] = ["None", "Horizontal (x)", "Vertical (y)", "Both (xy)"];
+-        let cur = match get(&cfg, "PIMAX_EYE_FLIP").as_deref() {
+-            Some("x") => FLIPS[1],
+-            Some("y") => FLIPS[2],
+-            Some("xy" | "yx") => FLIPS[3],
+-            _ => FLIPS[0],
+-        };
+-        let c = cfg.clone();
+-        et.add(&combo_row(
+-            "Axis flip",
+-            Some("Raw axis mirroring before calibration; normally None (calibration handles it)"),
+-            cur,
+-            FLIPS.iter().map(|s| s.to_string()).collect(),
+-            move |row| {
+-                let v = match row.selected() {
+-                    1 => Some("x"),
+-                    2 => Some("y"),
+-                    3 => Some("xy"),
+-                    _ => None,
+-                };
+-                set(&c, "PIMAX_EYE_FLIP", v.map(String::from));
+-            },
+-        ));
+-    }
+-    page.add(&et);
+-
+-    // Foveated rendering
+-    let fov = group(
+-        "Foveated Rendering",
+-        Some("Quad views: apps that support XR_VARJO_quad_views render a sharp inset where you look."),
+-    );
+-    fov.add(&bool_row(&cfg, "PIMAX_FOVEATION", "Quad views (foveation)", "Offer gaze-steered quad views to apps", true));
+-    page.add(&fov);
+-
+-    // Tracking
+-    let trk = group("Tracking", None);
+-    trk.add(&bool_row(&cfg, "PIMAX_SLAM", "Inside-out tracking (SLAM)", "Headset cameras; off when a lighthouse faceplate is used", true));
+-    trk.add(&bool_row(&cfg, "PIMAX_CONSTELLATION", "Controller tracking", "Controller LEDs seen by the headset cameras", true));
+-    page.add(&trk);
+-
+-    page
+-}
+diff --git a/src/ui/preferences_window.rs b/src/ui/preferences_window.rs
+index 3053f53..d34014e 100644
+--- a/src/ui/preferences_window.rs
++++ b/src/ui/preferences_window.rs
+@@ -370,7 +370,6 @@ impl AsyncComponent for PreferencesWindow {
+ 
+         let widgets = view_output!();
+ 
+-        widgets.win.add(&super::pimax_prefs::pimax_page(model.config.clone()));
+         model.win = Some(widgets.win.clone());
+         model.plugins_grp = Some(widgets.plugins_grp.clone());
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,98 @@
+From 5eb3512c78e48b9c79b96b2fb449cbd3417504d8 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:07:35 +0100
+Subject: [PATCH 09/28] d/pimax_p3c: log firmware version and device check at
+ bring-up
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/session/bringup.rs   | 58 +++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+index c2c316dc6..91e552036 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+@@ -8,7 +8,9 @@ use crate::device::tracking::Tracking;
+ 
+ use pimax_protocol::calibration::SlamCalibration;
+ use pimax_protocol::cmd::read_imu_config::CmdReadImuConfig;
++use pimax_protocol::cmd::device_check::CmdDeviceCheck;
+ use pimax_protocol::cmd::read_sn::CmdReadSn;
++use pimax_protocol::cmd::soft_ver::CmdSoftVer;
+ use pimax_protocol::cmd::vision_sts::{CmdVisionSts1, SuperOpticalEngine};
+ use pimax_protocol::device::PimaxSubDevice;
+ use pimax_protocol::status::imu::{CONTROLLER_FORMAT, HMD_FORMAT};
+@@ -53,6 +55,61 @@ fn resolve_crystal_super_engine(
+     }
+ }
+ 
++/// Firmware and self-test results, for the log and the status file. Failures only warn.
++#[derive(Clone, Default)]
++pub struct DeviceInfo {
++    pub firmware: Option<String>,
++    pub device_check: Option<String>,
++}
++
++fn printable_or_hex(bytes: &[u8]) -> String {
++    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
++    let bytes = &bytes[..end];
++    if !bytes.is_empty() && bytes.iter().all(|b| (0x20..0x7F).contains(b)) {
++        String::from_utf8_lossy(bytes).into_owned()
++    } else {
++        bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
++    }
++}
++
++impl DeviceInfo {
++    fn query(cmd: &CommandDevice) -> Self {
++        let mut firmware = Vec::new();
++        for (name, device) in [("HMD", PimaxSubDevice::Hmd), ("MCU", PimaxSubDevice::MCU)] {
++            match cmd.query(&CmdSoftVer { cmd_opt: device }) {
++                Ok(payload) => {
++                    let text = printable_or_hex(&payload);
++                    info!("software version ({name}): {text} (raw {payload:02X?})");
++                    if !text.is_empty() {
++                        firmware.push(if device == PimaxSubDevice::Hmd { text } else { format!("{name} {text}") });
++                    }
++                }
++                Err(e) => warn!("could not read the software version ({name}): {e}"),
++            }
++        }
++        let device_check = match cmd.query(&CmdDeviceCheck) {
++            Ok(check) => {
++                let text = check
++                    .subsystems()
++                    .filter(|&(_, exists, _)| exists)
++                    .map(|(name, _, ok)| format!("{name}={}", if ok { "ok" } else { "FAIL" }))
++                    .collect::<Vec<_>>()
++                    .join(", ");
++                info!("device check: {:#X}: {text}", check.status);
++                Some(text)
++            }
++            Err(e) => {
++                warn!("device check failed: {e}");
++                None
++            }
++        };
++        Self {
++            firmware: (!firmware.is_empty()).then(|| firmware.join("; ")),
++            device_check,
++        }
++    }
++}
++
+ pub struct BringUp {
+     pub calibration: Option<SlamCalibration>,
+     pub lighthouse_plate: bool,
+@@ -82,6 +139,7 @@ pub fn bring_up(interfaces: Interfaces, serial: &str) -> BringUp {
+     let log_thread = LogSession::spawn(mcu_log, panel_log, stop.clone());
+ 
+     let calibration = calibration::load(&cmd, serial);
++    let device_info = DeviceInfo::query(&cmd);
+ 
+     let rate_hz = refresh_hz(model);
+     let required_rate = match video::start_video(&cmd, rate_hz) {
+-- 
+2.56.0
+

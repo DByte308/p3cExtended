@@ -1,0 +1,793 @@
+From 9ae6e3f368907f9fbf6a57421dce23b10191318f Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:00:42 +0100
+Subject: [PATCH 01/28] d/pimax_p3c: fix stereo, add eye tracking and
+ gaze-steered quad views
+
+Stereo (Crystal Super Ultrawide, verified in the headset):
+- view_fov(): use the visible extent around the lens centre per side; the old
+  signed fov_fix_degree plus the per-eye side swap gave the right eye the left
+  eye's frustum, and the cant was applied twice (pose and frustum).
+- lens centre from lens.separation + level offset (~2 mm nasal) instead of
+  h_size/2. Override: PIMAX_LENS_SEP_MM.
+- diagnostics: PIMAX_CANT_SCALE (percent), PIMAX_BLANK_EYE=0|1.
+
+Eye tracking: Tobii VR4 EyeChip over libusb (TTP), XRT_DEVICE_EYE_GAZE_INTERACTION
+device, per-eye fallback; native quad views (views 2-3 follow gaze).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/pimax_p3c/Cargo.toml          |   1 +
+ src/xrt/drivers/pimax_p3c/src/device/eye.rs   | 468 ++++++++++++++++++
+ .../pimax_p3c/src/device/hmd/distortion.rs    |  41 +-
+ .../drivers/pimax_p3c/src/device/hmd/mod.rs   |  20 +-
+ .../drivers/pimax_p3c/src/device/hmd/views.rs |  32 +-
+ src/xrt/drivers/pimax_p3c/src/device/mod.rs   |   1 +
+ .../pimax_p3c/src/device/session/extras.rs    |  41 +-
+ 7 files changed, 596 insertions(+), 8 deletions(-)
+ create mode 100644 src/xrt/drivers/pimax_p3c/src/device/eye.rs
+
+diff --git a/src/xrt/drivers/pimax_p3c/Cargo.toml b/src/xrt/drivers/pimax_p3c/Cargo.toml
+index 86a786d7e..3d4312608 100644
+--- a/src/xrt/drivers/pimax_p3c/Cargo.toml
++++ b/src/xrt/drivers/pimax_p3c/Cargo.toml
+@@ -10,6 +10,7 @@ pimax-protocol = { git = "https://gitlab.freedesktop.org/ultradev/pimax-protocol
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ arraydeque = "0.5.1"
++rusb = "0.9"
+ 
+ [build-dependencies]
+ monado-build.workspace = true
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/eye.rs b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+new file mode 100644
+index 000000000..dc8dedfa9
+--- /dev/null
++++ b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+@@ -0,0 +1,468 @@
++//! Eye tracking: Tobii "VR4" EyeChip (USB 2104:0220) speaking Tobii TTP over bulk endpoints.
++//!
++//! The headset powers the chip and starts its cameras/illuminators through the vendor HID commands in
++//! `session::extras` (CmdEyeTrackEnable + the Vision "opt 05" bring-up).  This module only reads the chip:
++//! vendor control transfers, TTP hello, subscribe to stream 1289 (0x509, combined gaze, ~120 Hz).
++//! Wire format derived from observation; see docs/ROADMAP.md in the pimax-linux project.
++
++use rusb::{Context, DeviceHandle, UsbContext};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex};
++use std::thread::{self, JoinHandle};
++use std::time::{Duration, Instant};
++
++const VID: u16 = 0x2104;
++const PID: u16 = 0x0220;
++const EP_IN: u8 = 0x83;
++const EP_OUT: u8 = 0x05;
++const STREAM_GAZE: u16 = 1289;
++const STREAM_EYES: u16 = 1285;
++const OP_HELLO: u32 = 0x3E8;
++const OP_SUBSCRIBE: u32 = 0x4C4;
++const OP_UNSUBSCRIBE: u32 = 0x4CE;
++const HELLO: [u8; 47] = [
++    0, 0, 0x17, 0, 0, 0, 0x28, 0, 0, 0, 9, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 4, 0, 1, 0, 5, 0, 1, 0, 6,
++    0, 1, 0, 7, 0, 1, 0, 8,
++];
++/// A sample older than this is reported as "no gaze".
++const STALE: Duration = Duration::from_millis(250);
++
++#[derive(Clone, Copy, Debug)]
++pub struct Gaze {
++    /// Combined gaze direction, chip frame: x right, y up, z forward (unit length).
++    pub dir: [f32; 3],
++    pub at: Instant,
++}
++
++pub struct EyeTracker {
++    latest: Mutex<Option<Gaze>>,
++    want: AtomicBool,
++    touched: Mutex<Option<Instant>>,
++    stop: AtomicBool,
++    thread: Mutex<Option<JoinHandle<()>>>,
++}
++
++impl EyeTracker {
++    pub fn start() -> Arc<Self> {
++        let me = Arc::new(Self {
++            latest: Mutex::new(None),
++            want: AtomicBool::new(false),
++            touched: Mutex::new(None),
++            stop: AtomicBool::new(false),
++            thread: Mutex::new(None),
++        });
++        let worker = me.clone();
++        let handle = thread::Builder::new().name("pimax-eye".into()).spawn(move || worker.run()).ok();
++        *me.thread.lock().unwrap() = handle;
++        me
++    }
++
++    /// xrt_device::begin_feature / end_feature.
++    pub fn set_enabled(&self, on: bool) {
++        self.want.store(on, Ordering::Relaxed);
++        if !on {
++            *self.latest.lock().unwrap() = None;
++        }
++    }
++
++    /// Foveation (quad views) asks for gaze every frame instead of via begin_feature; stays on 2 s after the last ask.
++    pub fn touch(&self) {
++        *self.touched.lock().unwrap() = Some(Instant::now());
++    }
++
++    fn wanted(&self) -> bool {
++        self.want.load(Ordering::Relaxed) || self.touched.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_secs(2))
++    }
++
++    pub fn gaze(&self) -> Option<Gaze> {
++        let g = (*self.latest.lock().unwrap())?;
++        (g.at.elapsed() < STALE).then_some(g)
++    }
++
++    pub fn shutdown(&self) {
++        self.stop.store(true, Ordering::Relaxed);
++        if let Some(t) = self.thread.lock().unwrap().take() {
++            let _ = t.join();
++        }
++    }
++
++    fn run(&self) {
++        let Ok(ctx) = Context::new() else {
++            warn!("eye tracking: libusb init failed");
++            return;
++        };
++        let mut warned = false;
++        while !self.stop.load(Ordering::Relaxed) {
++            if !self.wanted() {
++                thread::sleep(Duration::from_millis(100));
++                continue;
++            }
++            match open_chip(&ctx) {
++                Some(h) => {
++                    warned = false;
++                    if let Err(e) = self.stream(&h) {
++                        warn!("eye tracking: stream ended: {e}");
++                    }
++                    let _ = h.release_interface(0);
++                }
++                None => {
++                    if !warned {
++                        warn!("eye tracking: EyeChip {VID:04x}:{PID:04x} not found or not accessible (udev rule?), retrying");
++                        warned = true;
++                    }
++                }
++            }
++            thread::sleep(Duration::from_secs(1));
++        }
++    }
++
++    fn stream(&self, h: &DeviceHandle<Context>) -> Result<(), String> {
++        let t = Duration::from_millis(1500);
++        let e = |what: &str, r: rusb::Error| format!("{what}: {r}");
++        let mut buf = vec![0u8; 512];
++        h.read_control(0xC1, 48, 0, 0, &mut buf, t).map_err(|r| e("info", r))?;
++        h.read_control(0xC1, 70, 1, 0, &mut buf[..8], t).map_err(|r| e("counter", r))?;
++        h.write_control(0x41, 65, 0, 0, &[], t).map_err(|r| e("session", r))?;
++        thread::sleep(Duration::from_millis(200));
++
++        let mut seq = 0u32;
++        let mut pending = Vec::new();
++        request(h, &mut seq, &mut pending, OP_HELLO, &HELLO)?;
++        let sub = stream_payload(STREAM_GAZE);
++        request(h, &mut seq, &mut pending, OP_SUBSCRIBE, &sub)?;
++        let sub2 = stream_payload(STREAM_EYES);
++        request(h, &mut seq, &mut pending, OP_SUBSCRIBE, &sub2)?;
++        info!("eye tracking: streaming gaze from EyeChip");
++        let mut last_ok = Instant::now();
++        let mut combined: Option<([f32; 3], Instant)> = None;
++        let mut eyes: [Option<[f32; 3]>; 2] = [None, None];
++        // Once-per-5-s statistics: messages per stream, how many gave a usable gaze, last combined state.
++        let (mut n_gaze, mut n_eyes, mut ok_gaze, mut ok_eyes, mut n_out) = (0u32, 0u32, 0u32, 0u32, 0u32);
++        let mut last_state: Option<u32> = None;
++        let mut stats_at = Instant::now();
++        let result = loop {
++            if stats_at.elapsed() > Duration::from_secs(5) {
++                info!(
++                    "eye tracking: 5 s: combined {ok_gaze}/{n_gaze} usable (last state {last_state:?}), per-eye {ok_eyes}/{n_eyes}, gaze out {n_out}"
++                );
++                (n_gaze, n_eyes, ok_gaze, ok_eyes, n_out) = (0, 0, 0, 0, 0);
++                stats_at = Instant::now();
++            }
++            if self.stop.load(Ordering::Relaxed) || !self.wanted() {
++                break Ok(());
++            }
++            match next_message(h, &mut pending, Duration::from_millis(200)) {
++                Ok(Some(m)) if m.magic == 0x53 => {
++                    last_ok = Instant::now();
++                    let cols = parse_cols(&m.payload);
++                    if m.op == STREAM_GAZE as u32 {
++                        n_gaze += 1;
++                        last_state = col(&cols, 2).and_then(|c| match c.first() {
++                            Some(Val::U2(s)) => Some(*s),
++                            _ => None,
++                        });
++                        combined = combined_gaze(&cols).map(|d| (d, Instant::now()));
++                        ok_gaze += combined.is_some() as u32;
++                    } else if m.op == STREAM_EYES as u32 {
++                        n_eyes += 1;
++                        eyes = eyes_gaze(&cols);
++                        ok_eyes += eyes.iter().any(|e| e.is_some()) as u32;
++                    }
++                    // Prefer the combined gaze; else the mean of whichever eyes the chip tracks right now.
++                    let dir = combined.filter(|(_, t)| t.elapsed() < Duration::from_millis(60)).map(|(d, _)| d).or_else(|| mean_dir(&eyes));
++                    n_out += dir.is_some() as u32;
++                    *self.latest.lock().unwrap() = dir.map(|dir| Gaze { dir, at: Instant::now() });
++                }
++                Ok(_) => {
++                    if last_ok.elapsed() > Duration::from_secs(3) {
++                        break Err("no data for 3 s".to_string());
++                    }
++                }
++                Err(err) => break Err(err),
++            }
++        };
++        // Best effort; the chip keeps running if this fails.
++        for sid in [STREAM_GAZE, STREAM_EYES] {
++            let _ = send(h, &mut seq, OP_UNSUBSCRIBE, &stream_payload(sid));
++        }
++        result
++    }
++}
++
++fn open_chip(ctx: &Context) -> Option<DeviceHandle<Context>> {
++    let h = ctx.open_device_with_vid_pid(VID, PID)?;
++    let _ = h.set_auto_detach_kernel_driver(true);
++    h.claim_interface(0).ok()?;
++    Some(h)
++}
++
++fn stream_payload(sid: u16) -> [u8; 20] {
++    let mut p = [0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0x17, 0, 0, 0, 4, 0, 0, 0, 0];
++    p[9] = (sid >> 8) as u8;
++    p[10] = (sid & 255) as u8;
++    p
++}
++
++fn send(h: &DeviceHandle<Context>, seq: &mut u32, op: u32, payload: &[u8]) -> Result<u32, String> {
++    *seq += 1;
++    let ttp_len = 24 + payload.len() as u32;
++    let mut f = Vec::with_capacity(8 + ttp_len as usize);
++    f.extend_from_slice(&[0, 0, 0, 0]);
++    f.extend_from_slice(&ttp_len.to_le_bytes());
++    for v in [0x51u32, *seq, 0, op, 0, payload.len() as u32] {
++        f.extend_from_slice(&v.to_be_bytes());
++    }
++    f.extend_from_slice(payload);
++    h.write_bulk(EP_OUT, &f, Duration::from_millis(2000)).map_err(|r| format!("write: {r}"))?;
++    Ok(*seq)
++}
++
++struct Message {
++    magic: u32,
++    seq: u32,
++    op: u32,
++    payload: Vec<u8>,
++}
++
++fn next_message(h: &DeviceHandle<Context>, pending: &mut Vec<u8>, wait: Duration) -> Result<Option<Message>, String> {
++    let mut chunk = vec![0u8; 16384];
++    for _ in 0..2 {
++        if pending.len() >= 8 {
++            let n = u32::from_le_bytes(pending[4..8].try_into().unwrap()) as usize;
++            if n < 24 || n > 1 << 20 {
++                pending.clear();
++                return Err("bad TTP length".into());
++            }
++            if pending.len() >= n {
++                let be = |o: usize| u32::from_be_bytes(pending[o..o + 4].try_into().unwrap());
++                let (magic, seq, op, plen) = (be(8), be(12), be(20), be(28) as usize);
++                let payload = pending.get(32..32 + plen).ok_or("short payload")?.to_vec();
++                pending.drain(..n);
++                return Ok(Some(Message { magic, seq, op, payload }));
++            }
++        }
++        match h.read_bulk(EP_IN, &mut chunk, wait) {
++            Ok(k) => pending.extend_from_slice(&chunk[..k]),
++            Err(rusb::Error::Timeout) => return Ok(None),
++            Err(r) => return Err(format!("read: {r}")),
++        }
++    }
++    Ok(None)
++}
++
++fn request(h: &DeviceHandle<Context>, seq: &mut u32, pending: &mut Vec<u8>, op: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
++    let s = send(h, seq, op, payload)?;
++    let start = Instant::now();
++    while start.elapsed() < Duration::from_millis(2000) {
++        if let Some(m) = next_message(h, pending, Duration::from_millis(500))? {
++            if m.magic == 0x52 && m.seq == s {
++                return Ok(m.payload);
++            }
++        }
++    }
++    Err(format!("no reply to op {op:#x}"))
++}
++
++type Cols = Vec<(u32, Vec<Val>)>;
++
++/// Walk the TTP value items into columns: `[tag 134073][column id][values...]`.
++fn parse_cols(p: &[u8]) -> Cols {
++    let mut pos = 2usize;
++    let mut cols: Cols = Vec::new();
++    while pos < p.len() {
++        let Some((v, next)) = item(p, pos) else { break };
++        pos = next;
++        match v {
++            Val::U5(134073) => {
++                let Some((idv, nx)) = item(p, pos) else { break };
++                pos = nx;
++                if let Val::U2(id) = idv {
++                    cols.push((id, Vec::new()));
++                }
++            }
++            other => {
++                if let Some(c) = cols.last_mut() {
++                    c.1.push(other);
++                }
++            }
++        }
++    }
++    cols
++}
++
++fn col(cols: &Cols, id: u32) -> Option<&Vec<Val>> {
++    cols.iter().find(|c| c.0 == id).map(|c| &c.1)
++}
++
++fn vec3(vals: &[Val]) -> Option<[f32; 3]> {
++    let f: Vec<f32> = vals.iter().filter_map(|v| if let Val::F3(x) = v { Some(*x) } else { None }).collect();
++    (f.len() == 3).then(|| [f[0], f[1], f[2]])
++}
++
++/// A usable unit gaze vector; the chip reports exactly (0,0,1) while it has no eyes/config.
++fn usable(v: [f32; 3]) -> bool {
++    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
++    (0.9..1.1).contains(&n) && !(v[0].abs() < 1e-4 && v[1].abs() < 1e-4)
++}
++
++/// Stream 1289: col 2 = state (2 valid), col 5 = combined gaze direction.
++fn combined_gaze(cols: &Cols) -> Option<[f32; 3]> {
++    let state = match col(cols, 2)?.first()? {
++        Val::U2(s) => *s,
++        _ => return None,
++    };
++    let v = vec3(col(cols, 5)?)?;
++    (state == 2 && usable(v)).then_some(v)
++}
++
++/// Stream 1285: per-eye gaze (col 4 left / col 10 right) valid when its flag (col 5 / col 11) is 1.
++fn eyes_gaze(cols: &Cols) -> [Option<[f32; 3]>; 2] {
++    let one = |gaze: u32, flag: u32| {
++        let valid = matches!(col(cols, flag)?.first()?, Val::U2(1));
++        let v = vec3(col(cols, gaze)?)?;
++        (valid && usable(v)).then_some(v)
++    };
++    [one(4, 5), one(10, 11)]
++}
++
++fn mean_dir(eyes: &[Option<[f32; 3]>; 2]) -> Option<[f32; 3]> {
++    let mut sum = [0.0f32; 3];
++    let mut n = 0;
++    for v in eyes.iter().flatten() {
++        for i in 0..3 {
++            sum[i] += v[i];
++        }
++        n += 1;
++    }
++    if n == 0 {
++        return None;
++    }
++    let len = (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt();
++    Some([sum[0] / len, sum[1] / len, sum[2] / len])
++}
++
++enum Val {
++    U2(u32),
++    F3(f32),
++    U5(u32),
++    Other,
++}
++
++fn item(p: &[u8], pos: usize) -> Option<(Val, usize)> {
++    let t = *p.get(pos)?;
++    let s = pos + 5;
++    let u32_at = |o: usize| p.get(o..o + 4).map(|b| u32::from_be_bytes(b.try_into().unwrap()));
++    match t {
++        2 => Some((Val::U2(u32_at(s)?), s + 4)),
++        3 => Some((Val::F3(u32_at(s)? as i32 as f32 * (1.0 / 65536.0)), s + 4)),
++        4 | 6 => Some((Val::Other, s + 8)),
++        5 => Some((Val::U5(u32_at(s)?), s + 4)),
++        21 => Some((Val::Other, s + 4 + u32_at(s)? as usize)),
++        23 => Some((Val::Other, s + 4 + u32_at(s)? as usize * 4)),
++        _ => None,
++    }
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// xrt_device exposing XRT_INPUT_GENERIC_EYE_GAZE_POSE (role "eyes", bound through the ext eye-gaze profile)
++// ---------------------------------------------------------------------------------------------------------------
++
++use crate::device::tracking::Tracking;
++use crate::util::{option_str, set_str};
++use monado_sys::math::{XRT_POSE_IDENTITY, XRT_VEC3_ZERO, pose_transform};
++use monado_sys::*;
++
++#[repr(C)]
++struct EyeDevice {
++    base: xrt_device, // must be first
++    inputs: Box<[xrt_input; 1]>,
++    eye: Arc<EyeTracker>,
++    tracking: Arc<Tracking>,
++}
++
++pub fn create_device(origin: *mut xrt_tracking_origin, tracking: Arc<Tracking>, eye: Arc<EyeTracker>) -> *mut xrt_device {
++    let mut me = Box::new(EyeDevice {
++        base: unsafe { std::mem::zeroed() },
++        inputs: Box::new([unsafe { std::mem::zeroed() }]),
++        eye,
++        tracking,
++    });
++    me.base.name = xrt_device_name::XRT_DEVICE_EYE_GAZE_INTERACTION;
++    me.base.device_type = xrt_device_type::XRT_DEVICE_TYPE_EYE_TRACKER;
++    set_str(&mut me.base.str_, "Pimax EyeChip (Tobii VR4)");
++    set_str(&mut me.base.serial, "pimax-eye");
++    me.base.inputs = me.inputs.as_mut_ptr();
++    me.base.input_count = 1;
++    me.inputs[0].name = xrt_input_name::XRT_INPUT_GENERIC_EYE_GAZE_POSE;
++    me.inputs[0].active = true;
++    me.base.tracking_origin = origin;
++    me.base.supported.eye_gaze = true;
++    me.base.supported.orientation_tracking = true;
++    unsafe { u_device_populate_function_pointers(&mut me.base, Some(eye_get_tracked_pose), Some(eye_destroy)) };
++    me.base.begin_feature = Some(eye_begin_feature);
++    me.base.end_feature = Some(eye_end_feature);
++    Box::into_raw(me) as *mut xrt_device
++}
++
++unsafe extern "C" fn eye_get_tracked_pose(
++    xdev: *mut xrt_device,
++    name: xrt_input_name,
++    at_ns: i64,
++    out: *mut xrt_space_relation,
++) -> xrt_result_t {
++    if name != xrt_input_name::XRT_INPUT_GENERIC_EYE_GAZE_POSE {
++        return xrt_result::XRT_ERROR_INPUT_UNSUPPORTED;
++    }
++    let me = unsafe { &*(xdev as *mut EyeDevice) };
++    let mut relation = xrt_space_relation {
++        relation_flags: xrt_space_relation_flags(0),
++        pose: XRT_POSE_IDENTITY,
++        linear_velocity: XRT_VEC3_ZERO,
++        angular_velocity: XRT_VEC3_ZERO,
++    };
++    if let Some(g) = me.eye.gaze() {
++        // Gaze is relative to the head, so compose it onto the head pose (SLAM when up, else identity).
++        let head = me.tracking.slam_pose(at_ns).map(|r| r.pose).unwrap_or(XRT_POSE_IDENTITY);
++        relation.pose = pose_transform(&head, &gaze_pose(&g));
++        relation.relation_flags = xrt_space_relation_flags::XRT_SPACE_RELATION_ORIENTATION_VALID_BIT
++            | xrt_space_relation_flags::XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
++    }
++    unsafe { *out = relation };
++    xrt_result::XRT_SUCCESS
++}
++
++/// Chip frame is x right, y up, z forward (toward the scene); OpenXR gaze looks along -Z of the pose.
++/// `PIMAX_EYE_FLIP` (letters x,y) mirrors axes if a calibration test shows a sign error.
++pub fn gaze_pose(g: &Gaze) -> xrt_pose {
++    let flip = option_str("PIMAX_EYE_FLIP").unwrap_or_default();
++    let sx = if flip.contains('x') { -1.0 } else { 1.0 };
++    let sy = if flip.contains('y') { -1.0 } else { 1.0 };
++    let d = [g.dir[0] * sx, g.dir[1] * sy, -g.dir[2]];
++    // Shortest rotation from -Z to d: w = 1 + dot(-Z, d) = 1 - d.z, axis = cross(-Z, d) = (d.y, -d.x, 0).
++    let (w, x, y) = (1.0 - d[2], d[1], -d[0]);
++    let n = (w * w + x * x + y * y).sqrt().max(1e-6);
++    xrt_pose { orientation: xrt_quat { x: x / n, y: y / n, z: 0.0, w: w / n }, position: XRT_VEC3_ZERO }
++}
++
++unsafe extern "C" fn eye_begin_feature(xdev: *mut xrt_device, ty: xrt_device_feature_type) -> xrt_result_t {
++    feature(xdev, ty, true)
++}
++
++unsafe extern "C" fn eye_end_feature(xdev: *mut xrt_device, ty: xrt_device_feature_type) -> xrt_result_t {
++    feature(xdev, ty, false)
++}
++
++fn feature(xdev: *mut xrt_device, ty: xrt_device_feature_type, on: bool) -> xrt_result_t {
++    let me = unsafe { &*(xdev as *mut EyeDevice) };
++    if ty != xrt_device_feature_type::XRT_DEVICE_FEATURE_EYE_TRACKING {
++        return xrt_result::XRT_ERROR_FEATURE_NOT_SUPPORTED;
++    }
++    info!("eye tracking feature {}", if on { "begin" } else { "end" });
++    me.eye.set_enabled(on);
++    xrt_result::XRT_SUCCESS
++}
++
++unsafe extern "C" fn eye_destroy(xdev: *mut xrt_device) {
++    // The HMD shares the tracker and shuts it down; the thread only holds a clone.
++    drop(unsafe { Box::from_raw(xdev as *mut EyeDevice) });
++}
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/distortion.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/distortion.rs
+index 0fcbaa785..1dd6db17f 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/distortion.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/distortion.rs
+@@ -7,6 +7,9 @@ use monado_sys::{u_compute_distortion_rift_fov, u_rift_eye_profile, u_rift_panel
+ #[derive(Deserialize)]
+ pub struct PimaxDeviceConfig {
+     pub displays: [PimaxDeviceConfigDisplay; 1],
++    /// Per-level corrections to `lens[0].separation` (Ultrawide: [0, -0.0045]).
++    #[serde(default)]
++    pub lens_separation_level_offsets: Vec<f32>,
+     pub render: PimaxDeviceConfigRender,
+     pub lens: [PimaxDeviceConfigLens; 1],
+     q_d2i: [f32; 4],
+@@ -55,6 +58,9 @@ pub struct PimaxDeviceConfigDisplay {
+ 
+ #[derive(Deserialize)]
+ pub struct PimaxDeviceConfigLens {
++    /// Distance between the two lens optical centres, metres (before the level offset).
++    #[serde(default)]
++    pub separation: f32,
+     #[serde(alias = "MetersPerTanAngleAtCenter")]
+     pub meters_per_tan_angle_at_center: f32,
+     pub v_center_off: f32,
+@@ -100,12 +106,29 @@ fn rift_panel(config: &PimaxDeviceConfig) -> u_rift_panel {
+             x: native_width as f32,
+             y: native_height as f32,
+         },
+-        lens_center_separation_m: h_size / 2.,
++        lens_center_separation_m: lens_center_separation(config, h_size),
+         lens_center_from_panel_top: v_size / 2. + lens.v_center_off,
+         lens_diameter_m: 0.,
+     }
+ }
+ 
++/// Lens optical-centre separation used for the distortion model.
++///
++/// The optical centres are not in the middle of each half-panel: on the Crystal Super Ultrawide they sit ~2 mm towards
++/// the nose (sboys3's native-matched profile: 6.38 % of the half width). Placing them mid-panel shifts each eye's image
++/// ~3 deg outwards -> ~6 deg vergence error -> the eyes never fuse. `separation` plus the last level offset reproduces
++/// the measured value (0.07331 - 0.0045 = 0.06881 m -> 6.65 %). Override: PIMAX_LENS_SEP_MM.
++fn lens_center_separation(config: &PimaxDeviceConfig, h_size: f32) -> f32 {
++    if let Some(mm) = std::env::var("PIMAX_LENS_SEP_MM").ok().and_then(|v| v.parse::<f32>().ok()) {
++        return mm / 1000.;
++    }
++    let lens = &config.lens[0];
++    if lens.separation <= 0. {
++        return h_size / 2.;
++    }
++    lens.separation + config.lens_separation_level_offsets.last().copied().unwrap_or(0.)
++}
++
+ fn rift_eye_profile(config: &PimaxDeviceConfig) -> u_rift_eye_profile {
+     let lens = &config.lens[0];
+     let distortion = &lens.distortion_param;
+@@ -167,9 +190,11 @@ pub fn view_fov(config: &PimaxDeviceConfig, view: usize) -> xrt_fov {
+     let panel = rift_panel(config);
+     let lens_center_v = panel.lens_center_from_panel_top / panel.size_m.y;
+ 
+-    let base = seen_through_lens(config, 1., lens_center_v).x.atan();
+-    let fix = config.render.eyes[view].fov_fix_degree.to_radians();
+-    let (outward, inward) = ((base + fix).tan(), (base - fix).tan());
++    // Visible extent through the lens on each side of the optical centre (view 1 = unmirrored right eye, so u=1 is
++    // the temporal edge). With the lens off-centre towards the nose the temporal half is the wider one. The eye cant
++    // (fov_fix_degree) is applied to the view pose, not added to the frustum again.
++    let outward = seen_through_lens(config, 1., lens_center_v).x.abs();
++    let inward = seen_through_lens(config, 0., lens_center_v).x.abs();
+     let (left, right) = if view == 0 {
+         (outward, inward)
+     } else {
+@@ -197,6 +222,14 @@ pub unsafe extern "C" fn pimax_compute_distortion(
+         return xrt_result::XRT_ERROR_INPUT_UNSUPPORTED;
+     }
+ 
++    // Diagnostic: PIMAX_BLANK_EYE=0|1 blacks out that view (uv outside the image: culled by SteamVR, border colour in
++    // Monado). Tells which physical eye each viewport reaches; the stereo bug could be a swapped eye assignment.
++    if crate::util::option_num("PIMAX_BLANK_EYE", -1) == view as i64 {
++        let off = xrt_vec2 { x: -1., y: -1. };
++        unsafe { *out = xrt_uv_triplet { r: off, g: off, b: off } };
++        return xrt_result::XRT_SUCCESS;
++    }
++
+     let config = unsafe { &(*(xdev as *mut PimaxHmd)).config };
+     let fov = view_fov(config, view as usize);
+ 
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
+index 66d95e51c..c41b50094 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
+@@ -62,6 +62,7 @@ pub struct PimaxHmd {
+     tracking: Arc<Tracking>,
+     cameras: Option<Cameras>,
+     usb_threads: UsbThreads,
++    eye: Option<Arc<crate::device::eye::EyeTracker>>,
+ }
+ 
+ pub fn create(
+@@ -83,6 +84,7 @@ pub fn create(
+         tracking: tracking.clone(),
+         cameras: None,
+         usb_threads,
++        eye: None,
+     });
+     me.describe(identity);
+     unsafe { views::setup_views(&mut me) };
+@@ -109,7 +111,14 @@ pub fn create(
+         me.cameras = startup::start_cameras(xp, &tracking, calibration);
+     }
+ 
+-    (Box::into_raw(me) as *mut xrt_device, controllers)
++    let tracking_origin = me.base.tracking_origin;
++    let mut others = controllers;
++    if option_bool("PIMAX_EYE_TRACKING", true) {
++        let eye = crate::device::eye::EyeTracker::start();
++        others.push(crate::device::eye::create_device(tracking_origin, tracking.clone(), eye.clone()));
++        me.eye = Some(eye);
++    }
++    (Box::into_raw(me) as *mut xrt_device, others)
+ }
+ 
+ impl PimaxHmd {
+@@ -143,6 +152,8 @@ impl PimaxHmd {
+             self.base.update_inputs = Some(pimax_update_inputs);
+         };
+         self.base.get_view_poses = Some(views::pimax_get_view_poses);
++        // Quad views (context + gaze-following inset) are produced by views.rs.
++        self.base.supported.get_views_quad = option_bool("PIMAX_FOVEATION", true);
+     }
+ 
+     fn set_tracking_capabilities(&mut self, slam_up: bool) {
+@@ -193,6 +204,13 @@ unsafe extern "C" fn pimax_get_tracked_pose(
+ 
+ unsafe extern "C" fn pimax_destroy(xdev: *mut xrt_device) {
+     let mut me = unsafe { Box::from_raw(xdev as *mut PimaxHmd) };
++    let t = std::time::Instant::now();
++    if let Some(eye) = me.eye.take() {
++        eye.shutdown();
++    }
++    info!("destroy: eye tracker stopped after {:?}", t.elapsed());
+     drop(me.cameras.take());
++    info!("destroy: cameras stopped after {:?}", t.elapsed());
+     me.usb_threads.stop();
++    info!("destroy: usb threads stopped after {:?}", t.elapsed());
+ }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+index ce59621a0..ee87a3bd4 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+@@ -73,13 +73,14 @@ pub unsafe extern "C" fn pimax_get_view_poses(
+         x: ipd,
+         ..unsafe { *default_eye_relation }
+     };
++    let quad = view_type == xrt_view_type::XRT_VIEW_TYPE_QUAD && view_count == 4;
+     let ret = unsafe {
+         u_device_get_view_poses(
+             xdev,
+             &eye_relation,
+             at_timestamp_ns,
+-            view_type,
+-            view_count,
++            if quad { xrt_view_type::XRT_VIEW_TYPE_STEREO } else { view_type },
++            if quad { 2 } else { view_count },
+             out_head_relation,
+             out_fovs,
+             out_poses,
+@@ -89,12 +90,16 @@ pub unsafe extern "C" fn pimax_get_view_poses(
+         return ret;
+     }
+     let poses = unsafe { std::slice::from_raw_parts_mut(out_poses, view_count as usize) };
++    let fovs = unsafe { std::slice::from_raw_parts_mut(out_fovs, view_count as usize) };
+     for (i, pose) in poses.iter_mut().enumerate().take(2) {
+         // Rotation about +y: positive turns the left eye's forward vector (-z) towards -x.
+         let outwards = if i == 0 { 1. } else { -1. };
++        // PIMAX_CANT_SCALE (percent, default 100) scales the outward view rotation: 0 = no cant, -100 = reversed.
++        let cant = crate::util::option_num("PIMAX_CANT_SCALE", 100) as f32 / 100.;
+         let (sin, cos) = (me.config.render.eyes[0]
+             .fov_fix_degree
+             .to_radians()
++            * cant
+             / 2.)
+             .sin_cos();
+         pose.orientation = xrt_quat {
+@@ -104,5 +109,28 @@ pub unsafe extern "C" fn pimax_get_view_poses(
+             w: cos,
+         };
+     }
++    if quad {
++        // Views 2-3 are the foveal inset: centred on the gaze direction (head frame), fixed fine FOV.
++        let gaze = me.eye.as_ref().and_then(|e| {
++            e.touch();
++            e.gaze()
++        });
++        let half = INSET_HALF_FOV_DEG.to_radians();
++        for i in 0..2 {
++            let eye_pos = poses[i].position;
++            poses[2 + i] = xrt_pose {
++                orientation: match &gaze {
++                    Some(g) => crate::device::eye::gaze_pose(g).orientation,
++                    None => poses[i].orientation, // no gaze: inset sits straight ahead in the eye's view
++                },
++                position: eye_pos,
++            };
++            fovs[2 + i] = xrt_fov { angle_left: -half, angle_right: half, angle_up: half, angle_down: -half };
++        }
++    }
+     xrt_result::XRT_SUCCESS
+ }
++
++/// Foveal inset half-FOV in degrees; about a third of the full view.
++const INSET_HALF_FOV_DEG: f32 = 20.0;
++
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/mod.rs
+index c22193404..7034e8c36 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/mod.rs
+@@ -1,4 +1,5 @@
+ pub mod camera;
++pub mod eye;
+ mod constellation;
+ mod controller;
+ pub mod hmd;
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs b/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
+index 3aaa569c1..7fcc1b1b1 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
+@@ -1,9 +1,48 @@
+-use pimax_protocol::{CommandDevice, Error};
++use pimax_protocol::cmd::{Command, Query};
++use pimax_protocol::device::PimaxSubDevice;
++use pimax_protocol::{CmdResult, CommandDevice, Error};
+ use pimax_protocol::cmd::eye_track_enable::CmdEyeTrackEnable;
+ use pimax_protocol::cmd::visor_ctl::CmdVisorCtl;
+ use pimax_protocol::cmd::visor_status::CmdVisorStatus;
+ 
++/// Raw Vision (sub-device 0x05) command.
++struct VisionRaw<const ID: u8>(&'static [u8]);
++
++impl<const ID: u8> Command for VisionRaw<ID> {
++    const ID: u8 = ID;
++    fn cmd_opt(&self) -> PimaxSubDevice {
++        PimaxSubDevice::Vision
++    }
++    fn write_payload(&self, out: &mut Vec<u8>) {
++        out.extend_from_slice(self.0)
++    }
++}
++
++impl<const ID: u8> Query for VisionRaw<ID> {
++    type Response = Vec<u8>;
++    fn decode(result: CmdResult) -> pimax_protocol::Result<Vec<u8>> {
++        Ok(result.payload)
++    }
++}
++
++/// The Vision bring-up sequence the eye-tracking chip needs: without it the EyeChip enumerates and streams, but
++/// its eye cameras/illuminators stay idle and every gaze column is constant.  Panel, level, named-parameter and licence
++/// commands are deliberately left out.
+ pub(super) fn activate_eye_tracker(cmd: &CommandDevice) -> Result<(), Error> {
++    for r in [
++        cmd.query(&VisionRaw::<0x3A>(&[0x03])),
++        cmd.query(&VisionRaw::<0x3A>(&[0x01])),
++        cmd.query(&VisionRaw::<0x3A>(&[0x00])),
++        cmd.query(&VisionRaw::<0x56>(&[0x0A])),
++        cmd.query(&VisionRaw::<0x56>(&[0x0B, 0, 0, 1])),
++        cmd.query(&VisionRaw::<0x1B>(&[0x01])),
++        cmd.query(&VisionRaw::<0x5B>(&[0x02, 0x02])),
++        cmd.query(&VisionRaw::<0x5A>(&[0x00])),
++    ] {
++        if let Err(e) = r {
++            warn!("eye tracking bring-up command failed: {e}");
++        }
++    }
+     cmd.query(&CmdEyeTrackEnable)?;
+     Ok(())
+ }
+-- 
+2.56.0
+

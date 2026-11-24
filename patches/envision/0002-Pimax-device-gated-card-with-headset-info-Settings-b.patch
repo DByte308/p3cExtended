@@ -1,0 +1,389 @@
+From 1c54d44e47e3e642ce9f8f617b23e22a7430c7e3 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:07:59 +0100
+Subject: [PATCH 02/13] Pimax: device-gated card with headset info, Settings
+ button, stick dead zone and GPU prefs, Advanced page refresh
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/app.rs                |   1 +
+ src/ui/main_view.rs          |   2 +
+ src/ui/pimax_box.rs          | 186 ++++++++++++++++++++++++++++++++++-
+ src/ui/pimax_prefs.rs        |  28 +++++-
+ src/ui/preferences_window.rs |  14 +++
+ 5 files changed, 228 insertions(+), 3 deletions(-)
+
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 1529efe..331bc89 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -1307,6 +1307,7 @@ impl AsyncComponent for App {
+                     MainViewOutMsg::OpenLibsurviveSetup => Msg::OpenLibsurviveSetup,
+                     MainViewOutMsg::LaunchMonadoGui => Msg::LaunchMonadoGui,
+                     MainViewOutMsg::SetEnvVar(k, v) => Msg::SetGlobalEnvVar(k, v),
++                    MainViewOutMsg::OpenPreferences => Msg::OpenPreferences,
+                 }),
+             vkinfo,
+             debug_view: DebugView::builder()
+diff --git a/src/ui/main_view.rs b/src/ui/main_view.rs
+index f70dc35..4dbd45b 100644
+--- a/src/ui/main_view.rs
++++ b/src/ui/main_view.rs
+@@ -90,6 +90,7 @@ pub enum MainViewOutMsg {
+     OpenLibsurviveSetup,
+     LaunchMonadoGui,
+     SetEnvVar(String, Option<String>),
++    OpenPreferences,
+ }
+ 
+ pub struct MainViewInit {
+@@ -553,6 +554,7 @@ impl AsyncComponent for MainView {
+             .forward(sender.output_sender(), |msg| match msg {
+                 PimaxBoxOutMsg::SetEnvVar(k, v) => MainViewOutMsg::SetEnvVar(k, v),
+                 PimaxBoxOutMsg::RestartXRService => MainViewOutMsg::RestartXRService,
++                PimaxBoxOutMsg::OpenPreferences => MainViewOutMsg::OpenPreferences,
+             });
+ 
+         let model = Self {
+diff --git a/src/ui/pimax_box.rs b/src/ui/pimax_box.rs
+index 92179fc..86c8c91 100644
+--- a/src/ui/pimax_box.rs
++++ b/src/ui/pimax_box.rs
+@@ -9,9 +9,119 @@ use relm4::{
+     ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent,
+     gtk::{self, prelude::*},
+ };
++use serde::Deserialize;
+ use std::collections::VecDeque;
+ use tracing::{info, warn};
+ 
++const PIMAX_USB_VENDOR: &str = "34a4";
++/// The status file counts as fresh when written within this many ms.
++const STATUS_MAX_AGE_MS: u64 = 5000;
++
++/// True when any USB device has the Pimax vendor id.
++fn pimax_plugged_in() -> bool {
++    let Ok(dir) = std::fs::read_dir("/sys/bus/usb/devices") else {
++        return false;
++    };
++    dir.flatten().any(|e| {
++        std::fs::read_to_string(e.path().join("idVendor")).is_ok_and(|v| v.trim().eq_ignore_ascii_case(PIMAX_USB_VENDOR))
++    })
++}
++
++#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
++#[serde(default)]
++pub struct EyeTrackingStatus {
++    enabled: Option<bool>,
++    calibrated: Option<bool>,
++}
++
++#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
++#[serde(default)]
++pub struct ControllerStatus {
++    connected: Option<bool>,
++    battery_percent: Option<f64>,
++}
++
++#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
++#[serde(default)]
++pub struct ControllersStatus {
++    left: Option<ControllerStatus>,
++    right: Option<ControllerStatus>,
++}
++
++/// Contents of $XDG_RUNTIME_DIR/pimax-p3c/status.json (written by the driver while the XR service runs).
++#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
++#[serde(default)]
++pub struct PimaxStatus {
++    updated_unix_ms: u64,
++    model: Option<String>,
++    serial: Option<String>,
++    firmware: Option<String>,
++    device_check: Option<String>,
++    refresh_hz: Option<f64>,
++    ipd_mm: Option<f64>,
++    eye_tracking: Option<EyeTrackingStatus>,
++    foveation: Option<bool>,
++    controllers: Option<ControllersStatus>,
++}
++
++fn read_status() -> Option<PimaxStatus> {
++    let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
++    let data = std::fs::read(format!("{dir}/pimax-p3c/status.json")).ok()?;
++    let st: PimaxStatus = serde_json::from_slice(&data).ok()?;
++    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
++    (now.abs_diff(st.updated_unix_ms) <= STATUS_MAX_AGE_MS).then_some(st)
++}
++
++fn on_off(b: Option<bool>) -> String {
++    match b {
++        Some(true) => "On".into(),
++        Some(false) => "Off".into(),
++        None => "Unknown".into(),
++    }
++}
++
++fn controller_text(c: &Option<ControllerStatus>) -> String {
++    match c {
++        Some(ControllerStatus { connected: Some(true), battery_percent }) => match battery_percent {
++            Some(b) => format!("Connected, battery {b:.0}%"),
++            None => "Connected".into(),
++        },
++        Some(ControllerStatus { connected: Some(false), .. }) => "Not connected".into(),
++        _ => "Unknown".into(),
++    }
++}
++
++impl PimaxStatus {
++    fn rows(&self) -> Vec<(&'static str, String)> {
++        let s = |o: &Option<String>| o.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| "Unknown".into());
++        let et = self.eye_tracking.clone().unwrap_or_default();
++        let et_text = match (et.enabled, et.calibrated) {
++            (Some(false), _) => "Off".to_string(),
++            (Some(true), Some(true)) => "On, calibrated".into(),
++            (Some(true), Some(false)) => "On, not calibrated".into(),
++            (en, _) => on_off(en),
++        };
++        let ctrl = self.controllers.clone().unwrap_or_default();
++        let mut rows = vec![
++            ("Model", s(&self.model)),
++            ("Serial", s(&self.serial)),
++            ("Firmware", s(&self.firmware)),
++        ];
++        if let Some(dc) = self.device_check.as_ref().filter(|v| !v.is_empty()) {
++            rows.push(("Device check", dc.clone()));
++        }
++        rows.extend([
++            ("Refresh rate", self.refresh_hz.map(|v| format!("{v:.0} Hz")).unwrap_or_else(|| "Unknown".into())),
++            ("IPD", self.ipd_mm.map(|v| format!("{v:.1} mm")).unwrap_or_else(|| "Unknown".into())),
++            ("Eye tracking", et_text),
++            ("Foveation", on_off(self.foveation)),
++            ("Left controller", controller_text(&ctrl.left)),
++            ("Right controller", controller_text(&ctrl.right)),
++        ]);
++        rows
++    }
++}
++
+ /// Env var the driver reads the eye-tracking correction from.
+ pub const EYE_CALIB_VAR: &str = "PIMAX_EYE_CALIB";
+ 
+@@ -48,6 +158,7 @@ impl PimaxTool {
+ pub struct PimaxBox {
+     visible: bool,
+     xrservice_active: bool,
++    info: Option<PimaxStatus>,
+     running: Option<PimaxTool>,
+     status: Option<String>,
+     success: bool,
+@@ -66,10 +177,13 @@ pub enum PimaxBoxMsg {
+     OnLog(Vec<String>),
+     OnExit(i32),
+     Restart,
++    PollPresence,
++    PollStatus,
+ }
+ 
+ #[derive(Debug)]
+ pub enum PimaxBoxOutMsg {
++    OpenPreferences,
+     /// Store a global env var (None removes it) and save the config.
+     SetEnvVar(String, Option<String>),
+     RestartXRService,
+@@ -94,7 +208,34 @@ impl SimpleComponent for PimaxBox {
+             gtk::Label {
+                 add_css_class: "heading",
+                 set_xalign: 0.0,
+-                set_label: "Pimax Eye Tracking",
++                set_label: "Pimax Crystal",
++            },
++            gtk::Label {
++                add_css_class: "heading",
++                add_css_class: "dim-label",
++                set_xalign: 0.0,
++                set_label: "Headset",
++            },
++            #[name = "info_grid"]
++            gtk::Grid {
++                set_column_spacing: 18,
++                set_row_spacing: 4,
++            },
++            gtk::Label {
++                add_css_class: "dim-label",
++                set_xalign: 0.0,
++                set_wrap: true,
++                set_wrap_mode: gtk::pango::WrapMode::Word,
++                #[track = "model.changed(Self::info())"]
++                set_visible: model.info.is_none(),
++                set_label: "Headset info appears while the XR service is running",
++            },
++            gtk::Label {
++                add_css_class: "heading",
++                add_css_class: "dim-label",
++                set_xalign: 0.0,
++                set_margin_top: 6,
++                set_label: "Eye Tracking",
+             },
+             gtk::Label {
+                 add_css_class: "dim-label",
+@@ -158,6 +299,28 @@ impl SimpleComponent for PimaxBox {
+                     connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Restart),
+                 },
+             },
++            gtk::Button {
++                set_label: "Settings…",
++                set_halign: gtk::Align::Start,
++                set_margin_top: 6,
++                connect_clicked[sender] => move |_| { let _ = sender.output(PimaxBoxOutMsg::OpenPreferences); },
++            },
++        }
++    }
++
++    fn pre_view() {
++        if model.changed(Self::info()) {
++            while let Some(c) = widgets.info_grid.first_child() {
++                widgets.info_grid.remove(&c);
++            }
++            if let Some(info) = &model.info {
++                for (i, (k, v)) in info.rows().into_iter().enumerate() {
++                    let kl = gtk::Label::builder().label(k).xalign(0.0).css_classes(["dim-label"]).build();
++                    let vl = gtk::Label::builder().label(v).xalign(0.0).hexpand(true).selectable(true).wrap(true).build();
++                    widgets.info_grid.attach(&kl, 0, i as i32, 1, 1);
++                    widgets.info_grid.attach(&vl, 1, i as i32, 1, 1);
++                }
++            }
+         }
+     }
+ 
+@@ -217,6 +380,13 @@ impl SimpleComponent for PimaxBox {
+                     None => {}
+                 }
+             }
++            PimaxBoxMsg::PollPresence => self.set_visible(pimax_plugged_in()),
++            PimaxBoxMsg::PollStatus => {
++                let st = read_status();
++                if self.info != st {
++                    self.set_info(st);
++                }
++            }
+             PimaxBoxMsg::Restart => {
+                 self.set_restart_needed(false);
+                 let _ = sender.output(PimaxBoxOutMsg::RestartXRService);
+@@ -227,8 +397,9 @@ impl SimpleComponent for PimaxBox {
+     fn init(_init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
+         let model = Self {
+             tracker: 0,
+-            visible: true,
++            visible: pimax_plugged_in(),
+             xrservice_active: false,
++            info: read_status(),
+             running: None,
+             status: None,
+             success: true,
+@@ -237,6 +408,17 @@ impl SimpleComponent for PimaxBox {
+             worker: None,
+         };
+         let widgets = view_output!();
++        for (secs, msg) in [(3, 0), (2, 1)] {
++            let s = sender.input_sender().clone();
++            relm4::gtk::glib::timeout_add_seconds_local(secs, move || {
++                let m = if msg == 0 { PimaxBoxMsg::PollPresence } else { PimaxBoxMsg::PollStatus };
++                if s.send(m).is_ok() {
++                    relm4::gtk::glib::ControlFlow::Continue
++                } else {
++                    relm4::gtk::glib::ControlFlow::Break
++                }
++            });
++        }
+         ComponentParts { model, widgets }
+     }
+ }
+diff --git a/src/ui/pimax_prefs.rs b/src/ui/pimax_prefs.rs
+index ad521e7..4d9ba0e 100644
+--- a/src/ui/pimax_prefs.rs
++++ b/src/ui/pimax_prefs.rs
+@@ -104,6 +104,32 @@ pub fn pimax_page(cfg: Cfg) -> adw::PreferencesPage {
+     ));
+     page.add(&display);
+ 
++    // Advanced hardware
++    let hw = group("Advanced hardware", None);
++    hw.add(&num_row(
++        &cfg,
++        "PIMAX_STICK_DEADZONE",
++        "Thumbstick dead zone (%)",
++        "Ignore small thumbstick movement; 0 = none",
++        0.0,
++        0.0,
++        50.0,
++        1.0,
++    ));
++    {
++        const GPUS: [&str; 2] = ["Default (NVIDIA)", "AMD"];
++        let cur = if get(&cfg, "PIMAX_GPU").as_deref() == Some("amd") { GPUS[1] } else { GPUS[0] };
++        let c = cfg.clone();
++        hw.add(&combo_row(
++            "GPU",
++            Some("Which GPU vendor the driver should use"),
++            cur,
++            GPUS.iter().map(|s| s.to_string()).collect(),
++            move |row| set(&c, "PIMAX_GPU", (row.selected() == 1).then(|| "amd".to_string())),
++        ));
++    }
++    page.add(&hw);
++
+     // IPD
+     let ipd = group(
+         "IPD (lens distance)",
+@@ -134,7 +160,7 @@ pub fn pimax_page(cfg: Cfg) -> adw::PreferencesPage {
+     // Eye tracking
+     let et = group(
+         "Eye Tracking",
+-        Some("Calibrate from the main window (Pimax Eye Tracking → Recalibrate) while the XR service runs."),
++        Some("Calibrate from the main window (Pimax Crystal → Recalibrate) while the XR service runs."),
+     );
+     et.add(&bool_row(&cfg, "PIMAX_EYE_TRACKING", "Eye tracking", "Tobii eye tracker for gaze input and foveation", true));
+     {
+diff --git a/src/ui/preferences_window.rs b/src/ui/preferences_window.rs
+index e30aff3..3053f53 100644
+--- a/src/ui/preferences_window.rs
++++ b/src/ui/preferences_window.rs
+@@ -33,6 +33,8 @@ pub enum PreferencesWindowMsg {
+     EnvVarChanged(String, String),
+     EnvVarDelete(String),
+     AddEnvVar(String),
++    /// Reload the env var rows from the config (the Pimax page edits the config directly).
++    RefreshEnvRows,
+ }
+ 
+ #[derive(Debug)]
+@@ -235,6 +237,16 @@ impl AsyncComponent for PreferencesWindow {
+                     self.env_rows.guard().remove(p);
+                 }
+             }
++            Self::Input::RefreshEnvRows => {
++                let mut guard = self.env_rows.guard();
++                guard.clear();
++                for (k, v) in self.config.borrow().global_preferences.env_vars.iter() {
++                    guard.push_back(EnvVarModelInit {
++                        name: k.clone(),
++                        value: v.clone(),
++                    });
++                }
++            }
+             Self::Input::AddEnvVar(var) => {
+                 let mut conf = self.config.borrow_mut();
+                 let (name, value) = parse_var(&var);
+@@ -325,6 +337,8 @@ impl AsyncComponent for PreferencesWindow {
+                     "failed to make env var preference group description selectable, please open a bug report"
+                 );
+             }
++            let sender = sender.clone();
++            pg.connect_map(move |_| sender.input(Self::Input::RefreshEnvRows));
+             pg
+         };
+ 
+-- 
+2.56.0
+

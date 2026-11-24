@@ -1,0 +1,8 @@
+# Pimax headset: non-root USB/HID access (installed as /etc/udev/rules.d/99-pimax-evo.rules)
+#
+# USB vendor id 0x34A4, as reported by lsusb for the headset and its sub-devices.
+#
+# `TAG+="uaccess"` lets the seated desktop user open the device without being
+# added to a group; GROUP="input" additionally keeps it usable from services.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="34a4", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb",    ATTRS{idVendor}=="34a4", MODE="0660", GROUP="input", TAG+="uaccess"

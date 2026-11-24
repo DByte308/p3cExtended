@@ -1,0 +1,106 @@
+From e9a6c34eb254f64f7e99417dcd70e1c315444aab Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:50:25 +0100
+Subject: [PATCH 08/28] d/pimax_p3c: PIMAX_IPD_MM (lens motors) and
+ PIMAX_IPD_OFFSET_MM (render only)
+
+- PIMAX_IPD_MM 58..72: send CmdSetIpd (0x5C) at bring-up. Untested on hardware;
+  semantics inferred from pimax-protocol.
+- PIMAX_IPD_OFFSET_MM -5..5: added to the rendered eye distance (world scale).
+- No longer fail get_view_poses before the first HMD status: 63 mm fallback.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/pimax_p3c/src/device/hmd/views.rs | 21 +++++++++++++++----
+ .../pimax_p3c/src/device/session/bringup.rs   |  1 +
+ .../pimax_p3c/src/device/session/extras.rs    | 15 +++++++++++++
+ 3 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+index ee87a3bd4..f3f3dea9f 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+@@ -5,6 +5,20 @@ use crate::device::hmd::distortion::{
+ };
+ use crate::device::session::refresh_hz;
+ 
++/// `PIMAX_IPD_OFFSET_MM` (-5..5): added to the rendered eye distance only (world scale), as a
++/// software IPD offset. The lenses are moved with `PIMAX_IPD_MM` instead.
++fn render_ipd_offset_m() -> f32 {
++    static OFF: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    *OFF.get_or_init(|| {
++        let mm = std::env::var("PIMAX_IPD_OFFSET_MM").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
++        let mm = mm.clamp(-5.0, 5.0);
++        if mm != 0.0 {
++            info!("render IPD offset {mm} mm");
++        }
++        mm / 1000.0
++    })
++}
++
+ pub unsafe fn setup_views(me: &mut PimaxHmd) {
+     let PimaxDeviceConfigDisplay {
+         native_width,
+@@ -66,11 +80,10 @@ pub unsafe extern "C" fn pimax_get_view_poses(
+     out_poses: *mut xrt_pose,
+ ) -> xrt_result_t {
+     let me = unsafe { &*(xdev as *mut PimaxHmd) };
+-    let Some(ipd) = me.tracking.ipd_meters() else {
+-        return xrt_result::XRT_ERROR_DEVICE_CREATION_FAILED;
+-    };
++    // Lens IPD as reported by the headset (follows the lens motors); 63 mm until the first status report.
++    let ipd = me.tracking.ipd_meters().unwrap_or(0.063);
+     let eye_relation = xrt_vec3 {
+-        x: ipd,
++        x: ipd + render_ipd_offset_m(),
+         ..unsafe { *default_eye_relation }
+     };
+     let quad = view_type == xrt_view_type::XRT_VIEW_TYPE_QUAD && view_count == 4;
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+index 0a3ae4f27..c2c316dc6 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+@@ -91,6 +91,7 @@ pub fn bring_up(interfaces: Interfaces, serial: &str) -> BringUp {
+             0
+         }
+     };
++    extras::apply_ipd(&cmd);
+     if let Err(e) = extras::activate_eye_tracker(&cmd) {
+         warn!("eye tracking enable failed {e}")
+     }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs b/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
+index 7fcc1b1b1..00ee31752 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
+@@ -2,6 +2,7 @@ use pimax_protocol::cmd::{Command, Query};
+ use pimax_protocol::device::PimaxSubDevice;
+ use pimax_protocol::{CmdResult, CommandDevice, Error};
+ use pimax_protocol::cmd::eye_track_enable::CmdEyeTrackEnable;
++use pimax_protocol::cmd::set_ipd::CmdSetIpd;
+ use pimax_protocol::cmd::visor_ctl::CmdVisorCtl;
+ use pimax_protocol::cmd::visor_status::CmdVisorStatus;
+ 
+@@ -28,6 +29,20 @@ impl<const ID: u8> Query for VisionRaw<ID> {
+ /// The Vision bring-up sequence the eye-tracking chip needs: without it the EyeChip enumerates and streams, but
+ /// its eye cameras/illuminators stay idle and every gaze column is constant.  Panel, level, named-parameter and licence
+ /// commands are deliberately left out.
++/// `PIMAX_IPD_MM` (58..72): move the lens motors to this IPD at start-up (command 0x5C, semantics inferred from the
++/// protocol crate, not yet confirmed on the device). Unset: lenses stay where they are.
++pub(super) fn apply_ipd(cmd: &CommandDevice) {
++    let Ok(raw) = std::env::var("PIMAX_IPD_MM") else { return };
++    match raw.parse::<f32>() {
++        Ok(mm) if (58.0..=72.0).contains(&mm) => match cmd.query(&CmdSetIpd(mm)) {
++            Ok(ack) => info!("set IPD {mm} mm, ack {ack}"),
++            Err(e) => warn!("set IPD {mm} mm failed: {e}"),
++        },
++        Ok(0.0) => {}
++        _ => warn!("PIMAX_IPD_MM={raw}: need 58..72 mm; lenses not moved"),
++    }
++}
++
+ pub(super) fn activate_eye_tracker(cmd: &CommandDevice) -> Result<(), Error> {
+     for r in [
+         cmd.query(&VisionRaw::<0x3A>(&[0x03])),
+-- 
+2.56.0
+

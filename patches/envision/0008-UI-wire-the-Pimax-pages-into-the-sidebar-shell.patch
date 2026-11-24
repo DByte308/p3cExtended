@@ -1,0 +1,751 @@
+From 92d810e8c61e466afc4be7f6c899d772c694c3a0 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:25:30 +0100
+Subject: [PATCH 08/13] UI: wire the Pimax pages into the sidebar shell
+
+Headset / Eye Tracking / Controllers pages fill the shell's slots, the summary
+tiles replace the old Pimax card on Home; removes pimax_box.rs and messages
+that are no longer used. Builds without warnings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/app.rs          |   4 +-
+ src/ui/main_view.rs    |  57 ++++--
+ src/ui/mod.rs          |   1 -
+ src/ui/pimax_box.rs    | 454 -----------------------------------------
+ src/ui/pimax_common.rs |   2 -
+ src/ui/pimax_eye.rs    |   1 -
+ src/ui/pimax_pages.rs  |   8 -
+ src/ui/shell.rs        |   3 -
+ 8 files changed, 46 insertions(+), 484 deletions(-)
+ delete mode 100644 src/ui/pimax_box.rs
+
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 7000287..194b9f1 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -1301,6 +1301,9 @@ impl AsyncComponent for App {
+                     selected_profile: selected_profile.clone(),
+                     root_win: root.clone().into(),
+                     devices_slot: shell.devices_slot.clone(),
++                    headset_slot: shell.headset_slot.clone(),
++                    eyetracking_slot: shell.eyetracking_slot.clone(),
++                    controllers_slot: shell.controllers_slot.clone(),
+                     has_nvidia: vkinfo.as_ref().is_some_and(|i| i.has_nvidia),
+                 })
+                 .forward(sender.input_sender(), |message| match message {
+@@ -1309,7 +1312,6 @@ impl AsyncComponent for App {
+                     MainViewOutMsg::OpenLibsurviveSetup => Msg::OpenLibsurviveSetup,
+                     MainViewOutMsg::LaunchMonadoGui => Msg::LaunchMonadoGui,
+                     MainViewOutMsg::SetEnvVar(k, v) => Msg::SetGlobalEnvVar(k, v),
+-                    MainViewOutMsg::OpenPreferences => Msg::OpenPreferences,
+                 }),
+             vkinfo,
+             debug_view: DebugView::builder()
+diff --git a/src/ui/main_view.rs b/src/ui/main_view.rs
+index be2672a..a183aaf 100644
+--- a/src/ui/main_view.rs
++++ b/src/ui/main_view.rs
+@@ -5,7 +5,10 @@ use super::{
+     devices_box::{DevicesBox, DevicesBoxMsg},
+     openhmd_calibration_box::{OpenHmdCalibrationBox, OpenHmdCalibrationBoxMsg},
+     steam_launch_options_box::{SteamLaunchOptionsBox, SteamLaunchOptionsBoxMsg},
+-    pimax_box::{PimaxBox, PimaxBoxMsg, PimaxBoxOutMsg},
++    pimax_common::{PimaxOutMsg, PimaxPageInit},
++    pimax_pages::{
++        ControllersPage, EyeTrackingMsg, EyeTrackingPage, HeadsetPage, PimaxSummary,
++    },
+     steamvr_calibration_box::{SteamVrCalibrationBox, SteamVrCalibrationBoxMsg},
+ };
+ use crate::{
+@@ -53,7 +56,13 @@ pub struct MainView {
+     #[tracker::do_not_track]
+     steamvr_calibration_box: Controller<SteamVrCalibrationBox>,
+     #[tracker::do_not_track]
+-    pimax_box: Controller<PimaxBox>,
++    pimax_summary: Controller<PimaxSummary>,
++    #[tracker::do_not_track]
++    _headset_page: Controller<HeadsetPage>,
++    #[tracker::do_not_track]
++    eyetracking_page: Controller<EyeTrackingPage>,
++    #[tracker::do_not_track]
++    _controllers_page: Controller<ControllersPage>,
+     #[tracker::do_not_track]
+     openhmd_calibration_box: Controller<OpenHmdCalibrationBox>,
+     xrservice_ready: bool,
+@@ -89,7 +98,6 @@ pub enum MainViewOutMsg {
+     OpenLibsurviveSetup,
+     LaunchMonadoGui,
+     SetEnvVar(String, Option<String>),
+-    OpenPreferences,
+ }
+ 
+ pub struct MainViewInit {
+@@ -99,6 +107,9 @@ pub struct MainViewInit {
+     pub has_nvidia: bool,
+     /// slot (owned by the shell) that receives the "Devices & Apps" page
+     pub devices_slot: adw::Bin,
++    pub headset_slot: adw::Bin,
++    pub eyetracking_slot: adw::Bin,
++    pub controllers_slot: adw::Bin,
+ }
+ 
+ impl MainView {
+@@ -203,7 +214,7 @@ impl AsyncComponent for MainView {
+             },
+ 
+             // Slot for the Pimax summary widget
+-            model.pimax_box.widget(),
++            model.pimax_summary.widget(),
+ 
+                         warn_card(None, concat!(
+                             "Your current prefix is inside a partition ",
+@@ -387,9 +398,9 @@ impl AsyncComponent for MainView {
+                 self.openhmd_calibration_box
+                     .sender()
+                     .emit(OpenHmdCalibrationBoxMsg::XRServiceActiveChanged(active));
+-                self.pimax_box
++                self.eyetracking_page
+                     .sender()
+-                    .emit(PimaxBoxMsg::XRServiceActiveChanged(active));
++                    .emit(EyeTrackingMsg::XRServiceActiveChanged(active));
+                 if !active {
+                     sender.input(Self::Input::UpdateDevices(vec![]));
+                     sender.input(Self::Input::UpdateClients(vec![]));
+@@ -511,13 +522,28 @@ impl AsyncComponent for MainView {
+                 init.selected_profile.features.openhmd.enabled,
+             ));
+ 
+-        let pimax_box = PimaxBox::builder()
+-            .launch(())
+-            .forward(sender.output_sender(), |msg| match msg {
+-                PimaxBoxOutMsg::SetEnvVar(k, v) => MainViewOutMsg::SetEnvVar(k, v),
+-                PimaxBoxOutMsg::RestartXRService => MainViewOutMsg::RestartXRService,
+-                PimaxBoxOutMsg::OpenPreferences => MainViewOutMsg::OpenPreferences,
+-            });
++        // Pimax pages: Home summary + Headset / Eye Tracking / Controllers pages in the shell's slots.
++        let pimax_init = PimaxPageInit {
++            env_vars: init.config.global_preferences.env_vars.clone(),
++        };
++        let pimax_out = |msg| match msg {
++            PimaxOutMsg::SetEnvVar(k, v) => MainViewOutMsg::SetEnvVar(k, v),
++        };
++        let pimax_summary = PimaxSummary::builder()
++            .launch(pimax_init.clone())
++            .forward(sender.output_sender(), pimax_out);
++        let headset_page = HeadsetPage::builder()
++            .launch(pimax_init.clone())
++            .forward(sender.output_sender(), pimax_out);
++        let eyetracking_page = EyeTrackingPage::builder()
++            .launch(pimax_init.clone())
++            .forward(sender.output_sender(), pimax_out);
++        let controllers_page = ControllersPage::builder()
++            .launch(pimax_init)
++            .forward(sender.output_sender(), pimax_out);
++        init.headset_slot.set_child(Some(headset_page.widget()));
++        init.eyetracking_slot.set_child(Some(eyetracking_page.widget()));
++        init.controllers_slot.set_child(Some(controllers_page.widget()));
+ 
+         // "Devices & Apps" page
+         let devices_box = DevicesBox::builder().launch(()).detach();
+@@ -544,7 +570,10 @@ impl AsyncComponent for MainView {
+         }
+ 
+         let model = Self {
+-            pimax_box,
++            pimax_summary,
++            _headset_page: headset_page,
++            eyetracking_page,
++            _controllers_page: controllers_page,
+             xrservice_active: false,
+             monado_gui_btn,
+             steam_launch_options_box: SteamLaunchOptionsBox::builder().launch(()).detach(),
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 64c022b..8ad3de0 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -18,7 +18,6 @@ mod preference_rows;
+ mod preferences_window;
+ mod profile_editor;
+ mod steam_launch_options_box;
+-mod pimax_box;
+ mod pimax_common;
+ mod pimax_eye;
+ mod pimax_pages;
+diff --git a/src/ui/pimax_box.rs b/src/ui/pimax_box.rs
+deleted file mode 100644
+index 1a28c14..0000000
+--- a/src/ui/pimax_box.rs
++++ /dev/null
+@@ -1,454 +0,0 @@
+-#![allow(unused_assignments)] // vars named in view! macro are not correctly recognized as used
+-
+-// DEPRECATED: replaced by the pages in pimax_pages.rs / pimax_eye.rs (sidebar shell); kept until the shell drops it.
+-
+-//! Pimax tools card on the main view: eye-tracking calibration, gaze test, foveation test.
+-//! The tools are the pimax-linux clients in ~/.local/bin (tools/xrgaze in the pimax-linux repo); they are OpenXR
+-//! apps, so the XR service must be running.
+-
+-use super::job_worker::{JobWorker, internal_worker::JobWorkerOut, job::WorkerJob};
+-use relm4::{
+-    ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent,
+-    gtk::{self, prelude::*},
+-};
+-use serde::Deserialize;
+-use std::collections::VecDeque;
+-use tracing::{info, warn};
+-
+-const PIMAX_USB_VENDOR: &str = "34a4";
+-/// The status file counts as fresh when written within this many ms.
+-const STATUS_MAX_AGE_MS: u64 = 5000;
+-
+-/// True when any USB device has the Pimax vendor id.
+-fn pimax_plugged_in() -> bool {
+-    let Ok(dir) = std::fs::read_dir("/sys/bus/usb/devices") else {
+-        return false;
+-    };
+-    dir.flatten().any(|e| {
+-        std::fs::read_to_string(e.path().join("idVendor")).is_ok_and(|v| v.trim().eq_ignore_ascii_case(PIMAX_USB_VENDOR))
+-    })
+-}
+-
+-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+-#[serde(default)]
+-pub struct EyeTrackingStatus {
+-    enabled: Option<bool>,
+-    calibrated: Option<bool>,
+-}
+-
+-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+-#[serde(default)]
+-pub struct ControllerStatus {
+-    connected: Option<bool>,
+-    battery_percent: Option<f64>,
+-}
+-
+-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+-#[serde(default)]
+-pub struct ControllersStatus {
+-    left: Option<ControllerStatus>,
+-    right: Option<ControllerStatus>,
+-}
+-
+-/// Contents of $XDG_RUNTIME_DIR/pimax-p3c/status.json (written by the driver while the XR service runs).
+-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+-#[serde(default)]
+-pub struct PimaxStatus {
+-    updated_unix_ms: u64,
+-    model: Option<String>,
+-    serial: Option<String>,
+-    firmware: Option<String>,
+-    device_check: Option<String>,
+-    refresh_hz: Option<f64>,
+-    ipd_mm: Option<f64>,
+-    eye_tracking: Option<EyeTrackingStatus>,
+-    foveation: Option<bool>,
+-    controllers: Option<ControllersStatus>,
+-}
+-
+-fn read_status() -> Option<PimaxStatus> {
+-    let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
+-    let data = std::fs::read(format!("{dir}/pimax-p3c/status.json")).ok()?;
+-    let st: PimaxStatus = serde_json::from_slice(&data).ok()?;
+-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+-    (now.abs_diff(st.updated_unix_ms) <= STATUS_MAX_AGE_MS).then_some(st)
+-}
+-
+-fn on_off(b: Option<bool>) -> String {
+-    match b {
+-        Some(true) => "On".into(),
+-        Some(false) => "Off".into(),
+-        None => "Unknown".into(),
+-    }
+-}
+-
+-fn controller_text(c: &Option<ControllerStatus>) -> String {
+-    match c {
+-        Some(ControllerStatus { connected: Some(true), battery_percent }) => match battery_percent {
+-            Some(b) => format!("Connected, battery {b:.0}%"),
+-            None => "Connected".into(),
+-        },
+-        Some(ControllerStatus { connected: Some(false), .. }) => "Not connected".into(),
+-        _ => "Unknown".into(),
+-    }
+-}
+-
+-impl PimaxStatus {
+-    fn rows(&self) -> Vec<(&'static str, String)> {
+-        let s = |o: &Option<String>| o.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| "Unknown".into());
+-        let et = self.eye_tracking.clone().unwrap_or_default();
+-        let et_text = match (et.enabled, et.calibrated) {
+-            (Some(false), _) => "Off".to_string(),
+-            (Some(true), Some(true)) => "On, calibrated".into(),
+-            (Some(true), Some(false)) => "On, not calibrated".into(),
+-            (en, _) => on_off(en),
+-        };
+-        let ctrl = self.controllers.clone().unwrap_or_default();
+-        let mut rows = vec![
+-            ("Model", s(&self.model)),
+-            ("Serial", s(&self.serial)),
+-            ("Firmware", s(&self.firmware)),
+-        ];
+-        if let Some(dc) = self.device_check.as_ref().filter(|v| !v.is_empty()) {
+-            rows.push(("Device check", dc.clone()));
+-        }
+-        rows.extend([
+-            ("Refresh rate", self.refresh_hz.map(|v| format!("{v:.0} Hz")).unwrap_or_else(|| "Unknown".into())),
+-            ("IPD", self.ipd_mm.map(|v| format!("{v:.1} mm")).unwrap_or_else(|| "Unknown".into())),
+-            ("Eye tracking", et_text),
+-            ("Foveation", on_off(self.foveation)),
+-            ("Left controller", controller_text(&ctrl.left)),
+-            ("Right controller", controller_text(&ctrl.right)),
+-        ]);
+-        rows
+-    }
+-}
+-
+-/// Env var the driver reads the eye-tracking correction from.
+-pub const EYE_CALIB_VAR: &str = "PIMAX_EYE_CALIB";
+-
+-fn tool(name: &str) -> String {
+-    format!("{}/.local/bin/{name}", std::env::var("HOME").unwrap_or_default())
+-}
+-
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub enum PimaxTool {
+-    Calibrate,
+-    GazeTest,
+-    FoveationTest,
+-}
+-
+-impl PimaxTool {
+-    fn command(self) -> (String, Vec<String>) {
+-        match self {
+-            // Shows the calibration dots in the headset (~45 s), fits, prints PIMAX_EYE_CALIB=... as last line.
+-            Self::Calibrate => (tool("pimax-et-calibrate"), vec![]),
+-            Self::GazeTest => (tool("pimax-gaze"), vec!["120".into()]),
+-            Self::FoveationTest => (tool("xrfovea"), vec!["120".into()]),
+-        }
+-    }
+-    fn label(self) -> &'static str {
+-        match self {
+-            Self::Calibrate => "Eye-tracking calibration",
+-            Self::GazeTest => "Gaze test",
+-            Self::FoveationTest => "Foveation test",
+-        }
+-    }
+-}
+-
+-#[tracker::track]
+-pub struct PimaxBox {
+-    visible: bool,
+-    xrservice_active: bool,
+-    info: Option<PimaxStatus>,
+-    running: Option<PimaxTool>,
+-    status: Option<String>,
+-    success: bool,
+-    restart_needed: bool,
+-    #[tracker::do_not_track]
+-    log: Vec<String>,
+-    #[tracker::do_not_track]
+-    worker: Option<JobWorker>,
+-}
+-
+-#[derive(Debug)]
+-pub enum PimaxBoxMsg {
+-    XRServiceActiveChanged(bool),
+-    Run(PimaxTool),
+-    Stop,
+-    OnLog(Vec<String>),
+-    OnExit(i32),
+-    Restart,
+-    PollPresence,
+-    PollStatus,
+-}
+-
+-#[derive(Debug)]
+-pub enum PimaxBoxOutMsg {
+-    OpenPreferences,
+-    /// Store a global env var (None removes it) and save the config.
+-    SetEnvVar(String, Option<String>),
+-    RestartXRService,
+-}
+-
+-#[relm4::component(pub)]
+-impl SimpleComponent for PimaxBox {
+-    type Init = ();
+-    type Input = PimaxBoxMsg;
+-    type Output = PimaxBoxOutMsg;
+-
+-    view! {
+-        gtk::Box {
+-            set_orientation: gtk::Orientation::Vertical,
+-            set_hexpand: true,
+-            set_vexpand: false,
+-            set_spacing: 12,
+-            add_css_class: "card",
+-            add_css_class: "padded",
+-            #[track = "model.changed(Self::visible())"]
+-            set_visible: model.visible,
+-            gtk::Label {
+-                add_css_class: "heading",
+-                set_xalign: 0.0,
+-                set_label: "Pimax Crystal",
+-            },
+-            gtk::Label {
+-                add_css_class: "heading",
+-                add_css_class: "dim-label",
+-                set_xalign: 0.0,
+-                set_label: "Headset",
+-            },
+-            #[name = "info_grid"]
+-            gtk::Grid {
+-                set_column_spacing: 18,
+-                set_row_spacing: 4,
+-            },
+-            gtk::Label {
+-                add_css_class: "dim-label",
+-                set_xalign: 0.0,
+-                set_wrap: true,
+-                set_wrap_mode: gtk::pango::WrapMode::Word,
+-                #[track = "model.changed(Self::info())"]
+-                set_visible: model.info.is_none(),
+-                set_label: "Headset info appears while the XR service is running",
+-            },
+-            gtk::Label {
+-                add_css_class: "heading",
+-                add_css_class: "dim-label",
+-                set_xalign: 0.0,
+-                set_margin_top: 6,
+-                set_label: "Eye Tracking",
+-            },
+-            gtk::Label {
+-                add_css_class: "dim-label",
+-                set_xalign: 0.0,
+-                set_wrap: true,
+-                set_wrap_mode: gtk::pango::WrapMode::Word,
+-                #[track = "model.changed(Self::xrservice_active())"]
+-                set_label: if model.xrservice_active {
+-                    "Put the headset on. Calibration: look at the centre dot, then follow it with your eyes \
+-                     only (about 45 s). Gaze test: the white dot should sit on the grey dot you look at."
+-                } else {
+-                    "Start the XR service to calibrate or test eye tracking."
+-                },
+-            },
+-            gtk::Label {
+-                set_xalign: 0.0,
+-                set_wrap: true,
+-                set_wrap_mode: gtk::pango::WrapMode::Word,
+-                #[track = "model.changed(Self::status())"]
+-                set_visible: model.status.is_some(),
+-                #[track = "model.changed(Self::status())"]
+-                set_label: model.status.as_deref().unwrap_or_default(),
+-                #[track = "model.changed(Self::success())"]
+-                set_class_active: ("error", !model.success),
+-                #[track = "model.changed(Self::success())"]
+-                set_class_active: ("success", model.success),
+-            },
+-            gtk::Box {
+-                set_orientation: gtk::Orientation::Horizontal,
+-                set_spacing: 6,
+-                gtk::Button {
+-                    add_css_class: "suggested-action",
+-                    set_label: "Recalibrate",
+-                    #[track = "model.changed(Self::running()) || model.changed(Self::xrservice_active())"]
+-                    set_sensitive: model.xrservice_active && model.running.is_none(),
+-                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Run(PimaxTool::Calibrate)),
+-                },
+-                gtk::Button {
+-                    set_label: "Gaze Test",
+-                    #[track = "model.changed(Self::running()) || model.changed(Self::xrservice_active())"]
+-                    set_sensitive: model.xrservice_active && model.running.is_none(),
+-                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Run(PimaxTool::GazeTest)),
+-                },
+-                gtk::Button {
+-                    set_label: "Foveation Test",
+-                    #[track = "model.changed(Self::running()) || model.changed(Self::xrservice_active())"]
+-                    set_sensitive: model.xrservice_active && model.running.is_none(),
+-                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Run(PimaxTool::FoveationTest)),
+-                },
+-                gtk::Button {
+-                    add_css_class: "destructive-action",
+-                    set_label: "Stop",
+-                    #[track = "model.changed(Self::running())"]
+-                    set_visible: model.running.is_some(),
+-                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Stop),
+-                },
+-                gtk::Button {
+-                    set_label: "Restart Session",
+-                    #[track = "model.changed(Self::restart_needed()) || model.changed(Self::xrservice_active())"]
+-                    set_visible: model.restart_needed && model.xrservice_active,
+-                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Restart),
+-                },
+-            },
+-            gtk::Button {
+-                set_label: "Settings…",
+-                set_halign: gtk::Align::Start,
+-                set_margin_top: 6,
+-                connect_clicked[sender] => move |_| { let _ = sender.output(PimaxBoxOutMsg::OpenPreferences); },
+-            },
+-        }
+-    }
+-
+-    fn pre_view() {
+-        if model.changed(Self::info()) {
+-            while let Some(c) = widgets.info_grid.first_child() {
+-                widgets.info_grid.remove(&c);
+-            }
+-            if let Some(info) = &model.info {
+-                for (i, (k, v)) in info.rows().into_iter().enumerate() {
+-                    let kl = gtk::Label::builder().label(k).xalign(0.0).css_classes(["dim-label"]).build();
+-                    let vl = gtk::Label::builder().label(v).xalign(0.0).hexpand(true).selectable(true).wrap(true).build();
+-                    widgets.info_grid.attach(&kl, 0, i as i32, 1, 1);
+-                    widgets.info_grid.attach(&vl, 1, i as i32, 1, 1);
+-                }
+-            }
+-        }
+-    }
+-
+-    fn update(&mut self, message: Self::Input, sender: ComponentSender<Self>) {
+-        self.reset();
+-        match message {
+-            PimaxBoxMsg::XRServiceActiveChanged(active) => {
+-                self.set_xrservice_active(active);
+-                if !active {
+-                    self.set_restart_needed(false);
+-                }
+-            }
+-            PimaxBoxMsg::Run(t) => {
+-                if self.running.is_some() {
+-                    return;
+-                }
+-                let (cmd, args) = t.command();
+-                if !std::path::Path::new(&cmd).exists() {
+-                    self.set_success(false);
+-                    self.set_status(Some(format!("{cmd} not found; install the pimax-linux tools")));
+-                    return;
+-                }
+-                info!("pimax: running {cmd} {args:?}");
+-                self.log.clear();
+-                let mut jobs = VecDeque::new();
+-                jobs.push_back(WorkerJob::new_cmd(None, cmd, Some(args)));
+-                let w = JobWorker::new(jobs, sender.input_sender(), |msg| match msg {
+-                    JobWorkerOut::Log(lines) => PimaxBoxMsg::OnLog(lines),
+-                    JobWorkerOut::Exit(code) => PimaxBoxMsg::OnExit(code),
+-                });
+-                w.start();
+-                self.worker = Some(w);
+-                self.set_running(Some(t));
+-                self.set_success(true);
+-                self.set_status(Some(format!("{} running in the headset…", t.label())));
+-            }
+-            PimaxBoxMsg::Stop => {
+-                if let Some(w) = self.worker.as_ref() {
+-                    w.stop();
+-                }
+-            }
+-            PimaxBoxMsg::OnLog(lines) => self.log.extend(lines.into_iter().map(|l| l.trim_end().to_string())),
+-            PimaxBoxMsg::OnExit(code) => {
+-                let tool = self.running.take();
+-                self.set_running(None);
+-                self.worker = None;
+-                match tool {
+-                    Some(PimaxTool::Calibrate) => self.finish_calibration(code, &sender),
+-                    Some(t) => {
+-                        self.set_success(code == 0);
+-                        self.set_status(Some(if code == 0 {
+-                            format!("{} finished", t.label())
+-                        } else {
+-                            format!("{} exited with code {code}", t.label())
+-                        }));
+-                    }
+-                    None => {}
+-                }
+-            }
+-            PimaxBoxMsg::PollPresence => self.set_visible(pimax_plugged_in()),
+-            PimaxBoxMsg::PollStatus => {
+-                let st = read_status();
+-                if self.info != st {
+-                    self.set_info(st);
+-                }
+-            }
+-            PimaxBoxMsg::Restart => {
+-                self.set_restart_needed(false);
+-                let _ = sender.output(PimaxBoxOutMsg::RestartXRService);
+-            }
+-        }
+-    }
+-
+-    fn init(_init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
+-        let model = Self {
+-            tracker: 0,
+-            visible: pimax_plugged_in(),
+-            xrservice_active: false,
+-            info: read_status(),
+-            running: None,
+-            status: None,
+-            success: true,
+-            restart_needed: false,
+-            log: vec![],
+-            worker: None,
+-        };
+-        let widgets = view_output!();
+-        for (secs, msg) in [(3, 0), (2, 1)] {
+-            let s = sender.input_sender().clone();
+-            relm4::gtk::glib::timeout_add_seconds_local(secs, move || {
+-                let m = if msg == 0 { PimaxBoxMsg::PollPresence } else { PimaxBoxMsg::PollStatus };
+-                if s.send(m).is_ok() {
+-                    relm4::gtk::glib::ControlFlow::Continue
+-                } else {
+-                    relm4::gtk::glib::ControlFlow::Break
+-                }
+-            });
+-        }
+-        ComponentParts { model, widgets }
+-    }
+-}
+-
+-impl PimaxBox {
+-    fn finish_calibration(&mut self, code: i32, sender: &ComponentSender<Self>) {
+-        let prefix = format!("{EYE_CALIB_VAR}=");
+-        let value = self.log.iter().rev().find_map(|l| l.strip_prefix(&prefix)).map(str::to_string);
+-        let quality = self.log.iter().rev().find(|l| l.starts_with("error after:")).cloned();
+-        match (code, value) {
+-            (0, Some(v)) => {
+-                info!("pimax: new eye calibration {v}");
+-                let _ = sender.output(PimaxBoxOutMsg::SetEnvVar(EYE_CALIB_VAR.into(), Some(v)));
+-                self.set_success(true);
+-                self.set_restart_needed(true);
+-                self.set_status(Some(format!(
+-                    "Calibration saved ({}). Restart the session to apply it.",
+-                    quality.as_deref().unwrap_or("fit done").trim_start_matches("error after:").trim()
+-                )));
+-            }
+-            _ => {
+-                warn!("pimax: calibration failed, code {code}, last output {:?}", self.log.last());
+-                self.set_success(false);
+-                self.set_status(Some(format!(
+-                    "Calibration failed (code {code}): {}",
+-                    self.log.last().map(String::as_str).unwrap_or("no output")
+-                )));
+-            }
+-        }
+-    }
+-}
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index 35276cc..05f7c3d 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -1,7 +1,6 @@
+ //! Shared pieces of the Pimax pages: status-file reader, USB presence check, env-var helpers and layout helpers.
+ //! Every settings row is a global env var read by the pimax_p3c Monado driver (or the Monado compositor); unset =
+ //! driver default. Changes apply when the XR service is (re)started.
+-#![allow(dead_code)] // the pages are wired into the shell by a later change
+ 
+ use adw::prelude::*;
+ use relm4::{Sender, gtk};
+@@ -19,7 +18,6 @@ pub const POLL_SECS: u32 = 2;
+ pub enum PimaxOutMsg {
+     /// Store a global env var (None removes it) and save the config.
+     SetEnvVar(String, Option<String>),
+-    RestartXRService,
+ }
+ 
+ /// Init shared by all Pimax page components.
+diff --git a/src/ui/pimax_eye.rs b/src/ui/pimax_eye.rs
+index 3a29461..fa52a94 100644
+--- a/src/ui/pimax_eye.rs
++++ b/src/ui/pimax_eye.rs
+@@ -1,6 +1,5 @@
+ //! Eye Tracking page: calibration and test tools (the pimax-linux clients in ~/.local/bin, which are OpenXR apps,
+ //! so the XR service must be running) plus the eye-tracking / foveation settings.
+-#![allow(dead_code)] // the component is wired into the shell by a later change
+ 
+ use super::{
+     job_worker::{JobWorker, internal_worker::JobWorkerOut, job::WorkerJob},
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index b11da09..5b38fc0 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -1,12 +1,10 @@
+ //! Pimax pages for the sidebar shell: Home summary, Headset page and Controllers page.
+ //! (The Eye Tracking page lives in pimax_eye.rs.) All components share `PimaxOutMsg` / `PimaxPageInit`.
+-#![allow(dead_code)] // the components are wired into the shell by a later change
+ 
+ use super::pimax_common::{
+     Ctx, PimaxOutMsg, PimaxPageInit, PimaxStatus, STALE_HINT, group, hint_label, info_row, page_shell, pimax_plugged_in,
+     pretty_model, read_status, spawn_poll,
+ };
+-#[allow(unused_imports)] // re-export for the shell
+ pub use super::pimax_eye::{EyeTrackingMsg, EyeTrackingPage};
+ use adw::prelude::*;
+ use relm4::{ComponentParts, ComponentSender, SimpleComponent, gtk};
+@@ -57,7 +55,6 @@ pub struct PimaxSummary {
+ 
+ #[derive(Debug)]
+ pub enum PimaxSummaryMsg {
+-    XRServiceActiveChanged(bool),
+     Poll,
+ }
+ 
+@@ -116,7 +113,6 @@ impl SimpleComponent for PimaxSummary {
+ 
+     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+         match msg {
+-            PimaxSummaryMsg::XRServiceActiveChanged(_) => {}
+             PimaxSummaryMsg::Poll => {
+                 self.plugged = pimax_plugged_in();
+                 self.status = read_status();
+@@ -159,7 +155,6 @@ pub struct HeadsetPage {
+ 
+ #[derive(Debug)]
+ pub enum HeadsetMsg {
+-    XRServiceActiveChanged(bool),
+     Poll,
+ }
+ 
+@@ -296,7 +291,6 @@ impl SimpleComponent for HeadsetPage {
+ 
+     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+         match msg {
+-            HeadsetMsg::XRServiceActiveChanged(_) => {}
+             HeadsetMsg::Poll => self.status = read_status(),
+         }
+     }
+@@ -342,7 +336,6 @@ pub struct ControllersPage {
+ 
+ #[derive(Debug)]
+ pub enum ControllersMsg {
+-    XRServiceActiveChanged(bool),
+     Poll,
+ }
+ 
+@@ -457,7 +450,6 @@ impl SimpleComponent for ControllersPage {
+ 
+     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+         match msg {
+-            ControllersMsg::XRServiceActiveChanged(_) => {}
+             ControllersMsg::Poll => self.status = read_status(),
+         }
+     }
+diff --git a/src/ui/shell.rs b/src/ui/shell.rs
+index 08db427..2281122 100644
+--- a/src/ui/shell.rs
++++ b/src/ui/shell.rs
+@@ -53,13 +53,10 @@ pub struct Shell {
+     pub banner: adw::Banner,
+     pub home_slot: adw::Bin,
+     /// Fill with `set_child(Some(..))` to replace the placeholder.
+-    #[allow(dead_code)]
+     pub headset_slot: adw::Bin,
+     /// Fill with `set_child(Some(..))` to replace the placeholder.
+-    #[allow(dead_code)]
+     pub eyetracking_slot: adw::Bin,
+     /// Fill with `set_child(Some(..))` to replace the placeholder.
+-    #[allow(dead_code)]
+     pub controllers_slot: adw::Bin,
+     pub devices_slot: adw::Bin,
+     pub logs_slot: adw::Bin,
+-- 
+2.56.0
+

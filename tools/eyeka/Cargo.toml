@@ -1,0 +1,7 @@
+[package]
+name = "eyeka"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+pimax-protocol = { git = "https://gitlab.freedesktop.org/ultradev/pimax-protocol.git", rev = "00e0f995f000497701e721b33e429bde37c08e48" }
+hidapi = "2"

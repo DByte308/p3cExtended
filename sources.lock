@@ -1,0 +1,12 @@
+# Upstream sources this setup is built from. scripts/install.sh reads the monado, basalt, pimax-configs and
+# envision lines (columns: name, url, "branch <name>", full commit) and checks them out under src/;
+# the rest are recorded for reference. Monado gets patches/monado/*.patch on the local branch pimax-linux,
+# Envision gets patches/envision/*.patch on the local branch pimax.
+monado        https://gitlab.freedesktop.org/ultradev/monado.git        branch pimax-p3c-monado-rust  ae0895d415e3355087729146770bf78322db0e33  (BSL-1.0; pimax_p3c driver has no licence file; the branch was rewritten upstream since, the commit is fetched by hash) + patches/monado (work branch pimax-linux)
+basalt        https://gitlab.freedesktop.org/ultradev/basalt.git        branch pose-covariance  456836260ab019a1f67c4ec0d0eeb664c957d40f  (BSD-3-Clause; VIT 2.1.0; with submodules)
+pimax-protocol https://gitlab.freedesktop.org/ultradev/pimax-protocol.git rev 00e0f995f000497701e721b33e429bde37c08e48  (no licence file; fetched by cargo, pinned in the driver's Cargo.toml)
+pimax-configs https://gitlab.com/notfranko/pimax-configs.git            branch main  0a0fdccc0cd69821dddf7d4a3e8fcc942e45328c  (headset display/controller configs)
+envision      https://gitlab.com/gabmus/envision.git                    branch main  7575ca31666c194289d4a3a62291be4450e51d66  (AGPL-3.0) + patches/envision (work branch pimax; installed as envision-pimax)
+linux         vanilla linux-7.3.1 + patches/kernel/0001  (GPL-2.0)  -> 7.3.1-pimaxq
+wayvr         GitHub release v26.8.0 AppImage
+xrizer        GitHub release v0.6

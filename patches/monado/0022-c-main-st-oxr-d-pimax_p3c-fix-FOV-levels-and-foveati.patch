@@ -1,0 +1,273 @@
+From 2035990f22acf6546bb2082f31cc38003ffc2309 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:52:51 +0100
+Subject: [PATCH 22/28] c/main, st/oxr, d/pimax_p3c: fix FOV levels and
+ foveation settings (audit)
+
+- The compositor scales the recommended size by view FOV / distortion FOV;
+  the driver no longer shrinks display.w/h_pixels, which also shrank the
+  compositor's scratch images (they cover the full distortion FOV).
+- XRT_FOVEATION_CONTEXT_PERCENT / XRT_FOVEATION_INSET_DENSITY_PERCENT are
+  read by the service and passed to apps in xrt_system_compositor_info;
+  before, apps (which never see Envision's env) had to set them.
+- XRT_MIRROR_DUMP creates parent folders and reports write errors once.
+- Status file reports fov_percent.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/compositor/main/comp_compositor.c     | 48 ++++++++++++++++++-
+ .../main/comp_mirror_to_debug_gui.c           | 20 +++++++-
+ .../drivers/pimax_p3c/src/device/hmd/mod.rs   |  2 +-
+ .../drivers/pimax_p3c/src/device/hmd/views.rs | 19 +++++---
+ .../src/device/session/status_file.rs         |  1 +
+ src/xrt/include/xrt/xrt_compositor.h          |  9 ++++
+ src/xrt/state_trackers/oxr/oxr_system.c       | 21 ++++----
+ 7 files changed, 99 insertions(+), 21 deletions(-)
+
+diff --git a/src/xrt/compositor/main/comp_compositor.c b/src/xrt/compositor/main/comp_compositor.c
+index a5fd49ae7..bd4df18e3 100644
+--- a/src/xrt/compositor/main/comp_compositor.c
++++ b/src/xrt/compositor/main/comp_compositor.c
+@@ -93,6 +93,8 @@
+ #define WINDOW_TITLE "Monado"
+ 
+ DEBUG_GET_ONCE_BOOL_OPTION(disable_deferred, "XRT_COMPOSITOR_DISABLE_DEFERRED", false)
++DEBUG_GET_ONCE_NUM_OPTION(foveation_context_percent, "XRT_FOVEATION_CONTEXT_PERCENT", 100)
++DEBUG_GET_ONCE_NUM_OPTION(foveation_inset_density_percent, "XRT_FOVEATION_INSET_DENSITY_PERCENT", 100)
+ 
+ 
+ /*
+@@ -1222,10 +1224,52 @@ comp_main_create_system_compositor(struct xrt_device *xdev,
+ 	// @note If timewarp is disabled this is not supported.
+ 	sys_info->supports_fov_mutable = true;
+ 
++	/*
++	 * A device may hand out a narrower view FOV than its distortion FOV (e.g. a
++	 * reduced FOV level). Apps then get the same pixel density over the smaller
++	 * FOV; the compositor's own scratch images keep the full display size, since
++	 * they are rendered over the full distortion FOV.
++	 */
++	double fov_ratio_w[XRT_MAX_VIEWS];
++	double fov_ratio_h[XRT_MAX_VIEWS];
++	for (uint32_t i = 0; i < view_count; ++i) {
++		fov_ratio_w[i] = fov_ratio_h[i] = 1.0;
++	}
++	{
++		struct xrt_vec3 eye_relation = {0.063f, 0.0f, 0.0f};
++		struct xrt_space_relation head_relation = XRT_SPACE_RELATION_ZERO;
++		struct xrt_fov fovs[XRT_MAX_VIEWS] = {0};
++		struct xrt_pose poses[XRT_MAX_VIEWS] = {0};
++		xrt_result_t fxret = xrt_device_get_view_poses(xdev, &eye_relation, os_monotonic_get_ns(), view_type,
++		                                               view_count, &head_relation, fovs, poses);
++		for (uint32_t i = 0; fxret == XRT_SUCCESS && i < view_count; ++i) {
++			const struct xrt_fov *d = &xdev->hmd->distortion.fov[i];
++			const struct xrt_fov *v = &fovs[i];
++			double dw = tan(d->angle_right) - tan(d->angle_left);
++			double dh = tan(d->angle_up) - tan(d->angle_down);
++			double vw = tan(v->angle_right) - tan(v->angle_left);
++			double vh = tan(v->angle_up) - tan(v->angle_down);
++			if (dw > 0.0 && vw > 0.0 && vw < dw) {
++				fov_ratio_w[i] = vw / dw;
++			}
++			if (dh > 0.0 && vh > 0.0 && vh < dh) {
++				fov_ratio_h[i] = vh / dh;
++			}
++		}
++		if (fov_ratio_w[0] < 1.0 || fov_ratio_h[0] < 1.0) {
++			COMP_INFO(c, "View FOV narrower than the distortion FOV: recommended size scaled by %.2f x %.2f",
++			          fov_ratio_w[0], fov_ratio_h[0]);
++		}
++	}
++
++	sys_info->quad_context_percent = (uint32_t)CLAMP(debug_get_num_option_foveation_context_percent(), 25, 100);
++	sys_info->quad_inset_density_percent =
++	    (uint32_t)CLAMP(debug_get_num_option_foveation_inset_density_percent(), 25, 200);
++
+ 	// clang-format off
+ 	for (uint32_t i = 0; i < view_count; ++i) {
+-		uint32_t w = (uint32_t)(xdev->hmd->views[i].display.w_pixels * scale);
+-		uint32_t h = (uint32_t)(xdev->hmd->views[i].display.h_pixels * scale);
++		uint32_t w = ((uint32_t)(xdev->hmd->views[i].display.w_pixels * scale * fov_ratio_w[i])) & ~1u;
++		uint32_t h = ((uint32_t)(xdev->hmd->views[i].display.h_pixels * scale * fov_ratio_h[i])) & ~1u;
+ 		uint32_t w_2 = xdev->hmd->views[i].display.w_pixels * 2;
+ 		uint32_t h_2 = xdev->hmd->views[i].display.h_pixels * 2;
+ 
+diff --git a/src/xrt/compositor/main/comp_mirror_to_debug_gui.c b/src/xrt/compositor/main/comp_mirror_to_debug_gui.c
+index bb9f0ec43..29cebef87 100644
+--- a/src/xrt/compositor/main/comp_mirror_to_debug_gui.c
++++ b/src/xrt/compositor/main/comp_mirror_to_debug_gui.c
+@@ -12,6 +12,7 @@
+ #include "xrt/xrt_results.h"
+ #include "math/m_mathinclude.h"
+ #include "main/comp_mirror_to_debug_gui.h"
++#include "util/u_logging.h"
+ 
+ #include "cache/render_compute_pipeline_cache.h"
+ #include "cache/render_shader_specialization_helpers.h"
+@@ -43,7 +44,18 @@ mirror_dump_dir(void)
+ 			dir = NULL;
+ 		}
+ 		if (dir != NULL) {
+-			mkdir(dir, 0755);
++			// mkdir -p: the parent folders may not exist yet.
++			char tmp[1024];
++			snprintf(tmp, sizeof(tmp), "%s", dir);
++			for (char *p = tmp + 1; *p != '\0'; p++) {
++				if (*p == '/') {
++					*p = '\0';
++					mkdir(tmp, 0755);
++					*p = '/';
++				}
++			}
++			mkdir(tmp, 0755);
++			U_LOG_W("XRT_MIRROR_DUMP: writing the left-eye view to %s (slows the compositor)", dir);
+ 		}
+ 	}
+ 	return dir;
+@@ -66,7 +78,11 @@ mirror_dump_frame(struct xrt_frame *frame)
+ 	for (uint32_t y = 0; y < frame->height; y++) {
+ 		memcpy(packed + y * row, frame->data + y * frame->stride, row);
+ 	}
+-	stbi_write_jpg(path, (int)frame->width, (int)frame->height, 4, packed, 70);
++	static bool warned = false;
++	if (stbi_write_jpg(path, (int)frame->width, (int)frame->height, 4, packed, 70) == 0 && !warned) {
++		warned = true;
++		U_LOG_E("XRT_MIRROR_DUMP: could not write %s", path);
++	}
+ 	free(packed);
+ }
+ 
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
+index 7b1e64da0..9b3f60d50 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
+@@ -1,6 +1,6 @@
+ pub mod distortion;
+ mod startup;
+-mod views;
++pub(crate) mod views;
+ 
+ use crate::device::camera::Cameras;
+ use crate::device::hmd::distortion::PimaxDeviceConfig;
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+index 989c88d53..082f637db 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+@@ -19,9 +19,9 @@ fn render_ipd_offset_m() -> f32 {
+     })
+ }
+ 
+-/// `PIMAX_FOV_PERCENT` (50..100, default 100): selectable FOV levels. Scales the view tangents (so the image
+-/// is cropped, the compositor fills the rest with black) and the recommended render size by the same ratio, keeping
+-/// the pixel density and saving GPU time.
++/// `PIMAX_FOV_PERCENT` (50..100, default 100): selectable FOV levels. Scales the view tangents, so the image
++/// is cropped and the compositor fills the rest with black. The compositor scales the recommended render size by the
++/// same tangent ratio (view FOV vs distortion FOV), keeping the pixel density and saving GPU time.
+ pub fn fov_scale() -> f32 {
+     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+     *V.get_or_init(|| {
+@@ -73,10 +73,15 @@ pub unsafe fn setup_views(me: &mut PimaxHmd) {
+     hmd.blend_mode_count = 1;
+ 
+     for (i, view) in hmd.views.iter_mut().enumerate().take(2) {
+-        // The recommended render size follows the FOV level (same pixel density over a smaller FOV).
+-        let (dw, dh) = if view_rotation == 90 || view_rotation == 270 { (eye_h, eye_w) } else { (eye_w, eye_h) };
+-        view.display.w_pixels = ((dw as f32 * fov_scale()) as u32) & !1;
+-        view.display.h_pixels = ((dh as f32 * fov_scale()) as u32) & !1;
++        // Full panel size: the compositor's scratch images cover the full distortion FOV. The recommended size for
++        // apps follows the (possibly narrower) view FOV, see comp_compositor.c.
++        if view_rotation == 90 || view_rotation == 270 {
++            view.display.w_pixels = eye_h;
++            view.display.h_pixels = eye_w;
++        } else {
++            view.display.w_pixels = eye_w;
++            view.display.h_pixels = eye_h;
++        }
+         view.viewport.x_pixels = eye_w * i as u32;
+         view.viewport.y_pixels = 0;
+         view.viewport.w_pixels = eye_w;
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
+index 52ba1fd21..834c25665 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
+@@ -87,6 +87,7 @@ impl StatusFile {
+                 "calibrated": option_str("PIMAX_EYE_CALIB").is_some(),
+             },
+             "foveation": option_bool("PIMAX_FOVEATION", true),
++            "fov_percent": (crate::device::hmd::views::fov_scale() * 100.0).round(),
+             "controllers": {
+                 "left": controller(Hand::Left),
+                 "right": controller(Hand::Right),
+diff --git a/src/xrt/include/xrt/xrt_compositor.h b/src/xrt/include/xrt/xrt_compositor.h
+index 614a44d7c..25d77d7ac 100644
+--- a/src/xrt/include/xrt/xrt_compositor.h
++++ b/src/xrt/include/xrt/xrt_compositor.h
+@@ -2325,6 +2325,15 @@ struct xrt_system_compositor_info
+ 	 * devices.
+ 	 */
+ 	bool supports_emulated_quad_views_with_inset;
++
++	/*!
++	 * Quad view sizing, read by the service (XRT_FOVEATION_CONTEXT_PERCENT /
++	 * XRT_FOVEATION_INSET_DENSITY_PERCENT) so apps don't need the env vars:
++	 * context views as a percentage of the stereo size, inset views as a
++	 * percentage of the stereo pixel density. 0 means 100.
++	 */
++	uint32_t quad_context_percent;
++	uint32_t quad_inset_density_percent;
+ };
+ 
+ /*!
+diff --git a/src/xrt/state_trackers/oxr/oxr_system.c b/src/xrt/state_trackers/oxr/oxr_system.c
+index 1fa2b6d03..600d6f490 100644
+--- a/src/xrt/state_trackers/oxr/oxr_system.c
++++ b/src/xrt/state_trackers/oxr/oxr_system.c
+@@ -40,8 +40,6 @@
+  */
+ 
+ DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "OXR_VIEWPORT_SCALE_PERCENTAGE", 100)
+-DEBUG_GET_ONCE_NUM_OPTION(foveation_context_percent, "XRT_FOVEATION_CONTEXT_PERCENT", 100)
+-DEBUG_GET_ONCE_NUM_OPTION(foveation_inset_density_percent, "XRT_FOVEATION_INSET_DENSITY_PERCENT", 100)
+ 
+ 
+ static double
+@@ -180,16 +178,21 @@ tan_span_v(const struct xrt_fov *f)
+ }
+ 
+ /*!
+- * Size the four quad views. Context views: the stereo size times XRT_FOVEATION_CONTEXT_PERCENT. Inset views: when the
++ * Size the four quad views. Context views: the stereo size times info->quad_context_percent. Inset views: when the
+  * device produces quad views itself, the stereo pixel density (in tangent space) over the inset's angles times
+- * XRT_FOVEATION_INSET_DENSITY_PERCENT, so the inset is no longer a full-resolution copy of the eye. The angles come
+- * from one get_view_poses(QUAD) call, so the driver stays the single source of truth for the inset FOV.
++ * info->quad_inset_density_percent, so the inset is no longer a full-resolution copy of the eye. The percentages are
++ * read by the service (env XRT_FOVEATION_*), so apps don't need them. The angles come from one get_view_poses(QUAD)
++ * call, so the driver stays the single source of truth for the inset FOV.
+  */
+ static void
+-size_quad_views(struct oxr_logger *log, struct xrt_device *head, struct oxr_view_config_properties *props)
++size_quad_views(struct oxr_logger *log,
++                const struct xrt_system_compositor_info *info,
++                struct xrt_device *head,
++                struct oxr_view_config_properties *props)
+ {
+-	const double context = CLAMP((double)debug_get_num_option_foveation_context_percent(), 25.0, 100.0) / 100.0;
+-	const double density = CLAMP((double)debug_get_num_option_foveation_inset_density_percent(), 25.0, 200.0) / 100.0;
++	const double context = (info->quad_context_percent ? CLAMP(info->quad_context_percent, 25u, 100u) : 100u) / 100.0;
++	const double density =
++	    (info->quad_inset_density_percent ? CLAMP(info->quad_inset_density_percent, 25u, 200u) : 100u) / 100.0;
+ 
+ 	XrViewConfigurationView *v = props->views;
+ 	const uint32_t stereo_w[2] = {v[0].recommendedImageRectWidth, v[1].recommendedImageRectWidth};
+@@ -252,7 +255,7 @@ fill_in_view_emulated_quadview_config_properties(struct oxr_logger *log,
+ 
+ 	props->view_count = 4;
+ 
+-	size_quad_views(log, head, props);
++	size_quad_views(log, info, head, props);
+ }
+ 
+ static bool
+-- 
+2.56.0
+

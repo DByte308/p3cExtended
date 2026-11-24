@@ -1,0 +1,78 @@
+From 56e16e5b59f84f6483f1c96ba590203dc7d79312 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:41:07 +0100
+Subject: [PATCH 18/28] d/pimax_p3c: PIMAX_AIM_OFFSET_L/R controller
+ orientation offset
+
+Rotates the LED-model frame the driver reports for grip/aim. Default
+identity: the captures so far predate the clock fix and disagree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/controller/mod.rs    | 44 +++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
+index c5dde844f..bd0b776c3 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
+@@ -134,8 +134,14 @@ unsafe extern "C" fn get_tracked_pose(
+         .get()
+         .and_then(|c| c.get_pose(me.hand, at_ns))
+         .unwrap_or_default();
++    let mut relation = relation;
+     if relation.relation_flags.0 != 0 {
+         diag.pose_valid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        // Rotate the LED-model frame so -Z points where the controller points (thumb up). Angular velocity is in
++        // world space and the origin stays, so only the orientation changes.
++        let o = &mut relation.pose.orientation;
++        let r = mul([o.x, o.y, o.z, o.w], aim_offset(me.hand));
++        (o.x, o.y, o.z, o.w) = (r[0], r[1], r[2], r[3]);
+     }
+     unsafe { *out = relation };
+     xrt_result::XRT_SUCCESS
+@@ -145,3 +151,41 @@ unsafe extern "C" fn destroy(xdev: *mut xrt_device) {
+     // The tracker itself is torn down with the HMD, which owns the threads feeding it.
+     drop(unsafe { Box::from_raw(xdev as *mut PimaxController) });
+ }
++
++/// Controller frame -> aim frame (x, y, z, w): `PIMAX_AIM_OFFSET_L` / `PIMAX_AIM_OFFSET_R` = "x,y,z,w". Default
++/// identity (the raw LED-model frame) until a measurement taken with the clock fix in place; the 2026-11-23 captures
++/// (L about -0.41,0.07,0.16,0.90) predate it and disagree between sessions. The right model is the mirror of the left
++/// about device X, so R should be L with y and z negated.
++fn aim_offset(hand: Hand) -> [f32; 4] {
++    static OFFSETS: std::sync::OnceLock<[[f32; 4]; 2]> = std::sync::OnceLock::new();
++    OFFSETS.get_or_init(|| {
++        let read = |var: &str, default: [f32; 4]| -> [f32; 4] {
++            let Ok(raw) = std::env::var(var) else { return default };
++            let v: Vec<f32> = raw.split(',').filter_map(|c| c.trim().parse().ok()).collect();
++            let n = v.iter().map(|c| c * c).sum::<f32>().sqrt();
++            if v.len() == 4 && n > 1e-6 {
++                [v[0] / n, v[1] / n, v[2] / n, v[3] / n]
++            } else {
++                warn!("{var}={raw}: want x,y,z,w; using the default");
++                default
++            }
++        };
++        let o = [
++            read("PIMAX_AIM_OFFSET_L", [0.0, 0.0, 0.0, 1.0]),
++            read("PIMAX_AIM_OFFSET_R", [0.0, 0.0, 0.0, 1.0]),
++        ];
++        info!("controller aim offsets L {:?} R {:?}", o[0], o[1]);
++        o
++    })[hand as usize]
++}
++
++fn mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
++    let [ax, ay, az, aw] = a;
++    let [bx, by, bz, bw] = b;
++    [
++        aw * bx + ax * bw + ay * bz - az * by,
++        aw * by - ax * bz + ay * bw + az * bx,
++        aw * bz + ax * by - ay * bx + az * bw,
++        aw * bw - ax * bx - ay * by - az * bz,
++    ]
++}
+-- 
+2.56.0
+

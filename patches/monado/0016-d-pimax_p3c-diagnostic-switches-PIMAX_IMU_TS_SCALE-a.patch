@@ -1,0 +1,84 @@
+From 8d339e902363a62a456b744f23b9e85761d826ad Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:41:37 +0100
+Subject: [PATCH 16/28] d/pimax_p3c: diagnostic switches PIMAX_IMU_TS_SCALE and
+ PIMAX_EYE_BRINGUP
+
+PIMAX_IMU_TS_SCALE (default 1000) A/Bs the HMD IMU per-sample timestamp
+factor; 100 leaves SLAM without any position. PIMAX_EYE_BRINGUP=0 skips
+the replayed Vision bring-up sequence; PIMAX_EYE_TRACKING=0 now skips the
+whole eye tracker bring-up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/session/extras.rs        | 15 +++++++++++++--
+ .../pimax_p3c/src/device/session/status.rs        | 13 ++++++++++++-
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs b/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
+index 00ee31752..ce67e53c1 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
+@@ -44,7 +44,18 @@ pub(super) fn apply_ipd(cmd: &CommandDevice) {
+ }
+ 
+ pub(super) fn activate_eye_tracker(cmd: &CommandDevice) -> Result<(), Error> {
+-    for r in [
++    if !crate::util::option_bool("PIMAX_EYE_TRACKING", true) {
++        info!("eye tracking disabled (PIMAX_EYE_TRACKING=0): no Vision bring-up");
++        return Ok(());
++    }
++    // Diagnostic: PIMAX_EYE_BRINGUP=0 skips the replayed Vision sequence (only CmdEyeTrackEnable is sent).
++    let replay = if crate::util::option_bool("PIMAX_EYE_BRINGUP", true) {
++        true
++    } else {
++        info!("PIMAX_EYE_BRINGUP=0: skipping the replayed Vision bring-up sequence");
++        false
++    };
++    for r in if !replay { vec![] } else { vec![
+         cmd.query(&VisionRaw::<0x3A>(&[0x03])),
+         cmd.query(&VisionRaw::<0x3A>(&[0x01])),
+         cmd.query(&VisionRaw::<0x3A>(&[0x00])),
+@@ -53,7 +64,7 @@ pub(super) fn activate_eye_tracker(cmd: &CommandDevice) -> Result<(), Error> {
+         cmd.query(&VisionRaw::<0x1B>(&[0x01])),
+         cmd.query(&VisionRaw::<0x5B>(&[0x02, 0x02])),
+         cmd.query(&VisionRaw::<0x5A>(&[0x00])),
+-    ] {
++    ] } {
+         if let Err(e) = r {
+             warn!("eye tracking bring-up command failed: {e}");
+         }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index 6f7600b06..c9ff7b038 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -39,6 +39,17 @@ impl ControllerDiag {
+     }
+ }
+ 
++/// Diagnostic A/B switch for the HMD IMU per-sample timestamp factor: `PIMAX_IMU_TS_SCALE` (default 1000 = us -> ns;
++/// upstream ae0895d41 used 100).
++fn imu_ts_scale() -> i64 {
++    static S: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
++    *S.get_or_init(|| {
++        let v = crate::util::option_num("PIMAX_IMU_TS_SCALE", 1000);
++        info!("HMD IMU per-sample timestamp scale {v}");
++        v
++    })
++}
++
+ fn log_controller_diag(now: i64) {
+     let last = DIAG_LAST_NS.load(Ordering::Relaxed);
+     if now - (last as i64) < 1_000_000_000 {
+@@ -113,7 +124,7 @@ impl OnReport for HmdStatus {
+             && let Some(slam) = tracking.slam.get()
+         {
+             for sample in self.imu {
+-                let timestamp_ns = host_ns + (sample.timestamp_us as i64 * 1000) - device_ns;
++                let timestamp_ns = host_ns + (sample.timestamp_us as i64 * imu_ts_scale()) - device_ns;
+ 
+                 let accel_m_s2 =
+                     to_headset_frame_vec(sample.accel.map(|g| g as f64 * MATH_GRAVITY_M_S2).into());
+-- 
+2.56.0
+

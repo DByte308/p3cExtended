@@ -1,0 +1,301 @@
+From c296d85b6aac64dded2d7fc0d16859c5503ec4a9 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:23:28 +0100
+Subject: [PATCH 05/13] Add shared Pimax status/env helpers and fix spin row
+ digits
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/pimax_common.rs    | 262 ++++++++++++++++++++++++++++++++++++++
+ src/ui/preference_rows.rs |   4 +-
+ 2 files changed, 264 insertions(+), 2 deletions(-)
+ create mode 100644 src/ui/pimax_common.rs
+
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+new file mode 100644
+index 0000000..35276cc
+--- /dev/null
++++ b/src/ui/pimax_common.rs
+@@ -0,0 +1,262 @@
++//! Shared pieces of the Pimax pages: status-file reader, USB presence check, env-var helpers and layout helpers.
++//! Every settings row is a global env var read by the pimax_p3c Monado driver (or the Monado compositor); unset =
++//! driver default. Changes apply when the XR service is (re)started.
++#![allow(dead_code)] // the pages are wired into the shell by a later change
++
++use adw::prelude::*;
++use relm4::{Sender, gtk};
++use serde::Deserialize;
++use std::{cell::RefCell, collections::HashMap, rc::Rc};
++
++const PIMAX_USB_VENDOR: &str = "34a4";
++/// The status file counts as fresh when written within this many ms.
++const STATUS_MAX_AGE_MS: u64 = 5000;
++/// How often the pages re-read the status file.
++pub const POLL_SECS: u32 = 2;
++
++/// Output shared by all Pimax page components.
++#[derive(Debug)]
++pub enum PimaxOutMsg {
++    /// Store a global env var (None removes it) and save the config.
++    SetEnvVar(String, Option<String>),
++    RestartXRService,
++}
++
++/// Init shared by all Pimax page components.
++#[derive(Debug, Clone, Default)]
++pub struct PimaxPageInit {
++    /// Snapshot of `config.global_preferences.env_vars`.
++    pub env_vars: HashMap<String, String>,
++}
++
++/// True when any USB device has the Pimax vendor id.
++pub fn pimax_plugged_in() -> bool {
++    let Ok(dir) = std::fs::read_dir("/sys/bus/usb/devices") else {
++        return false;
++    };
++    dir.flatten().any(|e| {
++        std::fs::read_to_string(e.path().join("idVendor")).is_ok_and(|v| v.trim().eq_ignore_ascii_case(PIMAX_USB_VENDOR))
++    })
++}
++
++#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
++#[serde(default)]
++pub struct EyeTrackingStatus {
++    pub enabled: Option<bool>,
++    pub calibrated: Option<bool>,
++}
++
++#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
++#[serde(default)]
++pub struct ControllerStatus {
++    pub connected: Option<bool>,
++    pub battery_percent: Option<f64>,
++}
++
++#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
++#[serde(default)]
++pub struct ControllersStatus {
++    pub left: Option<ControllerStatus>,
++    pub right: Option<ControllerStatus>,
++}
++
++/// Contents of $XDG_RUNTIME_DIR/pimax-p3c/status.json (written by the driver while the XR service runs).
++#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
++#[serde(default)]
++pub struct PimaxStatus {
++    pub updated_unix_ms: u64,
++    pub model: Option<String>,
++    pub serial: Option<String>,
++    pub firmware: Option<String>,
++    pub device_check: Option<String>,
++    pub refresh_hz: Option<f64>,
++    pub ipd_mm: Option<f64>,
++    pub eye_tracking: Option<EyeTrackingStatus>,
++    pub foveation: Option<bool>,
++    pub controllers: Option<ControllersStatus>,
++}
++
++impl PimaxStatus {
++    /// (total, failing subsystem names) parsed from "EEPROM=ok, IMU=ok, ...".
++    pub fn self_test(&self) -> Option<(usize, Vec<String>)> {
++        let dc = self.device_check.as_deref().filter(|v| !v.trim().is_empty())?;
++        let items: Vec<_> = dc.split(',').filter_map(|i| i.split_once('=')).collect();
++        if items.is_empty() {
++            return None;
++        }
++        let failing = items
++            .iter()
++            .filter(|(_, v)| !v.trim().eq_ignore_ascii_case("ok"))
++            .map(|(k, v)| format!("{} ({})", k.trim(), v.trim()))
++            .collect();
++        Some((items.len(), failing))
++    }
++
++    pub fn controller(&self, left: bool) -> ControllerStatus {
++        let c = self.controllers.clone().unwrap_or_default();
++        (if left { c.left } else { c.right }).unwrap_or_default()
++    }
++}
++
++/// The current status, or None when the file is missing or stale (XR service not running).
++pub fn read_status() -> Option<PimaxStatus> {
++    let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
++    let data = std::fs::read(format!("{dir}/pimax-p3c/status.json")).ok()?;
++    let st: PimaxStatus = serde_json::from_slice(&data).ok()?;
++    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
++    (now.abs_diff(st.updated_unix_ms) <= STATUS_MAX_AGE_MS).then_some(st)
++}
++
++/// "CrystalSuperUltrawide" -> "Crystal Super Ultrawide"
++pub fn pretty_model(m: &str) -> String {
++    let mut out = String::new();
++    for (i, c) in m.chars().enumerate() {
++        if i > 0 && c.is_uppercase() {
++            out.push(' ');
++        }
++        out.push(c);
++    }
++    out
++}
++
++pub fn spawn_poll<T: 'static>(input: &Sender<T>, msg: impl Fn() -> T + 'static) {
++    let s = input.clone();
++    relm4::gtk::glib::timeout_add_seconds_local(POLL_SECS, move || {
++        if s.send(msg()).is_ok() {
++            relm4::gtk::glib::ControlFlow::Continue
++        } else {
++            relm4::gtk::glib::ControlFlow::Break
++        }
++    });
++}
++
++/// A page's own copy of the env vars plus the output channel; rows write through it.
++#[derive(Clone)]
++pub struct Ctx {
++    env: Rc<RefCell<HashMap<String, String>>>,
++    out: Sender<PimaxOutMsg>,
++}
++
++impl Ctx {
++    pub fn new(init: &PimaxPageInit, out: &Sender<PimaxOutMsg>) -> Self {
++        Self { env: Rc::new(RefCell::new(init.env_vars.clone())), out: out.clone() }
++    }
++
++    pub fn get(&self, k: &str) -> Option<String> {
++        self.env.borrow().get(k).cloned()
++    }
++
++    /// Update the local copy and tell the shell (only when the value actually changed).
++    pub fn set(&self, k: &str, v: Option<String>) {
++        if self.get(k) == v {
++            return;
++        }
++        match &v {
++            Some(v) => self.env.borrow_mut().insert(k.into(), v.clone()),
++            None => self.env.borrow_mut().remove(k),
++        };
++        let _ = self.out.send(PimaxOutMsg::SetEnvVar(k.into(), v));
++    }
++
++    pub fn bool_var(&self, k: &str, default: bool) -> bool {
++        match self.get(k).as_deref() {
++            Some("0" | "false" | "off" | "no") => false,
++            Some(_) => true,
++            None => default,
++        }
++    }
++
++    /// Switch for a boolean driver option; writes the var only when it differs from the driver default.
++    pub fn bool_row(&self, k: &'static str, title: &str, desc: &str, default: bool) -> adw::SwitchRow {
++        let c = self.clone();
++        super::preference_rows::switch_row(title, Some(desc), self.bool_var(k, default), move |_, v| {
++            c.set(k, (v != default).then(|| if v { "1" } else { "0" }.to_string()));
++        })
++    }
++
++    /// Spin row for a numeric option; `unset` (shown as that value) removes the var.
++    #[allow(clippy::too_many_arguments)]
++    pub fn num_row(&self, k: &'static str, title: &str, desc: &str, unset: f64, min: f64, max: f64, step: f64) -> adw::SpinRow {
++        let c = self.clone();
++        let val = self.get(k).and_then(|v| v.parse().ok()).unwrap_or(unset);
++        super::preference_rows::spin_row(title, Some(desc), val, min, max, step, move |adj| {
++            let v = adj.value();
++            c.set(k, (v != unset).then(|| if step >= 1.0 { format!("{v:.0}") } else { format!("{v}") }));
++        })
++    }
++
++    /// Combo row over (label, value) choices; a None value means unset (driver default).
++    pub fn choice_row(&self, k: &'static str, title: &str, desc: &str, choices: &'static [(&'static str, Option<&'static str>)]) -> adw::ComboRow {
++        let cur = self.get(k);
++        let cur_label = choices
++            .iter()
++            .find(|(_, v)| v.map(str::to_string) == cur)
++            .map(|(l, _)| *l)
++            .unwrap_or(choices[0].0);
++        let c = self.clone();
++        super::preference_rows::combo_row(
++            title,
++            Some(desc),
++            cur_label,
++            choices.iter().map(|(l, _)| l.to_string()).collect(),
++            move |row| {
++                let v = choices.get(row.selected() as usize).and_then(|(_, v)| *v);
++                c.set(k, v.map(String::from));
++            },
++        )
++    }
++}
++
++pub fn group(title: &str, desc: Option<&str>) -> adw::PreferencesGroup {
++    let g = adw::PreferencesGroup::builder().title(title).build();
++    if let Some(d) = desc {
++        g.set_description(Some(d));
++    }
++    g
++}
++
++/// Read-only row: title on the left, live value as a dim suffix label.
++pub fn info_row(title: &str) -> (adw::ActionRow, gtk::Label) {
++    let row = adw::ActionRow::builder().title(title).subtitle_lines(0).build();
++    let l = gtk::Label::builder()
++        .css_classes(["dim-label"])
++        .selectable(true)
++        .xalign(1.0)
++        .valign(gtk::Align::Center)
++        .build();
++    row.add_suffix(&l);
++    (row, l)
++}
++
++/// Scrollable, clamped page container (24 px margins, 24 px between groups).
++pub fn page_shell() -> (gtk::ScrolledWindow, gtk::Box) {
++    let content = gtk::Box::builder()
++        .orientation(gtk::Orientation::Vertical)
++        .spacing(24)
++        .margin_top(24)
++        .margin_bottom(24)
++        .margin_start(24)
++        .margin_end(24)
++        .build();
++    let clamp = adw::Clamp::builder().maximum_size(720).tightening_threshold(560).child(&content).build();
++    let scroll = gtk::ScrolledWindow::builder()
++        .hscrollbar_policy(gtk::PolicyType::Never)
++        .hexpand(true)
++        .vexpand(true)
++        .child(&clamp)
++        .build();
++    (scroll, content)
++}
++
++/// Dim hint label shown while the status file is stale.
++pub fn hint_label(text: &str) -> gtk::Label {
++    gtk::Label::builder()
++        .label(text)
++        .css_classes(["dim-label"])
++        .wrap(true)
++        .wrap_mode(gtk::pango::WrapMode::Word)
++        .xalign(0.0)
++        .build()
++}
++
++pub const STALE_HINT: &str = "Start the session to see live headset data.";
+diff --git a/src/ui/preference_rows.rs b/src/ui/preference_rows.rs
+index 7f3bd3a..e4206b5 100644
+--- a/src/ui/preference_rows.rs
++++ b/src/ui/preference_rows.rs
+@@ -75,10 +75,10 @@ pub fn spin_row<F: Fn(&gtk::Adjustment) + 'static>(
+     let row = adw::SpinRow::builder()
+         .title(title)
+         .adjustment(&adj)
+-        .digits(if min_increment == 1.0 {
++        .digits(if min_increment.fract() == 0.0 {
+             0
+         } else {
+-            min_increment.to_string().len() - 2
++            min_increment.to_string().len().saturating_sub(2)
+         } as u32)
+         .build();
+     if let Some(sub) = subtitle {
+-- 
+2.56.0
+

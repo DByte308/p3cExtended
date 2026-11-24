@@ -1,0 +1,66 @@
+From 1765cae397343d65e6e3c108c619f22a0506365a Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:28:54 +0100
+Subject: [PATCH 07/28] d/pimax_p3c: PIMAX_EYE_CALIB affine gaze-angle
+ correction
+
+Six coefficients (degrees) mapping measured yaw/pitch to true, applied after
+PIMAX_EYE_FLIP. Measured on a Crystal Super: horizontal axis mirrored, gain ~0.8,
+offset 1-1.5 deg; with the fitted correction 0.44 deg mean / 0.8 deg max error
+on 14 targets (independent verification run).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/pimax_p3c/src/device/eye.rs | 32 ++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/eye.rs b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+index dc8dedfa9..e82831520 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/eye.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+@@ -433,11 +433,41 @@ unsafe extern "C" fn eye_get_tracked_pose(
+ 
+ /// Chip frame is x right, y up, z forward (toward the scene); OpenXR gaze looks along -Z of the pose.
+ /// `PIMAX_EYE_FLIP` (letters x,y) mirrors axes if a calibration test shows a sign error.
++/// `PIMAX_EYE_CALIB="ay,by,cy,ap,bp,cp"`: affine map in degrees from the measured gaze angles to the true ones,
++/// `yaw = ay*m_yaw + by*m_pitch + cy`, `pitch = ap*m_yaw + bp*m_pitch + cp` (yaw + right, pitch + up, head frame).
++/// Fitted by `tools/xrgaze/xrcalib` + `tools/xrgaze/fit_calib.py`. Unset or malformed: no correction.
++fn calib_coeffs() -> Option<[f32; 6]> {
++    static C: std::sync::OnceLock<Option<[f32; 6]>> = std::sync::OnceLock::new();
++    *C.get_or_init(|| {
++        let s = option_str("PIMAX_EYE_CALIB")?;
++        let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
++        match <[f32; 6]>::try_from(v) {
++            Ok(c) => {
++                info!("eye calibration: {c:?}");
++                Some(c)
++            }
++            Err(_) => {
++                warn!("PIMAX_EYE_CALIB={s}: need 6 comma-separated numbers; no correction");
++                None
++            }
++        }
++    })
++}
++
++fn calibrate(d: [f32; 3]) -> [f32; 3] {
++    let Some(c) = calib_coeffs() else { return d };
++    let my = d[0].atan2(-d[2]).to_degrees();
++    let mp = d[1].atan2(d[0].hypot(d[2])).to_degrees();
++    let y = (c[0] * my + c[1] * mp + c[2]).to_radians();
++    let p = (c[3] * my + c[4] * mp + c[5]).to_radians();
++    [y.sin() * p.cos(), p.sin(), -y.cos() * p.cos()]
++}
++
+ pub fn gaze_pose(g: &Gaze) -> xrt_pose {
+     let flip = option_str("PIMAX_EYE_FLIP").unwrap_or_default();
+     let sx = if flip.contains('x') { -1.0 } else { 1.0 };
+     let sy = if flip.contains('y') { -1.0 } else { 1.0 };
+-    let d = [g.dir[0] * sx, g.dir[1] * sy, -g.dir[2]];
++    let d = calibrate([g.dir[0] * sx, g.dir[1] * sy, -g.dir[2]]);
+     // Shortest rotation from -Z to d: w = 1 + dot(-Z, d) = 1 - d.z, axis = cross(-Z, d) = (d.y, -d.x, 0).
+     let (w, x, y) = (1.0 - d[2], d[1], -d[0]);
+     let n = (w * w + x * x + y * y).sqrt().max(1e-6);
+-- 
+2.56.0
+

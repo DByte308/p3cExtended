@@ -1,0 +1,15 @@
+#!/bin/sh
+# Eye-tracking calibration (needs a running XR service and the headset on):
+# shows the dots in the headset (xrcalib), fits the correction, prints PIMAX_EYE_CALIB=... as the last line.
+# Raw data is kept in $PIMAX_PREFIX/share/pimax-linux/calib/ (default ~/.local/...). Used by Envision's "Recalibrate" button.
+set -eu
+P="${PIMAX_PREFIX:-$HOME/.local}"
+DIR="$P/share/pimax-linux/calib"; mkdir -p "$DIR"
+CSV="$DIR/calib-$(date +%Y%m%d-%H%M%S).csv"
+# Run xrcalib as a child we can stop: Envision's Stop sends SIGTERM to this shell only.
+"$P/bin/xrcalib" "$CSV" "${1:-8}" "${2:-2.5}" &
+pid=$!
+trap 'kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; exit 143' TERM INT HUP
+wait "$pid"
+trap - TERM INT HUP
+exec python3 -I "$P/share/pimax-linux/fit_calib.py" "$CSV"

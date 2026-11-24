@@ -1,0 +1,236 @@
+From 4726e7a73aa30d083e0735bcbe7d2a5d1f92d61a Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:42:20 +0100
+Subject: [PATCH 21/28] d/pimax_p3c, st/oxr: FOV levels and sized foveation
+ quad views
+
+PIMAX_FOV_PERCENT (50-100) narrows the view tangents and the recommended
+render size by the same ratio (selectable FOV levels). The emulated quad
+view config no longer copies the full stereo size into the inset: the inset
+gets the stereo pixel density over its angles (from one get_view_poses(QUAD)
+call, so the driver is the single source of truth for the inset FOV) times
+XRT_FOVEATION_INSET_DENSITY_PERCENT; context views are scaled by
+XRT_FOVEATION_CONTEXT_PERCENT. XRT_FOVEATION_INSET_DEG sets the inset size.
+
+Behaviour change: quad-view apps now get a much smaller inset image at 100 %
+density instead of a second full-resolution copy of each eye.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/pimax_p3c/src/device/hmd/views.rs | 53 +++++++++---
+ src/xrt/state_trackers/oxr/oxr_system.c       | 80 +++++++++++++++++++
+ 2 files changed, 122 insertions(+), 11 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+index f3f3dea9f..989c88d53 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+@@ -19,6 +19,40 @@ fn render_ipd_offset_m() -> f32 {
+     })
+ }
+ 
++/// `PIMAX_FOV_PERCENT` (50..100, default 100): selectable FOV levels. Scales the view tangents (so the image
++/// is cropped, the compositor fills the rest with black) and the recommended render size by the same ratio, keeping
++/// the pixel density and saving GPU time.
++pub fn fov_scale() -> f32 {
++    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    *V.get_or_init(|| {
++        let pct = crate::util::option_num("PIMAX_FOV_PERCENT", 100).clamp(50, 100);
++        if pct != 100 {
++            info!("FOV level {pct} %");
++        }
++        pct as f32 / 100.0
++    })
++}
++
++/// `XRT_FOVEATION_INSET_DEG` (10..90, default 40): full width/height of the foveal inset. Shared with the OpenXR
++/// state tracker, which sizes the inset images from the angles this returns.
++fn inset_half_fov_rad() -> f32 {
++    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    *V.get_or_init(|| {
++        let deg = crate::util::option_num("XRT_FOVEATION_INSET_DEG", 40).clamp(10, 90);
++        info!("foveal inset {deg} deg");
++        (deg as f32 / 2.0).to_radians()
++    })
++}
++
++fn scale_fov(f: &mut xrt_fov, k: f32) {
++    if k >= 1.0 {
++        return;
++    }
++    for a in [&mut f.angle_left, &mut f.angle_right, &mut f.angle_up, &mut f.angle_down] {
++        *a = (a.tan() * k).atan();
++    }
++}
++
+ pub unsafe fn setup_views(me: &mut PimaxHmd) {
+     let PimaxDeviceConfigDisplay {
+         native_width,
+@@ -39,13 +73,10 @@ pub unsafe fn setup_views(me: &mut PimaxHmd) {
+     hmd.blend_mode_count = 1;
+ 
+     for (i, view) in hmd.views.iter_mut().enumerate().take(2) {
+-        if view_rotation == 90 || view_rotation == 270 {
+-            view.display.w_pixels = eye_h;
+-            view.display.h_pixels = eye_w;
+-        } else {
+-            view.display.w_pixels = eye_w;
+-            view.display.h_pixels = eye_h;
+-        }
++        // The recommended render size follows the FOV level (same pixel density over a smaller FOV).
++        let (dw, dh) = if view_rotation == 90 || view_rotation == 270 { (eye_h, eye_w) } else { (eye_w, eye_h) };
++        view.display.w_pixels = ((dw as f32 * fov_scale()) as u32) & !1;
++        view.display.h_pixels = ((dh as f32 * fov_scale()) as u32) & !1;
+         view.viewport.x_pixels = eye_w * i as u32;
+         view.viewport.y_pixels = 0;
+         view.viewport.w_pixels = eye_w;
+@@ -104,6 +135,9 @@ pub unsafe extern "C" fn pimax_get_view_poses(
+     }
+     let poses = unsafe { std::slice::from_raw_parts_mut(out_poses, view_count as usize) };
+     let fovs = unsafe { std::slice::from_raw_parts_mut(out_fovs, view_count as usize) };
++    for f in fovs.iter_mut().take(2) {
++        scale_fov(f, fov_scale());
++    }
+     for (i, pose) in poses.iter_mut().enumerate().take(2) {
+         // Rotation about +y: positive turns the left eye's forward vector (-z) towards -x.
+         let outwards = if i == 0 { 1. } else { -1. };
+@@ -128,7 +162,7 @@ pub unsafe extern "C" fn pimax_get_view_poses(
+             e.touch();
+             e.gaze()
+         });
+-        let half = INSET_HALF_FOV_DEG.to_radians();
++        let half = inset_half_fov_rad();
+         for i in 0..2 {
+             let eye_pos = poses[i].position;
+             poses[2 + i] = xrt_pose {
+@@ -144,6 +178,3 @@ pub unsafe extern "C" fn pimax_get_view_poses(
+     xrt_result::XRT_SUCCESS
+ }
+ 
+-/// Foveal inset half-FOV in degrees; about a third of the full view.
+-const INSET_HALF_FOV_DEG: f32 = 20.0;
+-
+diff --git a/src/xrt/state_trackers/oxr/oxr_system.c b/src/xrt/state_trackers/oxr/oxr_system.c
+index c8c3d639e..1fa2b6d03 100644
+--- a/src/xrt/state_trackers/oxr/oxr_system.c
++++ b/src/xrt/state_trackers/oxr/oxr_system.c
+@@ -30,6 +30,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <assert.h>
++#include <math.h>
+ 
+ 
+ /*
+@@ -39,6 +40,8 @@
+  */
+ 
+ DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "OXR_VIEWPORT_SCALE_PERCENTAGE", 100)
++DEBUG_GET_ONCE_NUM_OPTION(foveation_context_percent, "XRT_FOVEATION_CONTEXT_PERCENT", 100)
++DEBUG_GET_ONCE_NUM_OPTION(foveation_inset_density_percent, "XRT_FOVEATION_INSET_DENSITY_PERCENT", 100)
+ 
+ 
+ static double
+@@ -155,8 +158,82 @@ fill_in_view_config_properties(struct oxr_logger *log,
+ 	props->view_count = view_config->view_count;
+ }
+ 
++static uint32_t
++quad_size(double px, uint32_t max_px)
++{
++	uint32_t v = (uint32_t)lround(px);
++	v = MAX(v, 16u);
++	v = MIN(v, max_px);
++	return v & ~1u;
++}
++
++static double
++tan_span_h(const struct xrt_fov *f)
++{
++	return tan(f->angle_right) - tan(f->angle_left);
++}
++
++static double
++tan_span_v(const struct xrt_fov *f)
++{
++	return tan(f->angle_up) - tan(f->angle_down);
++}
++
++/*!
++ * Size the four quad views. Context views: the stereo size times XRT_FOVEATION_CONTEXT_PERCENT. Inset views: when the
++ * device produces quad views itself, the stereo pixel density (in tangent space) over the inset's angles times
++ * XRT_FOVEATION_INSET_DENSITY_PERCENT, so the inset is no longer a full-resolution copy of the eye. The angles come
++ * from one get_view_poses(QUAD) call, so the driver stays the single source of truth for the inset FOV.
++ */
++static void
++size_quad_views(struct oxr_logger *log, struct xrt_device *head, struct oxr_view_config_properties *props)
++{
++	const double context = CLAMP((double)debug_get_num_option_foveation_context_percent(), 25.0, 100.0) / 100.0;
++	const double density = CLAMP((double)debug_get_num_option_foveation_inset_density_percent(), 25.0, 200.0) / 100.0;
++
++	XrViewConfigurationView *v = props->views;
++	const uint32_t stereo_w[2] = {v[0].recommendedImageRectWidth, v[1].recommendedImageRectWidth};
++	const uint32_t stereo_h[2] = {v[0].recommendedImageRectHeight, v[1].recommendedImageRectHeight};
++
++	for (uint32_t i = 0; i < 2; i++) {
++		v[i].recommendedImageRectWidth = quad_size(stereo_w[i] * context, v[i].maxImageRectWidth);
++		v[i].recommendedImageRectHeight = quad_size(stereo_h[i] * context, v[i].maxImageRectHeight);
++	}
++
++	if (head == NULL || !head->supported.get_views_quad) {
++		return;
++	}
++
++	struct xrt_vec3 eye_relation = {0.063f, 0.0f, 0.0f};
++	struct xrt_space_relation head_relation = XRT_SPACE_RELATION_ZERO;
++	struct xrt_fov fovs[4] = {0};
++	struct xrt_pose poses[4] = {0};
++	xrt_result_t xret = xrt_device_get_view_poses(head, &eye_relation, os_monotonic_get_ns(), XRT_VIEW_TYPE_QUAD, 4,
++	                                              &head_relation, fovs, poses);
++	if (xret != XRT_SUCCESS) {
++		oxr_log(log, "Could not get quad view angles, the inset keeps the stereo size.");
++		return;
++	}
++
++	for (uint32_t i = 0; i < 2; i++) {
++		const double kw = tan_span_h(&fovs[2 + i]) / tan_span_h(&fovs[i]);
++		const double kh = tan_span_v(&fovs[2 + i]) / tan_span_v(&fovs[i]);
++		if (!(kw > 0.0) || !(kh > 0.0)) {
++			continue;
++		}
++		v[2 + i].recommendedImageRectWidth = quad_size(stereo_w[i] * kw * density, v[2 + i].maxImageRectWidth);
++		v[2 + i].recommendedImageRectHeight = quad_size(stereo_h[i] * kh * density, v[2 + i].maxImageRectHeight);
++	}
++
++	U_LOG_I("Quad views: context %ux%u (%.0f %%), inset %ux%u (%.0f %% density); stereo %ux%u",
++	        v[0].recommendedImageRectWidth, v[0].recommendedImageRectHeight, context * 100.0,
++	        v[2].recommendedImageRectWidth, v[2].recommendedImageRectHeight, density * 100.0, stereo_w[0],
++	        stereo_h[0]);
++}
++
+ static void
+ fill_in_view_emulated_quadview_config_properties(struct oxr_logger *log,
++                                                 struct xrt_device *head,
+                                                  struct oxr_view_config_properties *props,
+                                                  const struct xrt_system_compositor_info *info,
+                                                  const struct xrt_view_config *stereo_view_config)
+@@ -174,6 +251,8 @@ fill_in_view_emulated_quadview_config_properties(struct oxr_logger *log,
+ 	fill_in_view_config_properties_views(log, props->views + 2, stereo_view_config);
+ 
+ 	props->view_count = 4;
++
++	size_quad_views(log, head, props);
+ }
+ 
+ static bool
+@@ -317,6 +396,7 @@ oxr_system_fill_view_configs_locked(struct oxr_logger *log, uint32_t view_count,
+ 			assert(sys->view_config_count < XRT_MAX_COMPOSITOR_VIEW_CONFIGS_COUNT);
+ 			fill_in_view_emulated_quadview_config_properties( //
+ 			    log,                                          //
++			    GET_STATIC_XDEV_BY_ROLE(sys, head),           //
+ 			    &sys->view_configs[sys->view_config_count],   //
+ 			    info,                                         //
+ 			    stereo_view_config);                          //
+-- 
+2.56.0
+

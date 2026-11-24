@@ -1,0 +1,43 @@
+From 661def8684bc6f712ffad91901cbd76fbe686fbc Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:07:38 +0100
+Subject: [PATCH 10/28] d/pimax_p3c: PIMAX_GPU selects the video work mode
+ (nvidia/amd)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/session/video.rs       | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/video.rs b/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
+index d040bd563..a99492c89 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
+@@ -8,8 +8,23 @@ use std::time::{Duration, Instant};
+ 
+ const CAMERA_SETTINGS_INTERVAL: Duration = Duration::from_millis(500);
+ 
++const GPU_ENV: &str = "PIMAX_GPU";
++
++/// `PIMAX_GPU`: `nvidia` (default) or `amd`.
++fn gpu_type() -> GpuType {
++    match crate::util::option_str(GPU_ENV).map(|v| v.trim().to_ascii_lowercase()) {
++        None => GpuType::Nvidia,
++        Some(v) if v.is_empty() || v == "nvidia" => GpuType::Nvidia,
++        Some(v) if v == "amd" => GpuType::Amd,
++        Some(v) => {
++            warn!("{GPU_ENV}={v}: expected nvidia or amd; using nvidia");
++            GpuType::Nvidia
++        }
++    }
++}
++
+ pub(super) fn start_video(cmd: &CommandDevice, rate_hz: u8) -> Result<(), Error> {
+-    cmd.query(&CmdVideoCtrl::SetWorkMode(GpuType::Nvidia))?;
++    cmd.query(&CmdVideoCtrl::SetWorkMode(gpu_type()))?;
+     match cmd.query(&CmdGetVideoCtrlInfo) {
+         Ok(payload) => debug!("GetVideoCtrlInfo -> {payload:02X?}"),
+         Err(e) => warn!("GetVideoCtrlInfo: {e}"),
+-- 
+2.56.0
+

@@ -1,0 +1,869 @@
+From be511647c56e49a435f66406d28938a72276c947 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:23:28 +0100
+Subject: [PATCH 06/13] Add Pimax Summary, Headset, Eye Tracking and
+ Controllers page components
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/pimax_eye.rs   | 370 +++++++++++++++++++++++++++++++++
+ src/ui/pimax_pages.rs | 470 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 840 insertions(+)
+ create mode 100644 src/ui/pimax_eye.rs
+ create mode 100644 src/ui/pimax_pages.rs
+
+diff --git a/src/ui/pimax_eye.rs b/src/ui/pimax_eye.rs
+new file mode 100644
+index 0000000..3a29461
+--- /dev/null
++++ b/src/ui/pimax_eye.rs
+@@ -0,0 +1,370 @@
++//! Eye Tracking page: calibration and test tools (the pimax-linux clients in ~/.local/bin, which are OpenXR apps,
++//! so the XR service must be running) plus the eye-tracking / foveation settings.
++#![allow(dead_code)] // the component is wired into the shell by a later change
++
++use super::{
++    job_worker::{JobWorker, internal_worker::JobWorkerOut, job::WorkerJob},
++    pimax_common::{Ctx, PimaxOutMsg, PimaxPageInit, PimaxStatus, group, page_shell, read_status, spawn_poll},
++};
++use adw::prelude::*;
++use relm4::{ComponentParts, ComponentSender, SimpleComponent, gtk};
++use std::collections::VecDeque;
++use tracing::{info, warn};
++
++/// Env var the driver reads the eye-tracking correction from.
++pub const EYE_CALIB_VAR: &str = "PIMAX_EYE_CALIB";
++
++fn tool(name: &str) -> String {
++    format!("{}/.local/bin/{name}", std::env::var("HOME").unwrap_or_default())
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum PimaxTool {
++    Calibrate,
++    GazeTest,
++    FoveationTest,
++}
++
++impl PimaxTool {
++    fn command(self) -> (String, Vec<String>) {
++        match self {
++            // Shows the calibration dots in the headset (~45 s), fits, prints PIMAX_EYE_CALIB=... as last line.
++            Self::Calibrate => (tool("pimax-et-calibrate"), vec![]),
++            Self::GazeTest => (tool("pimax-gaze"), vec!["120".into()]),
++            Self::FoveationTest => (tool("xrfovea"), vec!["120".into()]),
++        }
++    }
++    fn label(self) -> &'static str {
++        match self {
++            Self::Calibrate => "Eye-tracking calibration",
++            Self::GazeTest => "Gaze test",
++            Self::FoveationTest => "Foveation test",
++        }
++    }
++}
++
++pub struct EyeTrackingPage {
++    ctx: Ctx,
++    xrservice_active: bool,
++    status: Option<PimaxStatus>,
++    running: Option<PimaxTool>,
++    result: Option<(bool, String)>,
++    /// Mean error reported by the last calibration run in this app session.
++    calib_error: Option<String>,
++    log: Vec<String>,
++    worker: Option<JobWorker>,
++}
++
++#[derive(Debug)]
++pub enum EyeTrackingMsg {
++    XRServiceActiveChanged(bool),
++    Run(PimaxTool),
++    Stop,
++    OnLog(Vec<String>),
++    OnExit(i32),
++    Poll,
++}
++
++pub struct EyeTrackingWidgets {
++    title: gtk::Label,
++    subtitle: gtk::Label,
++    tools_group: adw::PreferencesGroup,
++    buttons: Vec<gtk::Button>,
++    stop_row: adw::ActionRow,
++    spinner: gtk::Spinner,
++    result: gtk::Label,
++    calib_entry: adw::EntryRow,
++}
++
++impl EyeTrackingPage {
++    fn state(&self) -> (&'static str, String, &'static str) {
++        let et = self.status.as_ref().and_then(|s| s.eye_tracking.clone());
++        let enabled = et.as_ref().and_then(|e| e.enabled).unwrap_or_else(|| self.ctx.bool_var("PIMAX_EYE_TRACKING", true));
++        if !enabled {
++            return ("Eye tracking off", "Turn it on in the settings below.".into(), "dim-label");
++        }
++        let calibrated = et
++            .and_then(|e| e.calibrated)
++            .unwrap_or_else(|| self.ctx.get(EYE_CALIB_VAR).is_some_and(|v| !v.is_empty()));
++        if calibrated {
++            let sub = match &self.calib_error {
++                Some(e) => format!("Mean error {e}"),
++                None => "Calibration stored".into(),
++            };
++            ("Calibrated", sub, "success")
++        } else {
++            ("Not calibrated", "Run a calibration for accurate gaze and foveation.".into(), "warning")
++        }
++    }
++
++    fn finish_calibration(&mut self, code: i32) {
++        let prefix = format!("{EYE_CALIB_VAR}=");
++        let value = self.log.iter().rev().find_map(|l| l.strip_prefix(&prefix)).map(str::to_string);
++        let quality = self
++            .log
++            .iter()
++            .rev()
++            .find_map(|l| l.strip_prefix("error after:"))
++            .map(|q| q.trim().to_string());
++        match (code, value) {
++            (0, Some(v)) => {
++                info!("pimax: new eye calibration {v}");
++                self.ctx.set(EYE_CALIB_VAR, Some(v));
++                self.calib_error = quality.clone();
++                self.result = Some((
++                    true,
++                    format!(
++                        "Calibration saved{}. Restart the session to apply it.",
++                        quality.map(|q| format!(" (error {q})")).unwrap_or_default()
++                    ),
++                ));
++            }
++            _ => {
++                warn!("pimax: calibration failed, code {code}, last output {:?}", self.log.last());
++                self.result = Some((
++                    false,
++                    format!("Calibration failed (code {code}): {}", self.log.last().map(String::as_str).unwrap_or("no output")),
++                ));
++            }
++        }
++    }
++}
++
++fn tool_row(title: &str, subtitle: &str, button: &str, suggested: bool) -> (adw::ActionRow, gtk::Button) {
++    let row = adw::ActionRow::builder().title(title).subtitle(subtitle).subtitle_lines(0).build();
++    let b = gtk::Button::builder().label(button).width_request(150).valign(gtk::Align::Center).css_classes(["pill"]).build();
++    if suggested {
++        b.add_css_class("suggested-action");
++    }
++    row.add_suffix(&b);
++    (row, b)
++}
++
++impl SimpleComponent for EyeTrackingPage {
++    type Init = PimaxPageInit;
++    type Input = EyeTrackingMsg;
++    type Output = PimaxOutMsg;
++    type Root = gtk::Box;
++    type Widgets = EyeTrackingWidgets;
++
++    fn init_root() -> Self::Root {
++        gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).vexpand(true).build()
++    }
++
++    fn init(init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
++        let ctx = Ctx::new(&init, sender.output_sender());
++        let (scroll, content) = page_shell();
++        root.append(&scroll);
++
++        // Header
++        let header = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
++        header.append(
++            &gtk::Image::builder().icon_name("view-reveal-symbolic").pixel_size(48).halign(gtk::Align::Center).css_classes(["dim-label"]).build(),
++        );
++        let title = gtk::Label::builder().css_classes(["title-1"]).margin_top(6).build();
++        let subtitle = gtk::Label::builder().css_classes(["dim-label"]).wrap(true).justify(gtk::Justification::Center).build();
++        header.append(&title);
++        header.append(&subtitle);
++        content.append(&header);
++
++        // Tools
++        let tools_group = group(
++            "Calibration & tests",
++            Some("Put the headset on: these run inside the headset."),
++        );
++        let (r_cal, b_cal) = tool_row(
++            "Recalibrate",
++            "Look at the centre dot, then follow it with your eyes only. Takes about 45 seconds.",
++            "Recalibrate",
++            true,
++        );
++        let (r_gaze, b_gaze) = tool_row(
++            "Gaze test",
++            "A white dot follows your gaze: it should sit on the grey dot you look at.",
++            "Gaze Test",
++            false,
++        );
++        let (r_fov, b_fov) = tool_row(
++            "Foveation test",
++            "Shows the sharp inset where you look, to check quad views and calibration.",
++            "Foveation Test",
++            false,
++        );
++        b_cal.connect_clicked({
++            let s = sender.input_sender().clone();
++            move |_| {
++                let _ = s.send(EyeTrackingMsg::Run(PimaxTool::Calibrate));
++            }
++        });
++        b_gaze.connect_clicked({
++            let s = sender.input_sender().clone();
++            move |_| {
++                let _ = s.send(EyeTrackingMsg::Run(PimaxTool::GazeTest));
++            }
++        });
++        b_fov.connect_clicked({
++            let s = sender.input_sender().clone();
++            move |_| {
++                let _ = s.send(EyeTrackingMsg::Run(PimaxTool::FoveationTest));
++            }
++        });
++        for r in [&r_cal, &r_gaze, &r_fov] {
++            tools_group.add(r);
++        }
++        // running / result row
++        let stop_row = adw::ActionRow::builder().title("Running\u{2026}").visible(false).build();
++        let spinner = gtk::Spinner::builder().spinning(true).valign(gtk::Align::Center).build();
++        stop_row.add_prefix(&spinner);
++        let stop = gtk::Button::builder().label("Stop").valign(gtk::Align::Center).css_classes(["pill", "destructive-action"]).build();
++        stop.connect_clicked({
++            let s = sender.input_sender().clone();
++            move |_| {
++                let _ = s.send(EyeTrackingMsg::Stop);
++            }
++        });
++        stop_row.add_suffix(&stop);
++        tools_group.add(&stop_row);
++        content.append(&tools_group);
++        let result = gtk::Label::builder().xalign(0.0).wrap(true).wrap_mode(gtk::pango::WrapMode::Word).visible(false).build();
++        content.append(&result);
++
++        // Settings
++        let settings = group("Settings", Some("Applied when the session starts."));
++        settings.add(&ctx.bool_row("PIMAX_EYE_TRACKING", "Eye tracking", "Tobii eye tracker for gaze input and foveation", true));
++        settings.add(&ctx.bool_row(
++            "PIMAX_FOVEATION",
++            "Foveated rendering (quad views)",
++            "Apps that support XR_VARJO_quad_views render a sharp inset where you look",
++            true,
++        ));
++        let adv = adw::ExpanderRow::builder().title("Advanced").subtitle("Calibration value and axis flip").build();
++        let calib_entry = {
++            let c = ctx.clone();
++            let e = super::preference_rows::entry_row("Calibration", &ctx.get(EYE_CALIB_VAR).unwrap_or_default(), move |r| {
++                let t = r.text().trim().to_string();
++                c.set(EYE_CALIB_VAR, (!t.is_empty()).then_some(t));
++            });
++            e.set_tooltip_text(Some("Six numbers written by Recalibrate; clear to use the raw tracker output"));
++            e
++        };
++        adv.add_row(&calib_entry);
++        adv.add_row(&ctx.choice_row(
++            "PIMAX_EYE_FLIP",
++            "Axis flip",
++            "Raw axis mirroring before calibration; normally None (calibration handles it)",
++            &[("None", None), ("Horizontal (x)", Some("x")), ("Vertical (y)", Some("y")), ("Both (xy)", Some("xy"))],
++        ));
++        settings.add(&adv);
++        content.append(&settings);
++
++        spawn_poll(sender.input_sender(), || EyeTrackingMsg::Poll);
++        let model = Self {
++            ctx,
++            xrservice_active: false,
++            status: read_status(),
++            running: None,
++            result: None,
++            calib_error: None,
++            log: vec![],
++            worker: None,
++        };
++        ComponentParts {
++            model,
++            widgets: EyeTrackingWidgets {
++                title,
++                subtitle,
++                tools_group,
++                buttons: vec![b_cal, b_gaze, b_fov],
++                stop_row,
++                spinner,
++                result,
++                calib_entry,
++            },
++        }
++    }
++
++    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
++        match msg {
++            EyeTrackingMsg::XRServiceActiveChanged(active) => self.xrservice_active = active,
++            EyeTrackingMsg::Poll => self.status = read_status(),
++            EyeTrackingMsg::Run(t) => {
++                if self.running.is_some() {
++                    return;
++                }
++                let (cmd, args) = t.command();
++                if !std::path::Path::new(&cmd).exists() {
++                    self.result = Some((false, format!("{cmd} not found; install the pimax-linux tools")));
++                    return;
++                }
++                info!("pimax: running {cmd} {args:?}");
++                self.log.clear();
++                let mut jobs = VecDeque::new();
++                jobs.push_back(WorkerJob::new_cmd(None, cmd, Some(args)));
++                let w = JobWorker::new(jobs, sender.input_sender(), |msg| match msg {
++                    JobWorkerOut::Log(lines) => EyeTrackingMsg::OnLog(lines),
++                    JobWorkerOut::Exit(code) => EyeTrackingMsg::OnExit(code),
++                });
++                w.start();
++                self.worker = Some(w);
++                self.running = Some(t);
++                self.result = None;
++            }
++            EyeTrackingMsg::Stop => {
++                if let Some(w) = self.worker.as_ref() {
++                    w.stop();
++                }
++            }
++            EyeTrackingMsg::OnLog(lines) => self.log.extend(lines.into_iter().map(|l| l.trim_end().to_string())),
++            EyeTrackingMsg::OnExit(code) => {
++                let t = self.running.take();
++                self.worker = None;
++                match t {
++                    Some(PimaxTool::Calibrate) => self.finish_calibration(code),
++                    Some(t) => {
++                        self.result = Some((
++                            code == 0,
++                            if code == 0 { format!("{} finished", t.label()) } else { format!("{} exited with code {code}", t.label()) },
++                        ));
++                    }
++                    None => {}
++                }
++            }
++        }
++    }
++
++    fn update_view(&self, w: &mut Self::Widgets, _sender: ComponentSender<Self>) {
++        let (title, sub, class) = self.state();
++        w.title.set_label(title);
++        w.subtitle.set_label(&sub);
++        for c in ["success", "warning", "dim-label"] {
++            w.subtitle.remove_css_class(c);
++        }
++        w.subtitle.add_css_class(class);
++        let ready = self.xrservice_active && self.running.is_none();
++        for b in &w.buttons {
++            b.set_sensitive(ready);
++        }
++        w.tools_group.set_description(Some(if self.xrservice_active {
++            "Put the headset on: these run inside the headset."
++        } else {
++            "Start the session to calibrate or test eye tracking."
++        }));
++        w.stop_row.set_visible(self.running.is_some());
++        w.spinner.set_spinning(self.running.is_some());
++        if let Some(t) = self.running {
++            w.stop_row.set_title(&format!("{} running in the headset\u{2026}", t.label()));
++        }
++        match &self.result {
++            Some((ok, text)) => {
++                w.result.set_visible(true);
++                w.result.set_label(text);
++                w.result.set_css_classes(&[if *ok { "success" } else { "error" }]);
++            }
++            None => w.result.set_visible(false),
++        }
++        let cur = self.ctx.get(EYE_CALIB_VAR).unwrap_or_default();
++        if w.calib_entry.text().trim() != cur {
++            w.calib_entry.set_text(&cur);
++        }
++    }
++}
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+new file mode 100644
+index 0000000..b11da09
+--- /dev/null
++++ b/src/ui/pimax_pages.rs
+@@ -0,0 +1,470 @@
++//! Pimax pages for the sidebar shell: Home summary, Headset page and Controllers page.
++//! (The Eye Tracking page lives in pimax_eye.rs.) All components share `PimaxOutMsg` / `PimaxPageInit`.
++#![allow(dead_code)] // the components are wired into the shell by a later change
++
++use super::pimax_common::{
++    Ctx, PimaxOutMsg, PimaxPageInit, PimaxStatus, STALE_HINT, group, hint_label, info_row, page_shell, pimax_plugged_in,
++    pretty_model, read_status, spawn_poll,
++};
++#[allow(unused_imports)] // re-export for the shell
++pub use super::pimax_eye::{EyeTrackingMsg, EyeTrackingPage};
++use adw::prelude::*;
++use relm4::{ComponentParts, ComponentSender, SimpleComponent, gtk};
++
++const DASH: &str = "\u{2014}";
++
++fn page_root() -> gtk::Box {
++    gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).vexpand(true).build()
++}
++
++// ---------------------------------------------------------------- Summary
++
++/// Compact tile: icon, big value, small caption.
++fn tile(icon: &str, caption: &str) -> (gtk::Box, gtk::Label) {
++    let b = gtk::Box::builder()
++        .orientation(gtk::Orientation::Vertical)
++        .spacing(4)
++        .css_classes(["card"])
++        .halign(gtk::Align::Fill)
++        .build();
++    let inner = gtk::Box::builder()
++        .orientation(gtk::Orientation::Vertical)
++        .spacing(4)
++        .margin_top(14)
++        .margin_bottom(14)
++        .margin_start(16)
++        .margin_end(16)
++        .build();
++    let img = gtk::Image::builder().icon_name(icon).halign(gtk::Align::Start).css_classes(["dim-label"]).build();
++    let value = gtk::Label::builder()
++        .css_classes(["title-2"])
++        .xalign(0.0)
++        .wrap(true)
++        .wrap_mode(gtk::pango::WrapMode::Word)
++        .build();
++    let cap = gtk::Label::builder().label(caption).css_classes(["caption", "dim-label"]).xalign(0.0).build();
++    inner.append(&img);
++    inner.append(&value);
++    inner.append(&cap);
++    b.append(&inner);
++    (b, value)
++}
++
++pub struct PimaxSummary {
++    plugged: bool,
++    status: Option<PimaxStatus>,
++}
++
++#[derive(Debug)]
++pub enum PimaxSummaryMsg {
++    XRServiceActiveChanged(bool),
++    Poll,
++}
++
++pub struct PimaxSummaryWidgets {
++    headset: gtk::Label,
++    headset_caption: gtk::Label,
++    refresh: gtk::Label,
++    ipd: gtk::Label,
++    eye: gtk::Label,
++    controllers: gtk::Label,
++    hint: gtk::Label,
++}
++
++impl SimpleComponent for PimaxSummary {
++    type Init = PimaxPageInit;
++    type Input = PimaxSummaryMsg;
++    type Output = PimaxOutMsg;
++    type Root = gtk::Box;
++    type Widgets = PimaxSummaryWidgets;
++
++    fn init_root() -> Self::Root {
++        gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).hexpand(true).build()
++    }
++
++    fn init(_init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
++        let flow = gtk::FlowBox::builder()
++            .selection_mode(gtk::SelectionMode::None)
++            .homogeneous(true)
++            .column_spacing(12)
++            .row_spacing(12)
++            .min_children_per_line(1)
++            .max_children_per_line(5)
++            .build();
++        let (t_headset, headset) = tile("video-display-symbolic", "Headset");
++        let (t_refresh, refresh) = tile("view-refresh-symbolic", "Refresh rate");
++        let (t_ipd, ipd) = tile("view-dual-symbolic", "Lens IPD");
++        let (t_eye, eye) = tile("view-reveal-symbolic", "Eye tracking");
++        let (t_ctrl, controllers) = tile("input-gaming-symbolic", "Controllers");
++        for t in [&t_headset, &t_refresh, &t_ipd, &t_eye, &t_ctrl] {
++            flow.append(t);
++        }
++        // the headset tile's caption is the connection state
++        let headset_caption = t_headset.last_child().and_then(|c| c.last_child()).and_downcast::<gtk::Label>().unwrap();
++        let hint = hint_label(STALE_HINT);
++        hint.set_margin_start(4);
++        root.append(&flow);
++        root.append(&hint);
++        spawn_poll(sender.input_sender(), || PimaxSummaryMsg::Poll);
++        let model = Self { plugged: pimax_plugged_in(), status: read_status() };
++        root.set_visible(model.plugged);
++        ComponentParts {
++            model,
++            widgets: PimaxSummaryWidgets { headset, headset_caption, refresh, ipd, eye, controllers, hint },
++        }
++    }
++
++    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
++        match msg {
++            PimaxSummaryMsg::XRServiceActiveChanged(_) => {}
++            PimaxSummaryMsg::Poll => {
++                self.plugged = pimax_plugged_in();
++                self.status = read_status();
++            }
++        }
++    }
++
++    fn update_view(&self, w: &mut Self::Widgets, _sender: ComponentSender<Self>) {
++        let root = w.hint.parent().and_downcast::<gtk::Box>().unwrap();
++        root.set_visible(self.plugged);
++        let st = self.status.as_ref();
++        w.hint.set_visible(st.is_none());
++        w.headset.set_label(
++            &st.and_then(|s| s.model.as_deref()).filter(|m| !m.is_empty()).map(pretty_model).unwrap_or_else(|| "Pimax".into()),
++        );
++        w.headset_caption.set_label(if self.plugged { "Headset \u{b7} Connected" } else { "Headset \u{b7} Not connected" });
++        w.refresh.set_label(&st.and_then(|s| s.refresh_hz).map(|v| format!("{v:.0} Hz")).unwrap_or_else(|| DASH.into()));
++        w.ipd.set_label(&st.and_then(|s| s.ipd_mm).map(|v| format!("{v:.1} mm")).unwrap_or_else(|| DASH.into()));
++        w.eye.set_label(&match st.and_then(|s| s.eye_tracking.as_ref()) {
++            Some(e) if e.enabled == Some(false) => "Off".to_string(),
++            Some(e) if e.calibrated == Some(true) => "Calibrated".into(),
++            Some(_) => "Not calibrated".into(),
++            None => DASH.into(),
++        });
++        w.controllers.set_label(&match st {
++            Some(s) => {
++                let dot = |left| if s.controller(left).connected == Some(true) { "\u{25cf}" } else { "\u{25cb}" };
++                format!("L {} \u{b7} R {}", dot(true), dot(false))
++            }
++            None => DASH.into(),
++        });
++    }
++}
++
++// ---------------------------------------------------------------- Headset
++
++pub struct HeadsetPage {
++    status: Option<PimaxStatus>,
++}
++
++#[derive(Debug)]
++pub enum HeadsetMsg {
++    XRServiceActiveChanged(bool),
++    Poll,
++}
++
++pub struct HeadsetWidgets {
++    device_group: adw::PreferencesGroup,
++    model: gtk::Label,
++    serial: gtk::Label,
++    firmware: gtk::Label,
++    selftest_row: adw::ActionRow,
++    selftest: gtk::Label,
++    ipd: gtk::Label,
++}
++
++impl SimpleComponent for HeadsetPage {
++    type Init = PimaxPageInit;
++    type Input = HeadsetMsg;
++    type Output = PimaxOutMsg;
++    type Root = gtk::Box;
++    type Widgets = HeadsetWidgets;
++
++    fn init_root() -> Self::Root {
++        page_root()
++    }
++
++    fn init(init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
++        let ctx = Ctx::new(&init, sender.output_sender());
++        let (scroll, content) = page_shell();
++        root.append(&scroll);
++
++        // Device
++        let device_group = group("Device", Some(STALE_HINT));
++        let (r_model, model) = info_row("Model");
++        let (r_serial, serial) = info_row("Serial number");
++        let (r_fw, firmware) = info_row("Firmware");
++        let (selftest_row, selftest) = info_row("Self-test");
++        selftest_row.set_subtitle_selectable(true);
++        for r in [&r_model, &r_serial, &r_fw, &selftest_row] {
++            device_group.add(r);
++        }
++        content.append(&device_group);
++
++        // Display
++        let display = group("Display", Some("Applied when the session starts."));
++        display.add(&ctx.choice_row(
++            "PIMAX_REFRESH_HZ",
++            "Refresh rate",
++            "72 Hz saves GPU time; 120 Hz is not offered by every model",
++            &[("Default (90 Hz)", None), ("72 Hz", Some("72")), ("90 Hz", Some("90")), ("120 Hz", Some("120"))],
++        ));
++        display.add(&ctx.num_row(
++            "XRT_COMPOSITOR_SCALE_PERCENTAGE",
++            "Render resolution (%)",
++            "Compositor render scale; 100 = native panel resolution",
++            100.0,
++            30.0,
++            200.0,
++            5.0,
++        ));
++        display.add(&ctx.choice_row(
++            "PIMAX_GPU",
++            "GPU",
++            "Which GPU vendor the driver should use",
++            &[("Default (NVIDIA)", None), ("AMD", Some("amd"))],
++        ));
++        content.append(&display);
++
++        // IPD
++        let ipd_group = group(
++            "IPD",
++            Some("The lenses are moved by motors (58\u{2013}72 mm). Set your IPD so your pupils sit on the lens centres; the rendered eye distance follows the lenses."),
++        );
++        let (r_ipd, ipd) = info_row("Current lens IPD");
++        ipd_group.add(&r_ipd);
++        let stored = ctx.get("PIMAX_IPD_MM").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0);
++        let spin = {
++            let c = ctx.clone();
++            super::preference_rows::spin_row(
++                "Lens IPD (mm)",
++                Some("Where the lenses are moved to when the session starts"),
++                stored.unwrap_or(64.0).clamp(58.0, 72.0),
++                58.0,
++                72.0,
++                0.5,
++                move |adj| {
++                    if c.get("PIMAX_IPD_MM").is_some() {
++                        c.set("PIMAX_IPD_MM", Some(format!("{}", adj.value())));
++                    }
++                },
++            )
++        };
++        spin.set_sensitive(stored.is_some());
++        let sw = {
++            let c = ctx.clone();
++            let spin = spin.clone();
++            super::preference_rows::switch_row(
++                "Set lens IPD on start",
++                Some("Off: don't move the lenses"),
++                stored.is_some(),
++                move |_, on| {
++                    spin.set_sensitive(on);
++                    c.set("PIMAX_IPD_MM", on.then(|| format!("{}", spin.value())));
++                },
++            )
++        };
++        ipd_group.add(&sw);
++        ipd_group.add(&spin);
++        ipd_group.add(&ctx.num_row(
++            "PIMAX_IPD_OFFSET_MM",
++            "Render IPD offset (mm)",
++            "Added to the rendered eye distance only (world scale); 0 = none",
++            0.0,
++            -5.0,
++            5.0,
++            0.5,
++        ));
++        content.append(&ipd_group);
++
++        // Tracking (controller tracking lives on the Controllers page)
++        let trk = group("Tracking", None);
++        trk.add(&ctx.bool_row(
++            "PIMAX_SLAM",
++            "Inside-out tracking (SLAM)",
++            "Headset cameras; off when a lighthouse faceplate is used",
++            true,
++        ));
++        content.append(&trk);
++
++        spawn_poll(sender.input_sender(), || HeadsetMsg::Poll);
++        ComponentParts {
++            model: Self { status: read_status() },
++            widgets: HeadsetWidgets { device_group, model, serial, firmware, selftest_row, selftest, ipd },
++        }
++    }
++
++    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
++        match msg {
++            HeadsetMsg::XRServiceActiveChanged(_) => {}
++            HeadsetMsg::Poll => self.status = read_status(),
++        }
++    }
++
++    fn update_view(&self, w: &mut Self::Widgets, _sender: ComponentSender<Self>) {
++        let st = self.status.as_ref();
++        let s = |o: Option<&Option<String>>| {
++            o.and_then(|v| v.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| DASH.into())
++        };
++        w.device_group.set_description(if st.is_none() { Some(STALE_HINT) } else { None });
++        w.model.set_label(&st.and_then(|s| s.model.as_deref()).map(pretty_model).unwrap_or_else(|| DASH.into()));
++        w.serial.set_label(&s(st.map(|s| &s.serial)));
++        w.firmware.set_label(&s(st.map(|s| &s.firmware)));
++        w.ipd.set_label(&st.and_then(|s| s.ipd_mm).map(|v| format!("{v:.2} mm")).unwrap_or_else(|| DASH.into()));
++        for c in ["success", "warning", "dim-label"] {
++            w.selftest.remove_css_class(c);
++        }
++        match st.and_then(|s| s.self_test()) {
++            Some((n, failing)) if failing.is_empty() => {
++                w.selftest.set_label(&format!("All {n} subsystems OK"));
++                w.selftest.add_css_class("success");
++                w.selftest_row.set_subtitle("");
++            }
++            Some((n, failing)) => {
++                w.selftest.set_label(&format!("{} of {n} failed", failing.len()));
++                w.selftest.add_css_class("warning");
++                w.selftest_row.set_subtitle(&failing.join(", "));
++            }
++            None => {
++                w.selftest.set_label(DASH);
++                w.selftest.add_css_class("dim-label");
++                w.selftest_row.set_subtitle("");
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------- Controllers
++
++pub struct ControllersPage {
++    status: Option<PimaxStatus>,
++}
++
++#[derive(Debug)]
++pub enum ControllersMsg {
++    XRServiceActiveChanged(bool),
++    Poll,
++}
++
++struct ControllerCard {
++    state: gtk::Label,
++    battery: gtk::Label,
++}
++
++pub struct ControllersWidgets {
++    hint: gtk::Label,
++    left: ControllerCard,
++    right: ControllerCard,
++}
++
++fn controller_card(title: &str) -> (gtk::Box, ControllerCard) {
++    let b = gtk::Box::builder()
++        .orientation(gtk::Orientation::Vertical)
++        .spacing(4)
++        .css_classes(["card"])
++        .hexpand(true)
++        .build();
++    let inner = gtk::Box::builder()
++        .orientation(gtk::Orientation::Vertical)
++        .spacing(4)
++        .margin_top(16)
++        .margin_bottom(16)
++        .margin_start(16)
++        .margin_end(16)
++        .build();
++    inner.append(&gtk::Image::builder().icon_name("input-gaming-symbolic").pixel_size(32).halign(gtk::Align::Start).css_classes(["dim-label"]).build());
++    inner.append(&gtk::Label::builder().label(title).css_classes(["heading"]).xalign(0.0).margin_top(6).build());
++    let state = gtk::Label::builder().css_classes(["title-2"]).xalign(0.0).build();
++    let battery = gtk::Label::builder().css_classes(["caption", "dim-label"]).xalign(0.0).build();
++    inner.append(&state);
++    inner.append(&battery);
++    b.append(&inner);
++    (b, ControllerCard { state, battery })
++}
++
++impl ControllerCard {
++    fn show(&self, st: Option<&PimaxStatus>, left: bool) {
++        for c in ["success", "dim-label"] {
++            self.state.remove_css_class(c);
++        }
++        let Some(st) = st else {
++            self.state.set_label(DASH);
++            self.battery.set_label("");
++            return;
++        };
++        let c = st.controller(left);
++        if c.connected == Some(true) {
++            self.state.set_label("Connected");
++            self.state.add_css_class("success");
++            self.battery.set_label(&match c.battery_percent {
++                Some(b) => format!("Battery {b:.0}%"),
++                None => "Battery: Not reported".into(),
++            });
++        } else {
++            self.state.set_label("Not connected");
++            self.state.add_css_class("dim-label");
++            self.battery.set_label("Battery: Not reported");
++        }
++    }
++}
++
++impl SimpleComponent for ControllersPage {
++    type Init = PimaxPageInit;
++    type Input = ControllersMsg;
++    type Output = PimaxOutMsg;
++    type Root = gtk::Box;
++    type Widgets = ControllersWidgets;
++
++    fn init_root() -> Self::Root {
++        page_root()
++    }
++
++    fn init(init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
++        let ctx = Ctx::new(&init, sender.output_sender());
++        let (scroll, content) = page_shell();
++        root.append(&scroll);
++
++        let hint = hint_label(STALE_HINT);
++        content.append(&hint);
++        let cards = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).homogeneous(true).build();
++        let (cl, left) = controller_card("Left controller");
++        let (cr, right) = controller_card("Right controller");
++        cards.append(&cl);
++        cards.append(&cr);
++        content.append(&cards);
++
++        let g = group("Settings", Some("Applied when the session starts."));
++        g.add(&ctx.num_row(
++            "PIMAX_STICK_DEADZONE",
++            "Thumbstick dead zone (%)",
++            "Ignore small thumbstick movement; 0 = none",
++            0.0,
++            0.0,
++            50.0,
++            1.0,
++        ));
++        g.add(&ctx.bool_row(
++            "PIMAX_CONSTELLATION",
++            "Controller tracking",
++            "Controller LEDs seen by the headset cameras",
++            true,
++        ));
++        content.append(&g);
++
++        spawn_poll(sender.input_sender(), || ControllersMsg::Poll);
++        ComponentParts { model: Self { status: read_status() }, widgets: ControllersWidgets { hint, left, right } }
++    }
++
++    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
++        match msg {
++            ControllersMsg::XRServiceActiveChanged(_) => {}
++            ControllersMsg::Poll => self.status = read_status(),
++        }
++    }
++
++    fn update_view(&self, w: &mut Self::Widgets, _sender: ComponentSender<Self>) {
++        w.hint.set_visible(self.status.is_none());
++        w.left.show(self.status.as_ref(), true);
++        w.right.show(self.status.as_ref(), false);
++    }
++}
+-- 
+2.56.0
+

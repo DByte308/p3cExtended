@@ -1,0 +1,626 @@
+From c36284b72ff53b3584370fd33bbe0d8de11eb20a Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:50:25 +0100
+Subject: [PATCH 01/13] Pimax: preferences page and eye-tracking tools card
+
+- Preferences > Pimax: refresh rate, render scale, IPD (lens motors) and render
+  IPD offset, eye tracking on/off, calibration value, axis flip, quad views,
+  SLAM / controller tracking. Stored as global env vars for the driver.
+- Main view card: Recalibrate (pimax-et-calibrate; saves PIMAX_EYE_CALIB and
+  offers a session restart), Gaze Test, Foveation Test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/app.rs                |  14 ++
+ src/ui/main_view.rs          |  16 +++
+ src/ui/mod.rs                |   2 +
+ src/ui/pimax_box.rs          | 270 +++++++++++++++++++++++++++++++++++
+ src/ui/pimax_prefs.rs        | 191 +++++++++++++++++++++++++
+ src/ui/preferences_window.rs |   1 +
+ 6 files changed, 494 insertions(+)
+ create mode 100644 src/ui/pimax_box.rs
+ create mode 100644 src/ui/pimax_prefs.rs
+
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index c57e270..1529efe 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -109,6 +109,8 @@ pub struct App {
+ 
+ #[derive(Debug)]
+ pub enum Msg {
++    /// Set (Some) or remove (None) a global env var and save the config.
++    SetGlobalEnvVar(String, Option<String>),
+     OnServiceLog(Vec<String>),
+     OnServiceExit(i32),
+     OnPluginsExit(i32),
+@@ -1100,6 +1102,17 @@ impl AsyncComponent for App {
+                 preferences_win.sender().emit(PreferencesWindowMsg::Present);
+                 self.preferences_win = Some(preferences_win);
+             }
++            Msg::SetGlobalEnvVar(key, value) => {
++                match value {
++                    Some(v) => {
++                        self.config.global_preferences.env_vars.insert(key, v);
++                    }
++                    None => {
++                        self.config.global_preferences.env_vars.remove(&key);
++                    }
++                }
++                self.config.save();
++            }
+             Msg::OnPreferencesWindowClose(config) => {
+                 self.config = config;
+                 self.config.save();
+@@ -1293,6 +1306,7 @@ impl AsyncComponent for App {
+                     MainViewOutMsg::RestartXRService => Msg::RestartXRService,
+                     MainViewOutMsg::OpenLibsurviveSetup => Msg::OpenLibsurviveSetup,
+                     MainViewOutMsg::LaunchMonadoGui => Msg::LaunchMonadoGui,
++                    MainViewOutMsg::SetEnvVar(k, v) => Msg::SetGlobalEnvVar(k, v),
+                 }),
+             vkinfo,
+             debug_view: DebugView::builder()
+diff --git a/src/ui/main_view.rs b/src/ui/main_view.rs
+index fe4971c..f70dc35 100644
+--- a/src/ui/main_view.rs
++++ b/src/ui/main_view.rs
+@@ -6,6 +6,7 @@ use super::{
+     devices_box::{DevicesBox, DevicesBoxMsg},
+     openhmd_calibration_box::{OpenHmdCalibrationBox, OpenHmdCalibrationBoxMsg},
+     steam_launch_options_box::{SteamLaunchOptionsBox, SteamLaunchOptionsBoxMsg},
++    pimax_box::{PimaxBox, PimaxBoxMsg, PimaxBoxOutMsg},
+     steamvr_calibration_box::{SteamVrCalibrationBox, SteamVrCalibrationBoxMsg},
+ };
+ use crate::{
+@@ -52,6 +53,8 @@ pub struct MainView {
+     #[tracker::do_not_track]
+     steamvr_calibration_box: Controller<SteamVrCalibrationBox>,
+     #[tracker::do_not_track]
++    pimax_box: Controller<PimaxBox>,
++    #[tracker::do_not_track]
+     openhmd_calibration_box: Controller<OpenHmdCalibrationBox>,
+     xrservice_ready: bool,
+     show_setcap_warn: bool,
+@@ -86,6 +89,7 @@ pub enum MainViewOutMsg {
+     RestartXRService,
+     OpenLibsurviveSetup,
+     LaunchMonadoGui,
++    SetEnvVar(String, Option<String>),
+ }
+ 
+ pub struct MainViewInit {
+@@ -339,6 +343,7 @@ impl AsyncComponent for MainView {
+                         },
+ 
+                         model.steam_launch_options_box.widget(),
++                        model.pimax_box.widget(),
+                         model.steamvr_calibration_box.widget(),
+                         model.openhmd_calibration_box.widget(),
+ 
+@@ -417,6 +422,9 @@ impl AsyncComponent for MainView {
+                 self.openhmd_calibration_box
+                     .sender()
+                     .emit(OpenHmdCalibrationBoxMsg::XRServiceActiveChanged(active));
++                self.pimax_box
++                    .sender()
++                    .emit(PimaxBoxMsg::XRServiceActiveChanged(active));
+                 if !active {
+                     sender.input(Self::Input::UpdateDevices(vec![]));
+                     sender.input(Self::Input::UpdateClients(vec![]));
+@@ -540,7 +548,15 @@ impl AsyncComponent for MainView {
+                 init.selected_profile.features.openhmd.enabled,
+             ));
+ 
++        let pimax_box = PimaxBox::builder()
++            .launch(())
++            .forward(sender.output_sender(), |msg| match msg {
++                PimaxBoxOutMsg::SetEnvVar(k, v) => MainViewOutMsg::SetEnvVar(k, v),
++                PimaxBoxOutMsg::RestartXRService => MainViewOutMsg::RestartXRService,
++            });
++
+         let model = Self {
++            pimax_box,
+             xrservice_active: false,
+             enable_debug_view: init.config.debug_view_enabled,
+             steam_launch_options_box: SteamLaunchOptionsBox::builder().launch(()).detach(),
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index d1d53c5..38c4b43 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -17,6 +17,8 @@ mod preference_rows;
+ mod preferences_window;
+ mod profile_editor;
+ mod steam_launch_options_box;
++mod pimax_box;
++mod pimax_prefs;
+ mod steamvr_calibration_box;
+ mod term_widget;
+ mod util;
+diff --git a/src/ui/pimax_box.rs b/src/ui/pimax_box.rs
+new file mode 100644
+index 0000000..92179fc
+--- /dev/null
++++ b/src/ui/pimax_box.rs
+@@ -0,0 +1,270 @@
++#![allow(unused_assignments)] // vars named in view! macro are not correctly recognized as used
++
++//! Pimax tools card on the main view: eye-tracking calibration, gaze test, foveation test.
++//! The tools are the pimax-linux clients in ~/.local/bin (tools/xrgaze in the pimax-linux repo); they are OpenXR
++//! apps, so the XR service must be running.
++
++use super::job_worker::{JobWorker, internal_worker::JobWorkerOut, job::WorkerJob};
++use relm4::{
++    ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent,
++    gtk::{self, prelude::*},
++};
++use std::collections::VecDeque;
++use tracing::{info, warn};
++
++/// Env var the driver reads the eye-tracking correction from.
++pub const EYE_CALIB_VAR: &str = "PIMAX_EYE_CALIB";
++
++fn tool(name: &str) -> String {
++    format!("{}/.local/bin/{name}", std::env::var("HOME").unwrap_or_default())
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum PimaxTool {
++    Calibrate,
++    GazeTest,
++    FoveationTest,
++}
++
++impl PimaxTool {
++    fn command(self) -> (String, Vec<String>) {
++        match self {
++            // Shows the calibration dots in the headset (~45 s), fits, prints PIMAX_EYE_CALIB=... as last line.
++            Self::Calibrate => (tool("pimax-et-calibrate"), vec![]),
++            Self::GazeTest => (tool("pimax-gaze"), vec!["120".into()]),
++            Self::FoveationTest => (tool("xrfovea"), vec!["120".into()]),
++        }
++    }
++    fn label(self) -> &'static str {
++        match self {
++            Self::Calibrate => "Eye-tracking calibration",
++            Self::GazeTest => "Gaze test",
++            Self::FoveationTest => "Foveation test",
++        }
++    }
++}
++
++#[tracker::track]
++pub struct PimaxBox {
++    visible: bool,
++    xrservice_active: bool,
++    running: Option<PimaxTool>,
++    status: Option<String>,
++    success: bool,
++    restart_needed: bool,
++    #[tracker::do_not_track]
++    log: Vec<String>,
++    #[tracker::do_not_track]
++    worker: Option<JobWorker>,
++}
++
++#[derive(Debug)]
++pub enum PimaxBoxMsg {
++    XRServiceActiveChanged(bool),
++    Run(PimaxTool),
++    Stop,
++    OnLog(Vec<String>),
++    OnExit(i32),
++    Restart,
++}
++
++#[derive(Debug)]
++pub enum PimaxBoxOutMsg {
++    /// Store a global env var (None removes it) and save the config.
++    SetEnvVar(String, Option<String>),
++    RestartXRService,
++}
++
++#[relm4::component(pub)]
++impl SimpleComponent for PimaxBox {
++    type Init = ();
++    type Input = PimaxBoxMsg;
++    type Output = PimaxBoxOutMsg;
++
++    view! {
++        gtk::Box {
++            set_orientation: gtk::Orientation::Vertical,
++            set_hexpand: true,
++            set_vexpand: false,
++            set_spacing: 12,
++            add_css_class: "card",
++            add_css_class: "padded",
++            #[track = "model.changed(Self::visible())"]
++            set_visible: model.visible,
++            gtk::Label {
++                add_css_class: "heading",
++                set_xalign: 0.0,
++                set_label: "Pimax Eye Tracking",
++            },
++            gtk::Label {
++                add_css_class: "dim-label",
++                set_xalign: 0.0,
++                set_wrap: true,
++                set_wrap_mode: gtk::pango::WrapMode::Word,
++                #[track = "model.changed(Self::xrservice_active())"]
++                set_label: if model.xrservice_active {
++                    "Put the headset on. Calibration: look at the centre dot, then follow it with your eyes \
++                     only (about 45 s). Gaze test: the white dot should sit on the grey dot you look at."
++                } else {
++                    "Start the XR service to calibrate or test eye tracking."
++                },
++            },
++            gtk::Label {
++                set_xalign: 0.0,
++                set_wrap: true,
++                set_wrap_mode: gtk::pango::WrapMode::Word,
++                #[track = "model.changed(Self::status())"]
++                set_visible: model.status.is_some(),
++                #[track = "model.changed(Self::status())"]
++                set_label: model.status.as_deref().unwrap_or_default(),
++                #[track = "model.changed(Self::success())"]
++                set_class_active: ("error", !model.success),
++                #[track = "model.changed(Self::success())"]
++                set_class_active: ("success", model.success),
++            },
++            gtk::Box {
++                set_orientation: gtk::Orientation::Horizontal,
++                set_spacing: 6,
++                gtk::Button {
++                    add_css_class: "suggested-action",
++                    set_label: "Recalibrate",
++                    #[track = "model.changed(Self::running()) || model.changed(Self::xrservice_active())"]
++                    set_sensitive: model.xrservice_active && model.running.is_none(),
++                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Run(PimaxTool::Calibrate)),
++                },
++                gtk::Button {
++                    set_label: "Gaze Test",
++                    #[track = "model.changed(Self::running()) || model.changed(Self::xrservice_active())"]
++                    set_sensitive: model.xrservice_active && model.running.is_none(),
++                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Run(PimaxTool::GazeTest)),
++                },
++                gtk::Button {
++                    set_label: "Foveation Test",
++                    #[track = "model.changed(Self::running()) || model.changed(Self::xrservice_active())"]
++                    set_sensitive: model.xrservice_active && model.running.is_none(),
++                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Run(PimaxTool::FoveationTest)),
++                },
++                gtk::Button {
++                    add_css_class: "destructive-action",
++                    set_label: "Stop",
++                    #[track = "model.changed(Self::running())"]
++                    set_visible: model.running.is_some(),
++                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Stop),
++                },
++                gtk::Button {
++                    set_label: "Restart Session",
++                    #[track = "model.changed(Self::restart_needed()) || model.changed(Self::xrservice_active())"]
++                    set_visible: model.restart_needed && model.xrservice_active,
++                    connect_clicked[sender] => move |_| sender.input(PimaxBoxMsg::Restart),
++                },
++            },
++        }
++    }
++
++    fn update(&mut self, message: Self::Input, sender: ComponentSender<Self>) {
++        self.reset();
++        match message {
++            PimaxBoxMsg::XRServiceActiveChanged(active) => {
++                self.set_xrservice_active(active);
++                if !active {
++                    self.set_restart_needed(false);
++                }
++            }
++            PimaxBoxMsg::Run(t) => {
++                if self.running.is_some() {
++                    return;
++                }
++                let (cmd, args) = t.command();
++                if !std::path::Path::new(&cmd).exists() {
++                    self.set_success(false);
++                    self.set_status(Some(format!("{cmd} not found; install the pimax-linux tools")));
++                    return;
++                }
++                info!("pimax: running {cmd} {args:?}");
++                self.log.clear();
++                let mut jobs = VecDeque::new();
++                jobs.push_back(WorkerJob::new_cmd(None, cmd, Some(args)));
++                let w = JobWorker::new(jobs, sender.input_sender(), |msg| match msg {
++                    JobWorkerOut::Log(lines) => PimaxBoxMsg::OnLog(lines),
++                    JobWorkerOut::Exit(code) => PimaxBoxMsg::OnExit(code),
++                });
++                w.start();
++                self.worker = Some(w);
++                self.set_running(Some(t));
++                self.set_success(true);
++                self.set_status(Some(format!("{} running in the headset…", t.label())));
++            }
++            PimaxBoxMsg::Stop => {
++                if let Some(w) = self.worker.as_ref() {
++                    w.stop();
++                }
++            }
++            PimaxBoxMsg::OnLog(lines) => self.log.extend(lines.into_iter().map(|l| l.trim_end().to_string())),
++            PimaxBoxMsg::OnExit(code) => {
++                let tool = self.running.take();
++                self.set_running(None);
++                self.worker = None;
++                match tool {
++                    Some(PimaxTool::Calibrate) => self.finish_calibration(code, &sender),
++                    Some(t) => {
++                        self.set_success(code == 0);
++                        self.set_status(Some(if code == 0 {
++                            format!("{} finished", t.label())
++                        } else {
++                            format!("{} exited with code {code}", t.label())
++                        }));
++                    }
++                    None => {}
++                }
++            }
++            PimaxBoxMsg::Restart => {
++                self.set_restart_needed(false);
++                let _ = sender.output(PimaxBoxOutMsg::RestartXRService);
++            }
++        }
++    }
++
++    fn init(_init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
++        let model = Self {
++            tracker: 0,
++            visible: true,
++            xrservice_active: false,
++            running: None,
++            status: None,
++            success: true,
++            restart_needed: false,
++            log: vec![],
++            worker: None,
++        };
++        let widgets = view_output!();
++        ComponentParts { model, widgets }
++    }
++}
++
++impl PimaxBox {
++    fn finish_calibration(&mut self, code: i32, sender: &ComponentSender<Self>) {
++        let prefix = format!("{EYE_CALIB_VAR}=");
++        let value = self.log.iter().rev().find_map(|l| l.strip_prefix(&prefix)).map(str::to_string);
++        let quality = self.log.iter().rev().find(|l| l.starts_with("error after:")).cloned();
++        match (code, value) {
++            (0, Some(v)) => {
++                info!("pimax: new eye calibration {v}");
++                let _ = sender.output(PimaxBoxOutMsg::SetEnvVar(EYE_CALIB_VAR.into(), Some(v)));
++                self.set_success(true);
++                self.set_restart_needed(true);
++                self.set_status(Some(format!(
++                    "Calibration saved ({}). Restart the session to apply it.",
++                    quality.as_deref().unwrap_or("fit done").trim_start_matches("error after:").trim()
++                )));
++            }
++            _ => {
++                warn!("pimax: calibration failed, code {code}, last output {:?}", self.log.last());
++                self.set_success(false);
++                self.set_status(Some(format!(
++                    "Calibration failed (code {code}): {}",
++                    self.log.last().map(String::as_str).unwrap_or("no output")
++                )));
++            }
++        }
++    }
++}
+diff --git a/src/ui/pimax_prefs.rs b/src/ui/pimax_prefs.rs
+new file mode 100644
+index 0000000..ad521e7
+--- /dev/null
++++ b/src/ui/pimax_prefs.rs
+@@ -0,0 +1,191 @@
++//! "Pimax" page of the preferences dialog. Every row is a global env var read by the pimax_p3c Monado driver
++//! (or the Monado compositor); unset = driver default. Changes apply when the XR service is (re)started.
++
++use crate::{
++    config::Config,
++    ui::{
++        pimax_box::EYE_CALIB_VAR,
++        preference_rows::{combo_row, entry_row, spin_row, switch_row},
++    },
++};
++use adw::prelude::*;
++use std::{cell::RefCell, rc::Rc};
++
++type Cfg = Rc<RefCell<Config>>;
++
++fn get(cfg: &Cfg, k: &str) -> Option<String> {
++    cfg.borrow().global_preferences.env_vars.get(k).cloned()
++}
++
++fn set(cfg: &Cfg, k: &str, v: Option<String>) {
++    let mut c = cfg.borrow_mut();
++    match v {
++        Some(v) => c.global_preferences.env_vars.insert(k.into(), v),
++        None => c.global_preferences.env_vars.remove(k),
++    };
++}
++
++fn bool_var(cfg: &Cfg, k: &str, default: bool) -> bool {
++    match get(cfg, k).as_deref() {
++        Some("0" | "false" | "off" | "no") => false,
++        Some(_) => true,
++        None => default,
++    }
++}
++
++/// Switch for a boolean driver option; writes the var only when it differs from the driver default.
++fn bool_row(cfg: &Cfg, k: &'static str, title: &str, desc: &str, default: bool) -> adw::SwitchRow {
++    let c = cfg.clone();
++    switch_row(title, Some(desc), bool_var(cfg, k, default), move |_, v| {
++        set(&c, k, (v != default).then(|| if v { "1" } else { "0" }.to_string()));
++    })
++}
++
++/// Spin row for a numeric option; `unset` (shown as that value) removes the var.
++fn num_row(cfg: &Cfg, k: &'static str, title: &str, desc: &str, unset: f64, min: f64, max: f64, step: f64) -> adw::SpinRow {
++    let c = cfg.clone();
++    let val = get(cfg, k).and_then(|v| v.parse().ok()).unwrap_or(unset);
++    spin_row(title, Some(desc), val, min, max, step, move |adj| {
++        let v = adj.value();
++        set(&c, k, (v != unset).then(|| if step >= 1.0 { format!("{v:.0}") } else { format!("{v}") }));
++    })
++}
++
++fn group(title: &str, desc: Option<&str>) -> adw::PreferencesGroup {
++    let g = adw::PreferencesGroup::builder().title(title).build();
++    if let Some(d) = desc {
++        g.set_description(Some(d));
++    }
++    g
++}
++
++pub fn pimax_page(cfg: Cfg) -> adw::PreferencesPage {
++    let page = adw::PreferencesPage::builder()
++        .title("Pimax")
++        .icon_name("video-display-symbolic")
++        .build();
++
++    // Display
++    let display = group("Display", Some("Applied when the XR service starts."));
++    {
++        const RATES: [&str; 4] = ["Default (90 Hz)", "72 Hz", "90 Hz", "120 Hz"];
++        let cur = match get(&cfg, "PIMAX_REFRESH_HZ").as_deref() {
++            Some("72") => RATES[1],
++            Some("90") => RATES[2],
++            Some("120") => RATES[3],
++            _ => RATES[0],
++        };
++        let c = cfg.clone();
++        display.add(&combo_row(
++            "Refresh rate",
++            Some("72 Hz saves GPU time; 120 Hz is not offered by every model"),
++            cur,
++            RATES.iter().map(|s| s.to_string()).collect(),
++            move |row| {
++                let v = match row.selected() {
++                    1 => Some("72"),
++                    2 => Some("90"),
++                    3 => Some("120"),
++                    _ => None,
++                };
++                set(&c, "PIMAX_REFRESH_HZ", v.map(String::from));
++            },
++        ));
++    }
++    display.add(&num_row(
++        &cfg,
++        "XRT_COMPOSITOR_SCALE_PERCENTAGE",
++        "Render resolution (%)",
++        "Compositor render scale; 100 = native panel resolution",
++        100.0,
++        30.0,
++        200.0,
++        5.0,
++    ));
++    page.add(&display);
++
++    // IPD
++    let ipd = group(
++        "IPD (lens distance)",
++        Some("The Crystal Super moves its lenses with motors (58–72 mm). Set your IPD so your pupils sit on the lens centres; the rendered eye distance follows the lenses."),
++    );
++    ipd.add(&num_row(
++        &cfg,
++        "PIMAX_IPD_MM",
++        "IPD (mm)",
++        "0 = leave the lenses where they are",
++        0.0,
++        0.0,
++        72.0,
++        0.5,
++    ));
++    ipd.add(&num_row(
++        &cfg,
++        "PIMAX_IPD_OFFSET_MM",
++        "Render IPD offset (mm)",
++        "Added to the rendered eye distance only (world scale); 0 = none",
++        0.0,
++        -5.0,
++        5.0,
++        0.5,
++    ));
++    page.add(&ipd);
++
++    // Eye tracking
++    let et = group(
++        "Eye Tracking",
++        Some("Calibrate from the main window (Pimax Eye Tracking → Recalibrate) while the XR service runs."),
++    );
++    et.add(&bool_row(&cfg, "PIMAX_EYE_TRACKING", "Eye tracking", "Tobii eye tracker for gaze input and foveation", true));
++    {
++        let c = cfg.clone();
++        let row = entry_row("Calibration", &get(&cfg, EYE_CALIB_VAR).unwrap_or_default(), move |r| {
++            let t = r.text().trim().to_string();
++            set(&c, EYE_CALIB_VAR, (!t.is_empty()).then_some(t));
++        });
++        row.set_tooltip_text(Some("Six numbers written by Recalibrate; clear to use the raw tracker output"));
++        et.add(&row);
++    }
++    {
++        const FLIPS: [&str; 4] = ["None", "Horizontal (x)", "Vertical (y)", "Both (xy)"];
++        let cur = match get(&cfg, "PIMAX_EYE_FLIP").as_deref() {
++            Some("x") => FLIPS[1],
++            Some("y") => FLIPS[2],
++            Some("xy" | "yx") => FLIPS[3],
++            _ => FLIPS[0],
++        };
++        let c = cfg.clone();
++        et.add(&combo_row(
++            "Axis flip",
++            Some("Raw axis mirroring before calibration; normally None (calibration handles it)"),
++            cur,
++            FLIPS.iter().map(|s| s.to_string()).collect(),
++            move |row| {
++                let v = match row.selected() {
++                    1 => Some("x"),
++                    2 => Some("y"),
++                    3 => Some("xy"),
++                    _ => None,
++                };
++                set(&c, "PIMAX_EYE_FLIP", v.map(String::from));
++            },
++        ));
++    }
++    page.add(&et);
++
++    // Foveated rendering
++    let fov = group(
++        "Foveated Rendering",
++        Some("Quad views: apps that support XR_VARJO_quad_views render a sharp inset where you look."),
++    );
++    fov.add(&bool_row(&cfg, "PIMAX_FOVEATION", "Quad views (foveation)", "Offer gaze-steered quad views to apps", true));
++    page.add(&fov);
++
++    // Tracking
++    let trk = group("Tracking", None);
++    trk.add(&bool_row(&cfg, "PIMAX_SLAM", "Inside-out tracking (SLAM)", "Headset cameras; off when a lighthouse faceplate is used", true));
++    trk.add(&bool_row(&cfg, "PIMAX_CONSTELLATION", "Controller tracking", "Controller LEDs seen by the headset cameras", true));
++    page.add(&trk);
++
++    page
++}
+diff --git a/src/ui/preferences_window.rs b/src/ui/preferences_window.rs
+index 62e636e..e30aff3 100644
+--- a/src/ui/preferences_window.rs
++++ b/src/ui/preferences_window.rs
+@@ -356,6 +356,7 @@ impl AsyncComponent for PreferencesWindow {
+ 
+         let widgets = view_output!();
+ 
++        widgets.win.add(&super::pimax_prefs::pimax_page(model.config.clone()));
+         model.win = Some(widgets.win.clone());
+         model.plugins_grp = Some(widgets.plugins_grp.clone());
+ 
+-- 
+2.56.0
+

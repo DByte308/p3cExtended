@@ -1,0 +1,30 @@
+From d0928f4fa062791d56dae8f09e6d5e4c4cc4726d Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:11:22 +0100
+Subject: [PATCH 05/28] d/pimax_p3c: fix HMD IMU per-sample timestamp (us -> ns
+ factor 1000, not 100)
+
+host_ns + timestamp_us*100 - device_ns put every HMD IMU sample ~0.9x the
+device clock in the past and advanced it at 0.1x real time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/pimax_p3c/src/device/session/status.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index 8bbc8aab0..54c6551cd 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -72,7 +72,7 @@ impl OnReport for HmdStatus {
+             && let Some(slam) = tracking.slam.get()
+         {
+             for sample in self.imu {
+-                let timestamp_ns = host_ns + (sample.timestamp_us as i64 * 100) - device_ns;
++                let timestamp_ns = host_ns + (sample.timestamp_us as i64 * 1000) - device_ns;
+ 
+                 let accel_m_s2 =
+                     to_headset_frame_vec(sample.accel.map(|g| g as f64 * MATH_GRAVITY_M_S2).into());
+-- 
+2.56.0
+

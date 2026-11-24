@@ -1,0 +1,67 @@
+From 57e116dafbb5aeb54002aa6ff320e8689cbf7800 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:41:07 +0100
+Subject: [PATCH 19/28] t/constellation: CONSTELLATION_POSE_LOG per-camera pose
+ log
+
+One CSV line per accepted camera-space pose: camera, device, position,
+distance against the prior, blobs used, camera-space and world
+orientation. Used to rule out a per-camera depth error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../constellation/t_constellation_tracker.cpp | 38 +++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index fc14b08e5..99a5dd9f8 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -1061,6 +1061,44 @@ Camera::pushPose(CameraSample &camera_sample,
+ 		average_brightness /= used_blobs;
+ 	}
+ 
++	// CONSTELLATION_POSE_LOG=<file>: one CSV line per accepted camera-space pose (diagnostics).
++	{
++		static std::mutex log_mutex;
++		static FILE *log_file = [] {
++			const char *path = getenv("CONSTELLATION_POSE_LOG");
++			FILE *f = (path != nullptr && path[0] != '\0') ? fopen(path, "w") : nullptr;
++			if (f != nullptr) {
++				fprintf(f, "ts_ns,camera,device,x,y,z,dist,prior_dist,used_blobs,optimized,qx,qy,qz,qw,wx,wy,wz,wqx,wqy,wqz,wqw\n");
++			}
++			return f;
++		}();
++		if (log_file != nullptr) {
++			const xrt_vec3 &t = Tcv_cam_device.position;
++			double dist = sqrt(t.x * t.x + t.y * t.y + t.z * t.z);
++			double prior_dist = -1;
++			if (device_state.Tcv_cam_device_predicted.has_value()) {
++				const xrt_vec3 &q = device_state.Tcv_cam_device_predicted->pose.position;
++				prior_dist = sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
++			}
++			std::lock_guard<std::mutex> guard(log_mutex);
++			// World pose of this optical solve (camera pose from the sample, if any).
++			xrt_pose w = {};
++			w.orientation.w = 1;
++			if (camera_sample.Txr_world_cam.has_value()) {
++				xrt_pose Txr_cam_dev;
++				math_pose_convert_from_opencv(&Tcv_cam_device, &Txr_cam_dev);
++				math_pose_transform(&camera_sample.Txr_world_cam.value(), &Txr_cam_dev, &w);
++			}
++			const xrt_quat &o = Tcv_cam_device.orientation;
++			fprintf(log_file,
++			        "%" PRIi64 ",%u,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%d,%.5f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.5f\n",
++			        camera_sample.timestamp_ns, camera_sample.camera_index, (int)device->id, t.x, t.y, t.z, dist,
++			        prior_dist, used_blobs, (int)was_optimized, o.x, o.y, o.z, o.w, w.position.x, w.position.y,
++			        w.position.z, w.orientation.x, w.orientation.y, w.orientation.z, w.orientation.w);
++			fflush(log_file);
++		}
++	}
++
+ 	// Mark that we found a pose
+ 	device_state.found_pose = {
+ 	    .Tcv_cam_device = Tcv_cam_device,
+-- 
+2.56.0
+

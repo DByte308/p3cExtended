@@ -1,0 +1,286 @@
+From bc7b2e79d57097bb0c6e4eb2714bf29fc1163d00 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:26:44 +0100
+Subject: [PATCH 24/28] d/pimax_p3c: live options from Envision's settings file
+
+IPD offset, view cant, eye calibration and flip and the stick dead zone are
+re-read from $XDG_RUNTIME_DIR/pimax-p3c/settings.json while the service runs
+(files older than the driver instance are ignored; a key there wins over the
+environment, null = default).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/pimax_p3c/src/builder.rs      |  1 +
+ .../pimax_p3c/src/device/controller/inputs.rs | 23 +++--
+ src/xrt/drivers/pimax_p3c/src/device/eye.rs   | 27 +++---
+ .../drivers/pimax_p3c/src/device/hmd/views.rs | 17 ++--
+ .../src/device/session/status_file.rs         |  2 +-
+ src/xrt/drivers/pimax_p3c/src/lib.rs          |  1 +
+ src/xrt/drivers/pimax_p3c/src/live.rs         | 86 +++++++++++++++++++
+ 7 files changed, 126 insertions(+), 31 deletions(-)
+ create mode 100644 src/xrt/drivers/pimax_p3c/src/live.rs
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/builder.rs b/src/xrt/drivers/pimax_p3c/src/builder.rs
+index aedc88e5a..b4f9f9dd5 100644
+--- a/src/xrt/drivers/pimax_p3c/src/builder.rs
++++ b/src/xrt/drivers/pimax_p3c/src/builder.rs
+@@ -102,6 +102,7 @@ fn create_devices(
+     devices: &[*mut xrt_prober_device],
+     cap: usize,
+ ) -> Vec<*mut xrt_device> {
++    crate::live::init();
+     let Some((main_mcu, device_type, model)) = find_main_mcu(devices) else {
+         return Vec::new();
+     };
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/controller/inputs.rs b/src/xrt/drivers/pimax_p3c/src/device/controller/inputs.rs
+index a54037fc8..82b26997b 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/controller/inputs.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/controller/inputs.rs
+@@ -20,16 +20,23 @@ pub const COUNT: usize = 14;
+ 
+ const DEADZONE_ENV: &str = "PIMAX_STICK_DEADZONE";
+ 
+-/// Percent, 0..=50; read once.
++/// Percent, 0..=50; live option (see `crate::live`).
+ fn deadzone() -> f32 {
+-    static DEADZONE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+-    *DEADZONE.get_or_init(|| {
+-        let pct = crate::util::option_num(DEADZONE_ENV, 0);
+-        if !(0..=50).contains(&pct) {
+-            warn!("{DEADZONE_ENV}={pct}: need 0..50 percent; clamping");
++    static DEADZONE: std::sync::Mutex<Option<(u64, f32)>> = std::sync::Mutex::new(None);
++    let generation = crate::live::generation();
++    let mut cache = DEADZONE.lock().unwrap();
++    if let Some((g, d)) = *cache {
++        if g == generation {
++            return d;
+         }
+-        pct.clamp(0, 50) as f32 / 100.0
+-    })
++    }
++    let pct = crate::live::get_num(DEADZONE_ENV, 0);
++    if !(0..=50).contains(&pct) {
++        warn!("{DEADZONE_ENV}={pct}: need 0..50 percent; clamping");
++    }
++    let d = pct.clamp(0, 50) as f32 / 100.0;
++    *cache = Some((generation, d));
++    d
+ }
+ 
+ /// Radial deadzone: zero inside `deadzone` (fraction of full deflection), rescaled so the magnitude runs 0..1
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/eye.rs b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+index 183c8300f..10d30391c 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/eye.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+@@ -368,7 +368,7 @@ fn item(p: &[u8], pos: usize) -> Option<(Val, usize)> {
+ // ---------------------------------------------------------------------------------------------------------------
+ 
+ use crate::device::tracking::Tracking;
+-use crate::util::{option_str, set_str};
++use crate::util::set_str;
+ use monado_sys::math::{XRT_POSE_IDENTITY, XRT_VEC3_ZERO, pose_transform};
+ use monado_sys::*;
+ 
+@@ -436,22 +436,29 @@ unsafe extern "C" fn eye_get_tracked_pose(
+ /// `PIMAX_EYE_CALIB="ay,by,cy,ap,bp,cp"`: affine map in degrees from the measured gaze angles to the true ones,
+ /// `yaw = ay*m_yaw + by*m_pitch + cy`, `pitch = ap*m_yaw + bp*m_pitch + cp` (yaw + right, pitch + up, head frame).
+ /// Fitted by `tools/xrgaze/xrcalib` + `tools/xrgaze/fit_calib.py`. Unset or malformed: no correction.
++/// Live option (see `crate::live`): re-parsed when Envision changes it.
+ pub fn calib_coeffs() -> Option<[f32; 6]> {
+-    static C: std::sync::OnceLock<Option<[f32; 6]>> = std::sync::OnceLock::new();
+-    *C.get_or_init(|| {
+-        let s = option_str("PIMAX_EYE_CALIB")?;
++    static C: std::sync::Mutex<Option<(u64, Option<[f32; 6]>)>> = std::sync::Mutex::new(None);
++    let generation = crate::live::generation();
++    let mut cache = C.lock().unwrap();
++    if let Some((g, c)) = *cache {
++        if g == generation {
++            return c;
++        }
++    }
++    let parsed = crate::live::get_str("PIMAX_EYE_CALIB").and_then(|s| {
+         let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+         match <[f32; 6]>::try_from(v) {
+-            Ok(c) => {
+-                info!("eye calibration: {c:?}");
+-                Some(c)
+-            }
++            Ok(c) => Some(c),
+             Err(_) => {
+                 warn!("PIMAX_EYE_CALIB={s}: need 6 comma-separated numbers; no correction");
+                 None
+             }
+         }
+-    })
++    });
++    info!("eye calibration: {parsed:?}");
++    *cache = Some((generation, parsed));
++    parsed
+ }
+ 
+ fn calibrate(d: [f32; 3]) -> [f32; 3] {
+@@ -464,7 +471,7 @@ fn calibrate(d: [f32; 3]) -> [f32; 3] {
+ }
+ 
+ pub fn gaze_pose(g: &Gaze) -> xrt_pose {
+-    let flip = option_str("PIMAX_EYE_FLIP").unwrap_or_default();
++    let flip = crate::live::get_str("PIMAX_EYE_FLIP").unwrap_or_default();
+     let sx = if flip.contains('x') { -1.0 } else { 1.0 };
+     let sy = if flip.contains('y') { -1.0 } else { 1.0 };
+     let d = calibrate([g.dir[0] * sx, g.dir[1] * sy, -g.dir[2]]);
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+index 082f637db..221b8c4d8 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/views.rs
+@@ -6,17 +6,10 @@ use crate::device::hmd::distortion::{
+ use crate::device::session::refresh_hz;
+ 
+ /// `PIMAX_IPD_OFFSET_MM` (-5..5): added to the rendered eye distance only (world scale), as a
+-/// software IPD offset. The lenses are moved with `PIMAX_IPD_MM` instead.
++/// software IPD offset. The lenses are moved with `PIMAX_IPD_MM` instead. Live option (see `crate::live`).
+ fn render_ipd_offset_m() -> f32 {
+-    static OFF: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+-    *OFF.get_or_init(|| {
+-        let mm = std::env::var("PIMAX_IPD_OFFSET_MM").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+-        let mm = mm.clamp(-5.0, 5.0);
+-        if mm != 0.0 {
+-            info!("render IPD offset {mm} mm");
+-        }
+-        mm / 1000.0
+-    })
++    let mm = crate::live::get_str("PIMAX_IPD_OFFSET_MM").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0);
++    mm.clamp(-5.0, 5.0) / 1000.0
+ }
+ 
+ /// `PIMAX_FOV_PERCENT` (50..100, default 100): selectable FOV levels. Scales the view tangents, so the image
+@@ -146,8 +139,8 @@ pub unsafe extern "C" fn pimax_get_view_poses(
+     for (i, pose) in poses.iter_mut().enumerate().take(2) {
+         // Rotation about +y: positive turns the left eye's forward vector (-z) towards -x.
+         let outwards = if i == 0 { 1. } else { -1. };
+-        // PIMAX_CANT_SCALE (percent, default 100) scales the outward view rotation: 0 = no cant, -100 = reversed.
+-        let cant = crate::util::option_num("PIMAX_CANT_SCALE", 100) as f32 / 100.;
++        // PIMAX_CANT_SCALE (percent, default 100, live) scales the outward view rotation: 0 = no cant, -100 = reversed.
++        let cant = crate::live::get_num("PIMAX_CANT_SCALE", 100) as f32 / 100.;
+         let (sin, cos) = (me.config.render.eyes[0]
+             .fov_fix_degree
+             .to_radians()
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
+index 278a7ac42..35e268f5c 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
+@@ -4,7 +4,7 @@
+ use super::bringup::DeviceInfo;
+ use crate::device::constellation::Hand;
+ use crate::device::tracking::Tracking;
+-use crate::util::{now_ns, option_bool, option_str};
++use crate::util::{now_ns, option_bool};
+ use serde_json::{Value, json};
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+diff --git a/src/xrt/drivers/pimax_p3c/src/lib.rs b/src/xrt/drivers/pimax_p3c/src/lib.rs
+index 7a6c67a1f..8d7a63b1a 100644
+--- a/src/xrt/drivers/pimax_p3c/src/lib.rs
++++ b/src/xrt/drivers/pimax_p3c/src/lib.rs
+@@ -11,6 +11,7 @@ pub mod config;
+ pub mod xrt;
+ mod builder;
+ mod util;
++mod live;
+ 
+ #[cfg(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)]
+ mod lighthouse;
+diff --git a/src/xrt/drivers/pimax_p3c/src/live.rs b/src/xrt/drivers/pimax_p3c/src/live.rs
+new file mode 100644
+index 000000000..9357c2a40
+--- /dev/null
++++ b/src/xrt/drivers/pimax_p3c/src/live.rs
+@@ -0,0 +1,86 @@
++//! Options that can change while the service runs.
++//!
++//! Envision writes `$XDG_RUNTIME_DIR/pimax-p3c/settings.json` (`{"NAME": "value" | null}`) when one of these options
++//! changes. A file older than this driver instance is ignored, so a stale file from an earlier session never
++//! overrides the environment the service was started with. A key in the file wins over the environment; `null`
++//! means "unset" (driver default). Keys not in the file come from the environment.
++
++use std::collections::HashMap;
++use std::sync::{LazyLock, Mutex, OnceLock};
++use std::time::{Duration, Instant, SystemTime};
++
++const CHECK_EVERY: Duration = Duration::from_millis(250);
++
++struct State {
++    last_check: Option<Instant>,
++    mtime: Option<SystemTime>,
++    map: HashMap<String, Option<String>>,
++    generation: u64,
++}
++
++static STATE: LazyLock<Mutex<State>> =
++    LazyLock::new(|| Mutex::new(State { last_check: None, mtime: None, map: HashMap::new(), generation: 0 }));
++
++fn started() -> SystemTime {
++    static T: OnceLock<SystemTime> = OnceLock::new();
++    *T.get_or_init(SystemTime::now)
++}
++
++/// Call once at driver start-up: files written before this moment are ignored.
++pub fn init() {
++    started();
++}
++
++fn path() -> Option<std::path::PathBuf> {
++    std::env::var_os("XDG_RUNTIME_DIR")
++        .filter(|d| !d.is_empty())
++        .map(|d| std::path::PathBuf::from(d).join("pimax-p3c/settings.json"))
++}
++
++fn refresh(st: &mut State) {
++    let now = Instant::now();
++    if st.last_check.is_some_and(|t| now.duration_since(t) < CHECK_EVERY) {
++        return;
++    }
++    st.last_check = Some(now);
++    let Some(p) = path() else { return };
++    let Ok(mtime) = std::fs::metadata(&p).and_then(|m| m.modified()) else { return };
++    if mtime < started() || st.mtime == Some(mtime) {
++        return;
++    }
++    st.mtime = Some(mtime);
++    let parsed: Option<HashMap<String, Option<String>>> =
++        std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok());
++    match parsed {
++        Some(map) => {
++            if map != st.map {
++                info!("live settings: {map:?}");
++                st.map = map;
++                st.generation += 1;
++            }
++        }
++        None => warn!("live settings: could not parse {}", p.display()),
++    }
++}
++
++/// Bumped every time the live values change; lets callers cache parsed values.
++pub fn generation() -> u64 {
++    let mut st = STATE.lock().unwrap();
++    refresh(&mut st);
++    st.generation
++}
++
++/// Current value of `name`: the live file if it has the key, else the environment.
++pub fn get_str(name: &str) -> Option<String> {
++    let mut st = STATE.lock().unwrap();
++    refresh(&mut st);
++    match st.map.get(name) {
++        Some(v) => v.clone().filter(|v| !v.is_empty()),
++        None => crate::util::option_str(name),
++    }
++}
++
++/// Integer option (like debug_get_num_option: unparsable = default).
++pub fn get_num(name: &str, default: i64) -> i64 {
++    get_str(name).and_then(|v| v.trim().parse::<f64>().ok()).map(|v| v as i64).unwrap_or(default)
++}
+-- 
+2.56.0
+

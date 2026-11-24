@@ -1,0 +1,814 @@
+From 20c519886176b2f57a20de853b766cb56bdfbc31 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:16:34 +0100
+Subject: [PATCH 03/13] UI: sidebar shell with pages, restart banner and narrow
+ breakpoint
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/app.rs        |  52 ++++++---
+ src/ui/debug_view.rs |   4 +
+ src/ui/main_view.rs  | 267 ++++++++++++++++++++-----------------------
+ src/ui/mod.rs        |   1 +
+ src/ui/shell.rs      | 261 ++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 428 insertions(+), 157 deletions(-)
+ create mode 100644 src/ui/shell.rs
+
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 331bc89..7000287 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -13,6 +13,7 @@ use super::{
+     },
+     libsurvive_setup_window::{LibsurviveSetupMsg, LibsurviveSetupWindow},
+     main_view::{MainView, MainViewInit, MainViewMsg, MainViewOutMsg},
++    shell::Shell,
+     util::{copiable_code_snippet, open_with_default_handler},
+ };
+ use crate::{
+@@ -77,7 +78,7 @@ pub struct App {
+ 
+     main_view: AsyncController<MainView>,
+     debug_view: AsyncController<DebugView>,
+-    split_view: Option<adw::NavigationSplitView>,
++    shell: Shell,
+     about_dialog: adw::AboutDialog,
+     build_window: Controller<BuildWindow>,
+     setcap_confirm_dialog: adw::AlertDialog,
+@@ -201,6 +202,7 @@ impl App {
+             system_profile(&self.config)
+         };
+         self.xrservice_ready = false;
++        self.shell.banner.set_revealed(false);
+         if !prof.can_start(Some(&self.config)) {
+             let desc = if prof.is_system_profile {
+                 format!(
+@@ -345,6 +347,7 @@ impl App {
+     }
+ 
+     pub fn shutdown_xrservice(&mut self) {
++        self.shell.banner.set_revealed(false);
+         if let Some(w) = self.plugins_worker.as_ref() {
+             w.stop();
+         }
+@@ -384,15 +387,7 @@ impl AsyncComponent for App {
+                 set_orientation: gtk::Orientation::Vertical,
+                 set_hexpand: true,
+                 set_vexpand: true,
+-                #[name = "split_view"]
+-                adw::NavigationSplitView {
+-                    set_hexpand: true,
+-                    set_vexpand: true,
+-                    set_sidebar: Some(&adw::NavigationPage::new(model.main_view.widget(), APP_NAME)),
+-                    set_content: Some(&adw::NavigationPage::new(model.debug_view.widget(), "Developer Mode")),
+-                    set_show_content: false,
+-                    set_collapsed: !model.config.debug_view_enabled,
+-                },
++                append: &model.shell.split_view,
+             },
+             connect_close_request[sender] => move |win| {
+                 sender.input(Msg::SaveWinSize(win.width(), win.height()));
+@@ -445,6 +440,7 @@ impl AsyncComponent for App {
+                 }
+             }
+             Msg::OnServiceExit(code) => {
++                self.shell.banner.set_revealed(false);
+                 self.set_inhibit_session(false);
+                 self.xrservice_ready = false;
+                 self.restore_openxr_openvr_files();
+@@ -534,7 +530,6 @@ impl AsyncComponent for App {
+             Msg::EnableDebugViewChanged(val) => {
+                 self.config.debug_view_enabled = val;
+                 self.config.save();
+-                self.split_view.clone().unwrap().set_collapsed(!val);
+                 // disabling debug view also disables profiles
+                 if !val {
+                     sender.input(Msg::ProfilesEnabledChanged(false));
+@@ -542,9 +537,6 @@ impl AsyncComponent for App {
+                         .sender()
+                         .emit(DebugViewMsg::ProfilesEnabledChanged(false));
+                 }
+-                self.main_view
+-                    .sender()
+-                    .emit(MainViewMsg::EnableDebugViewChanged(val));
+             }
+             Msg::DoStartStopXRService => match &mut self.xrservice_worker {
+                 None => {
+@@ -1112,6 +1104,14 @@ impl AsyncComponent for App {
+                     }
+                 }
+                 self.config.save();
++                // env vars only apply on the next XR service start
++                let service_running = self
++                    .xrservice_worker
++                    .as_ref()
++                    .is_some_and(|w| w.state.lock().unwrap().exit_status.is_none());
++                if service_running {
++                    self.shell.banner.set_revealed(true);
++                }
+             }
+             Msg::OnPreferencesWindowClose(config) => {
+                 self.config = config;
+@@ -1290,7 +1290,8 @@ impl AsyncComponent for App {
+             }
+         };
+ 
+-        let mut model = App {
++        let shell = Shell::new();
++        let model = App {
+             application: init.application,
+             app_win: root.clone(),
+             inhibit_id: None,
+@@ -1299,6 +1300,7 @@ impl AsyncComponent for App {
+                     config: config.clone(),
+                     selected_profile: selected_profile.clone(),
+                     root_win: root.clone().into(),
++                    devices_slot: shell.devices_slot.clone(),
+                     has_nvidia: vkinfo.as_ref().is_some_and(|i| i.has_nvidia),
+                 })
+                 .forward(sender.input_sender(), |message| match message {
+@@ -1340,7 +1342,7 @@ impl AsyncComponent for App {
+                 .transient_for(&root)
+                 .launch(())
+                 .detach(),
+-            split_view: None,
++            shell,
+             setcap_confirm_dialog,
+             theme_engine: ThemeEngine::new_with_theme(&{
+                 if config.theme_name == "Follow system" {
+@@ -1429,7 +1431,23 @@ impl AsyncComponent for App {
+             ),
+         );
+ 
+-        model.split_view = Some(widgets.split_view.clone());
++        // wire the shell: pages, banner, narrow-width breakpoint
++        model.shell.home_slot.set_child(Some(model.main_view.widget()));
++        model.shell.logs_slot.set_child(Some(model.debug_view.widget()));
++        model.shell.banner.connect_button_clicked(clone!(
++            #[strong]
++            sender,
++            move |_| sender.input(Msg::RestartXRService)
++        ));
++        {
++            let bp = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
++                adw::BreakpointConditionLengthType::MaxWidth,
++                600.0,
++                adw::LengthUnit::Sp,
++            ));
++            bp.add_setter(&model.shell.split_view, "collapsed", Some(&true.to_value()));
++            root.add_breakpoint(bp);
++        }
+ 
+         AsyncComponentParts { model, widgets }
+     }
+diff --git a/src/ui/debug_view.rs b/src/ui/debug_view.rs
+index 2903b5d..019c47a 100644
+--- a/src/ui/debug_view.rs
++++ b/src/ui/debug_view.rs
+@@ -165,6 +165,10 @@ impl AsyncComponent for DebugView {
+                 set_hexpand: true,
+                 set_vexpand: false,
+                 add_css_class: "flat",
++                // acts as a secondary toolbar below the page header bar
++                set_show_start_title_buttons: false,
++                set_show_end_title_buttons: false,
++                set_show_title: false,
+                 pack_end: debug_menu_btn = &gtk::MenuButton {
+                     set_icon_name: "view-more-symbolic",
+                     set_tooltip_text: Some("Debug Actions"),
+diff --git a/src/ui/main_view.rs b/src/ui/main_view.rs
+index 4dbd45b..dbbada4 100644
+--- a/src/ui/main_view.rs
++++ b/src/ui/main_view.rs
+@@ -2,7 +2,6 @@
+ 
+ use super::{
+     SENDER_IO_ERR_MSG,
+-    app::{AboutAction, DebugViewToggleAction},
+     devices_box::{DevicesBox, DevicesBoxMsg},
+     openhmd_calibration_box::{OpenHmdCalibrationBox, OpenHmdCalibrationBoxMsg},
+     steam_launch_options_box::{SteamLaunchOptionsBox, SteamLaunchOptionsBoxMsg},
+@@ -17,7 +16,6 @@ use crate::{
+     profile::{LighthouseDriver, Profile, XRServiceType},
+     ui::{
+         alert::{alert, alert_w_widget},
+-        app::{PreferencesAction, ThemeManagerAction},
+         clients_box::{ClientsBox, ClientsBoxMsg},
+         util::{copiable_code_snippet, warn_card},
+     },
+@@ -35,13 +33,15 @@ use crate::{
+     xr_devices::XRDevice,
+ };
+ use adw::prelude::*;
++use gtk::glib::clone;
+ use relm4::prelude::*;
+ use tracing::{error, warn};
+ 
+ #[tracker::track]
+ pub struct MainView {
+     xrservice_active: bool,
+-    enable_debug_view: bool,
++    #[tracker::do_not_track]
++    monado_gui_btn: gtk::Button,
+     #[no_eq]
+     selected_profile: Profile,
+     #[tracker::do_not_track]
+@@ -72,7 +72,6 @@ pub enum MainViewMsg {
+     StartStopClicked,
+     RestartXRService,
+     XRServiceActiveChanged(bool, Option<Profile>, bool),
+-    EnableDebugViewChanged(bool),
+     UpdateSelectedProfile(Profile),
+     UpdateDevices(Vec<XRDevice>),
+     UpdateClients(Vec<XRClient>),
+@@ -98,6 +97,19 @@ pub struct MainViewInit {
+     pub selected_profile: Profile,
+     pub root_win: gtk::Window,
+     pub has_nvidia: bool,
++    /// slot (owned by the shell) that receives the "Devices & Apps" page
++    pub devices_slot: adw::Bin,
++}
++
++impl MainView {
++    fn refresh_monado_gui_btn(&self) {
++        self.monado_gui_btn.set_visible(
++            self.xrservice_active
++                && self.xrservice_ready
++                && self.selected_profile.xrservice_type == XRServiceType::Monado
++                && self.selected_profile.monado_gui_binary().is_some(),
++        );
++    }
+ }
+ 
+ #[relm4::component(pub async)]
+@@ -107,136 +119,92 @@ impl AsyncComponent for MainView {
+     type Output = MainViewOutMsg;
+     type CommandOutput = ();
+ 
+-    menu! {
+-        app_menu: {
+-            section! {
+-                "_Preferences" => PreferencesAction,
+-                // value inside action is ignored
+-                "_Developer mode" => DebugViewToggleAction,
+-            },
+-            section! {
+-                "Change _theme" => ThemeManagerAction,
+-                "_About" => AboutAction,
+-            },
+-        }
+-    }
+-
+     view! {
+-        adw::ToolbarView {
+-            set_top_bar_style: adw::ToolbarStyle::Flat,
+-            set_bottom_bar_style: adw::ToolbarStyle::Flat,
+-            #[track = "model.changed(Self::enable_debug_view())"]
+-            set_hexpand: !model.enable_debug_view,
+-            set_vexpand: true,
+-            set_size_request: (360, 350),
+-            add_top_bar: top_bar = &adw::HeaderBar {
+-                set_hexpand: true,
+-                set_vexpand: false,
+-                pack_end: menu_btn = &gtk::MenuButton {
+-                    set_icon_name: "open-menu-symbolic",
+-                    set_tooltip_text: Some("Menu"),
+-                    set_menu_model: Some(&app_menu),
++        gtk::Box {
++            set_orientation: gtk::Orientation::Vertical,
++            set_spacing: 24,
++            set_hexpand: true,
++
++            // Hero: status, start/stop, restart, profile
++            gtk::Box {
++                set_orientation: gtk::Orientation::Vertical,
++                set_halign: gtk::Align::Center,
++                set_spacing: 12,
++                set_margin_vertical: 12,
++                gtk::Label {
++                    add_css_class: "title-1",
++                    add_css_class: "dim-label",
++                    add_css_class: "success",
++                    add_css_class: "warning",
++                    #[track = "model.changed(Self::xrservice_active()) || model.changed(Self::xrservice_ready())"]
++                    set_label: match (model.xrservice_active, model.xrservice_ready) {
++                        (false, _) => "Stopped",
++                        (true, false) => "Starting…",
++                        (true, true) => "Ready",
++                    },
++                    #[track = "model.changed(Self::xrservice_active()) || model.changed(Self::xrservice_ready())"]
++                    set_class_active: ("dim-label", !model.xrservice_active),
++                    #[track = "model.changed(Self::xrservice_active()) || model.changed(Self::xrservice_ready())"]
++                    set_class_active: ("warning", model.xrservice_active && !model.xrservice_ready),
++                    #[track = "model.changed(Self::xrservice_active()) || model.changed(Self::xrservice_ready())"]
++                    set_class_active: ("success", model.xrservice_active && model.xrservice_ready),
++                },
++                gtk::Button {
++                    #[track = "model.changed(Self::selected_profile())"]
++                    set_visible: !model.selected_profile.is_system_profile && !model.selected_profile.can_start(None),
++                    add_css_class: "pill",
++                    add_css_class: "suggested-action",
++                    set_halign: gtk::Align::Center,
++                    set_width_request: 220,
++                    set_label: "Build profile",
++                    set_action_name: Some("win.buildprofileclean"),
++                },
++                gtk::Button {
++                    add_css_class: "pill",
++                    add_css_class: "title-3",
++                    add_css_class: "suggested-action",
++                    add_css_class: "destructive-action",
++                    set_halign: gtk::Align::Center,
++                    set_width_request: 220,
++                    #[track = "model.changed(Self::selected_profile())"]
++                    set_visible: model.selected_profile.is_system_profile || model.selected_profile.can_start(None),
++                    #[track = "model.changed(Self::xrservice_active())"]
++                    set_class_active: ("suggested-action", !model.xrservice_active),
++                    #[track = "model.changed(Self::xrservice_active())"]
++                    set_class_active: ("destructive-action", model.xrservice_active),
++                    #[track = "model.changed(Self::xrservice_active())"]
++                    set_label: match model.xrservice_active {
++                        true => "Stop",
++                        false => "Start",
++                    },
++                    connect_clicked[sender] => move |_| {
++                        sender.input(MainViewMsg::StartStopClicked);
++                    },
++                },
++                gtk::Button {
++                    add_css_class: "pill",
++                    set_halign: gtk::Align::Center,
++                    set_label: "Restart",
++                    set_icon_name: "view-refresh-symbolic",
++                    #[track = "model.changed(Self::xrservice_active())"]
++                    set_visible: model.xrservice_active,
++                    connect_clicked[sender] => move |_| {
++                        sender.input(MainViewMsg::RestartXRService)
++                    },
++                },
++                gtk::Label {
++                    add_css_class: "dim-label",
++                    set_halign: gtk::Align::Center,
++                    set_wrap: true,
++                    set_justify: gtk::Justification::Center,
++                    #[track = "model.changed(Self::selected_profile())"]
++                    set_label: &format!("Profile: {}", model.selected_profile.name),
+                 },
+             },
+-            #[wrap(Some)]
+-            set_content: content = &gtk::ScrolledWindow {
+-                set_hscrollbar_policy: gtk::PolicyType::Never,
+-                set_hexpand: true,
+-                set_vexpand: true,
+-                adw::Clamp {
+-                    set_maximum_size: 600,
+-                    gtk::Box {
+-                        set_spacing: 12,
+-                        set_margin_all: 12,
+-                        set_orientation: gtk::Orientation::Vertical,
+-                        gtk::Button {
+-                            #[track = "model.changed(Self::selected_profile())"]
+-                            set_visible: !model.selected_profile.is_system_profile && !model.selected_profile.can_start(None),
+-                            add_css_class: "pill",
+-                            add_css_class: "suggested-action",
+-                            set_hexpand: true,
+-                            set_label: "Build profile",
+-                            set_action_name: Some("win.buildprofileclean"),
+-                        },
+-                        gtk::Box {
+-                            set_hexpand: true,
+-                            set_orientation: gtk::Orientation::Horizontal,
+-                            add_css_class: "linked",
+-                            gtk::Button {
+-                                add_css_class: "suggested-action",
+-                                add_css_class: "destructive-action",
+-                                set_hexpand: true,
+-                                #[track = "model.changed(Self::selected_profile())"]
+-                                set_visible: model.selected_profile.is_system_profile || model.selected_profile.can_start(None),
+-                                #[track = "model.changed(Self::xrservice_active())"]
+-                                set_class_active: ("suggested-action", !model.xrservice_active),
+-                                #[track = "model.changed(Self::xrservice_active())"]
+-                                set_class_active: ("destructive-action", model.xrservice_active),
+-                                #[track = "model.changed(Self::xrservice_active())"]
+-                                set_label: match model.xrservice_active {
+-                                    true => "Stop",
+-                                    false => "Start",
+-                                },
+-                                connect_clicked[sender] => move |_| {
+-                                    sender.input(MainViewMsg::StartStopClicked);
+-                                },
+-                            },
+-                            gtk::Button {
+-                                set_halign: gtk::Align::Center,
+-                                set_valign: gtk::Align::Center,
+-                                set_icon_name: "view-refresh-symbolic",
+-                                set_tooltip_text: Some("Restart"),
+-                                #[track = "model.changed(Self::xrservice_active())"]
+-                                set_visible: model.xrservice_active,
+-                                connect_clicked[sender] => move |_| {
+-                                    sender.input(MainViewMsg::RestartXRService)
+-                                },
+-                            },
+-                        },
+-                        adw::Bin {
+-                            #[track = "model.changed(Self::xrservice_active())"]
+-                            set_visible: model.xrservice_active,
+-                            add_css_class: "card",
+-                            gtk::Label {
+-                                #[track = "model.changed(Self::xrservice_active()) || model.changed(Self::xrservice_ready())"]
+-                                set_label: {
+-                                    match model.selected_profile.xrservice_type {
+-                                        XRServiceType::Monado =>
+-                                            if model.xrservice_ready {
+-                                                "Service ready, you can launch XR apps"
+-                                            } else {
+-                                                "Starting…"
+-                                            }
+-                                    }
+-                                },
+-                                set_margin_all: 18,
+-                                add_css_class: "heading",
+-                                add_css_class: "success",
+-                                add_css_class: "warning",
+-                                #[track = "model.changed(Self::xrservice_active()) || model.changed(Self::xrservice_ready())"]
+-                                set_class_active: (
+-                                    "success",
+-                                    model.xrservice_ready
+-                                ),
+-                                set_wrap: true,
+-                                set_justify: gtk::Justification::Center,
+-                            },
+-                        },
+-                        model.devices_box.widget(),
+-                        model.clients_box.widget(),
+-                        gtk::Button {
+-                            #[track = "model.changed(Self::xrservice_active()) || model.changed(Self::xrservice_ready())"]
+-                            set_visible: model.xrservice_active
+-                                && model.xrservice_ready
+-                                && model.selected_profile.xrservice_type == XRServiceType::Monado
+-                                && model.selected_profile.monado_gui_binary().is_some(),
+-                            set_label: "Launch Monado GUI",
+-                            connect_clicked[sender] => move |_| {
+-                                sender
+-                                    .output(Self::Output::LaunchMonadoGui)
+-                                    .expect(SENDER_IO_ERR_MSG);
+-                            },
+-                        },
++
++            // Slot for the Pimax summary widget
++            model.pimax_box.widget(),
++
+                         warn_card(None, concat!(
+                             "Your current prefix is inside a partition ",
+                             "mounted with the nosuid option.\nThis will prevent ",
+@@ -386,9 +354,6 @@ impl AsyncComponent for MainView {
+                                 }
+                             },
+                         },
+-                    }
+-                }
+-            },
+         }
+     }
+ 
+@@ -439,9 +404,6 @@ impl AsyncComponent for MainView {
+                         .emit(SteamLaunchOptionsBoxMsg::UpdateLaunchOptions(prof));
+                 }
+             }
+-            Self::Input::EnableDebugViewChanged(val) => {
+-                self.set_enable_debug_view(val);
+-            }
+             Self::Input::UpdateSelectedProfile(prof) => {
+                 self.set_selected_profile(prof.clone());
+                 self.steamvr_calibration_box
+@@ -529,6 +491,7 @@ impl AsyncComponent for MainView {
+                 }
+             }
+         }
++        self.refresh_monado_gui_btn();
+     }
+ 
+     async fn init(
+@@ -557,13 +520,37 @@ impl AsyncComponent for MainView {
+                 PimaxBoxOutMsg::OpenPreferences => MainViewOutMsg::OpenPreferences,
+             });
+ 
++        // "Devices & Apps" page
++        let devices_box = DevicesBox::builder().launch(()).detach();
++        let clients_box = ClientsBox::builder().launch(()).detach();
++        let monado_gui_btn = gtk::Button::builder()
++            .label("Launch Monado GUI")
++            .visible(false)
++            .build();
++        monado_gui_btn.connect_clicked(clone!(
++            #[strong]
++            sender,
++            move |_| {
++                sender
++                    .output(MainViewOutMsg::LaunchMonadoGui)
++                    .expect(SENDER_IO_ERR_MSG);
++            }
++        ));
++        {
++            let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
++            page.append(devices_box.widget());
++            page.append(clients_box.widget());
++            page.append(&monado_gui_btn);
++            init.devices_slot.set_child(Some(&page));
++        }
++
+         let model = Self {
+             pimax_box,
+             xrservice_active: false,
+-            enable_debug_view: init.config.debug_view_enabled,
++            monado_gui_btn,
+             steam_launch_options_box: SteamLaunchOptionsBox::builder().launch(()).detach(),
+-            devices_box: DevicesBox::builder().launch(()).detach(),
+-            clients_box: ClientsBox::builder().launch(()).detach(),
++            devices_box,
++            clients_box,
+             selected_profile: init.selected_profile.clone(),
+             steamvr_calibration_box,
+             openhmd_calibration_box,
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 38c4b43..b828967 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -12,6 +12,7 @@ pub mod job_worker;
+ mod libsurvive_setup_window;
+ mod macros;
+ mod main_view;
++mod shell;
+ mod openhmd_calibration_box;
+ mod preference_rows;
+ mod preferences_window;
+diff --git a/src/ui/shell.rs b/src/ui/shell.rs
+new file mode 100644
+index 0000000..08db427
+--- /dev/null
++++ b/src/ui/shell.rs
+@@ -0,0 +1,261 @@
++//! The application shell: a sidebar (navigation) + content (pages) layout.
++//!
++//! Every page except Logs lives in a `adw::Bin` slot that is wrapped in a
++//! scrolled, clamped container. To put real content in a page, call
++//! `shell.<name>_slot.set_child(Some(&widget))`.
++
++use crate::constants::APP_NAME;
++use adw::prelude::*;
++use gtk::glib;
++
++pub struct PageDef {
++    pub id: &'static str,
++    pub title: &'static str,
++    pub icon: &'static str,
++}
++
++pub const PAGES: &[PageDef] = &[
++    PageDef {
++        id: "home",
++        title: "Home",
++        icon: "go-home-symbolic",
++    },
++    PageDef {
++        id: "headset",
++        title: "Headset",
++        icon: "video-display-symbolic",
++    },
++    PageDef {
++        id: "eyetracking",
++        title: "Eye Tracking",
++        icon: "view-reveal-symbolic",
++    },
++    PageDef {
++        id: "controllers",
++        title: "Controllers",
++        icon: "input-gaming-symbolic",
++    },
++    PageDef {
++        id: "devices",
++        title: "Devices & Apps",
++        icon: "applications-system-symbolic",
++    },
++    PageDef {
++        id: "logs",
++        title: "Logs",
++        icon: "utilities-terminal-symbolic",
++    },
++];
++
++#[derive(Clone)]
++pub struct Shell {
++    pub split_view: adw::NavigationSplitView,
++    pub banner: adw::Banner,
++    pub home_slot: adw::Bin,
++    /// Fill with `set_child(Some(..))` to replace the placeholder.
++    #[allow(dead_code)]
++    pub headset_slot: adw::Bin,
++    /// Fill with `set_child(Some(..))` to replace the placeholder.
++    #[allow(dead_code)]
++    pub eyetracking_slot: adw::Bin,
++    /// Fill with `set_child(Some(..))` to replace the placeholder.
++    #[allow(dead_code)]
++    pub controllers_slot: adw::Bin,
++    pub devices_slot: adw::Bin,
++    pub logs_slot: adw::Bin,
++}
++
++/// Placeholder content for a page that doesn't have real widgets yet.
++pub fn placeholder_page(icon: &str, title: &str) -> gtk::Widget {
++    adw::StatusPage::builder()
++        .icon_name(icon)
++        .title(title)
++        .description("Coming soon")
++        .vexpand(true)
++        .build()
++        .upcast()
++}
++
++/// Wraps a slot in a vertically scrolling page with a clamp and margins.
++fn scrolled_clamp(slot: &adw::Bin) -> gtk::Widget {
++    let clamp = adw::Clamp::builder()
++        .maximum_size(720)
++        .tightening_threshold(600)
++        .margin_top(24)
++        .margin_bottom(24)
++        .margin_start(24)
++        .margin_end(24)
++        .child(slot)
++        .build();
++    gtk::ScrolledWindow::builder()
++        .hscrollbar_policy(gtk::PolicyType::Never)
++        .vexpand(true)
++        .child(&clamp)
++        .build()
++        .upcast()
++}
++
++fn app_menu() -> gtk::gio::Menu {
++    let menu = gtk::gio::Menu::new();
++    let s1 = gtk::gio::Menu::new();
++    s1.append(Some("_Preferences"), Some("win.preferences"));
++    s1.append(Some("_Developer mode"), Some("win.debugviewtoggle"));
++    menu.append_section(None, &s1);
++    let s2 = gtk::gio::Menu::new();
++    s2.append(Some("Change _theme"), Some("win.thememanager"));
++    s2.append(Some("_About"), Some("win.about"));
++    menu.append_section(None, &s2);
++    menu
++}
++
++fn sidebar_row(def_icon: &str, title: &str) -> gtk::ListBoxRow {
++    let b = gtk::Box::new(gtk::Orientation::Horizontal, 12);
++    b.set_margin_top(6);
++    b.set_margin_bottom(6);
++    b.append(&gtk::Image::from_icon_name(def_icon));
++    let l = gtk::Label::new(Some(title));
++    l.set_xalign(0.0);
++    l.set_hexpand(true);
++    b.append(&l);
++    gtk::ListBoxRow::builder().child(&b).build()
++}
++
++impl Shell {
++    pub fn new() -> Self {
++        let home_slot = adw::Bin::new();
++        let devices_slot = adw::Bin::new();
++        let logs_slot = adw::Bin::new();
++        let headset_slot = adw::Bin::new();
++        let eyetracking_slot = adw::Bin::new();
++        let controllers_slot = adw::Bin::new();
++        // ---- placeholders: replace with the real widgets ----
++        headset_slot.set_child(Some(&placeholder_page(PAGES[1].icon, PAGES[1].title)));
++        eyetracking_slot.set_child(Some(&placeholder_page(PAGES[2].icon, PAGES[2].title)));
++        controllers_slot.set_child(Some(&placeholder_page(PAGES[3].icon, PAGES[3].title)));
++
++        // ---- content ----
++        let stack = adw::ViewStack::new();
++        stack.set_vexpand(true);
++        let page_widgets: [(&str, gtk::Widget); 6] = [
++            ("home", scrolled_clamp(&home_slot)),
++            ("headset", scrolled_clamp(&headset_slot)),
++            ("eyetracking", scrolled_clamp(&eyetracking_slot)),
++            ("controllers", scrolled_clamp(&controllers_slot)),
++            ("devices", scrolled_clamp(&devices_slot)),
++            ("logs", logs_slot.clone().upcast()),
++        ];
++        for (id, w) in &page_widgets {
++            stack.add_named(w, Some(id));
++        }
++
++        let banner = adw::Banner::builder()
++            .title("Settings changed. Restart the session to apply them.")
++            .button_label("Restart")
++            .revealed(false)
++            .build();
++        let content_title = adw::WindowTitle::new(PAGES[0].title, "");
++        let content_header = adw::HeaderBar::new();
++        content_header.set_title_widget(Some(&content_title));
++        let content_tv = adw::ToolbarView::new();
++        content_tv.add_top_bar(&content_header);
++        content_tv.add_top_bar(&banner);
++        content_tv.set_content(Some(&stack));
++        let content_page = adw::NavigationPage::new(&content_tv, PAGES[0].title);
++
++        // ---- sidebar ----
++        let sidebar_header = adw::HeaderBar::new();
++        sidebar_header.set_title_widget(Some(&adw::WindowTitle::new(APP_NAME, "")));
++        sidebar_header.pack_end(
++            &gtk::MenuButton::builder()
++                .icon_name("open-menu-symbolic")
++                .tooltip_text("Menu")
++                .menu_model(&app_menu())
++                .build(),
++        );
++        let list = gtk::ListBox::new();
++        list.add_css_class("navigation-sidebar");
++        for def in PAGES {
++            list.append(&sidebar_row(def.icon, def.title));
++        }
++        let settings_list = gtk::ListBox::new();
++        settings_list.add_css_class("navigation-sidebar");
++        settings_list.set_selection_mode(gtk::SelectionMode::None);
++        settings_list.append(&sidebar_row("emblem-system-symbolic", "Settings"));
++
++        let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
++        let sidebar_scroll = gtk::ScrolledWindow::builder()
++            .hscrollbar_policy(gtk::PolicyType::Never)
++            .vexpand(true)
++            .child(&list)
++            .build();
++        sidebar_box.append(&sidebar_scroll);
++        sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
++        sidebar_box.append(&settings_list);
++        let sidebar_tv = adw::ToolbarView::new();
++        sidebar_tv.add_top_bar(&sidebar_header);
++        sidebar_tv.set_content(Some(&sidebar_box));
++        let sidebar_page = adw::NavigationPage::new(&sidebar_tv, APP_NAME);
++
++        let split_view = adw::NavigationSplitView::builder()
++            .sidebar(&sidebar_page)
++            .content(&content_page)
++            .hexpand(true)
++            .vexpand(true)
++            .min_sidebar_width(220.0)
++            .max_sidebar_width(280.0)
++            .show_content(false)
++            .build();
++
++        // ---- wiring ----
++        let select_page = glib::clone!(
++            #[weak]
++            stack,
++            #[weak]
++            content_title,
++            #[weak]
++            content_page,
++            move |idx: i32| {
++                if let Some(def) = usize::try_from(idx).ok().and_then(|i| PAGES.get(i)) {
++                    stack.set_visible_child_name(def.id);
++                    content_title.set_title(def.title);
++                    content_page.set_title(def.title);
++                }
++            }
++        );
++        list.connect_row_selected(glib::clone!(
++            #[strong]
++            select_page,
++            move |_, row| {
++                if let Some(row) = row {
++                    select_page(row.index());
++                }
++            }
++        ));
++        list.connect_row_activated(glib::clone!(
++            #[weak]
++            split_view,
++            move |_, _| split_view.set_show_content(true)
++        ));
++        list.select_row(list.row_at_index(0).as_ref());
++        settings_list.connect_row_activated(|l, _| {
++            let _ = l.activate_action("win.preferences", None);
++        });
++
++        Self {
++            split_view,
++            banner,
++            home_slot,
++            headset_slot,
++            eyetracking_slot,
++            controllers_slot,
++            devices_slot,
++            logs_slot,
++        }
++    }
++}
++
++impl Default for Shell {
++    fn default() -> Self {
++        Self::new()
++    }
++}
+-- 
+2.56.0
+

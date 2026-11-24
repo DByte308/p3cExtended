@@ -1,0 +1,204 @@
+From 145a5aed787b9b1f2ddf99d392111e03c14f34c6 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:41:07 +0100
+Subject: [PATCH 17/28] d/pimax_p3c: keep stale and corrupted HMD reports out
+ of the shared clock
+
+The first HMD reports after start-up are stale (left in the USB buffer,
+seen 6 s old, arriving back to back). They seeded the windowed skew
+tracker that times IMU samples, camera frames and controllers, so the
+device->host mapping was off by seconds until the 2048-sample window
+flushed: head SLAM runaways on about half the starts, controller depth
+jumps, and once an IMU sample 380 s in the future that made Basalt abort
+(frame timestamps not monotonically increasing).
+
+Reports from the first 300 ms are discarded; afterwards a report is only
+accepted when its device clock advanced like the host clock (within
+100 ms) since the last accepted one, else it becomes a candidate that the
+next consistent report rebases onto. HMD and controller IMU samples that
+would still land in the future are dropped.
+
+Diagnostics: PIMAX_CTRL_IMU_AXES (controller IMU axis adapter, default
+raw) and the mean raw controller accelerometer in the 1 s log line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/session/status.rs    | 109 +++++++++++++++++-
+ 1 file changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index c9ff7b038..ba0d1947a 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -22,6 +22,8 @@ pub struct ControllerDiag {
+     pub imu_pushed: AtomicU64,
+     pub pose_queries: AtomicU64,
+     pub pose_valid: AtomicU64,
++    /// Raw accelerometer sum (g) and count since the last log line.
++    pub accel_sum: std::sync::Mutex<[f64; 4]>,
+ }
+ 
+ pub static CONTROLLER_DIAG: [ControllerDiag; 2] = [const { ControllerDiag::new() }, const { ControllerDiag::new() }];
+@@ -35,6 +37,7 @@ impl ControllerDiag {
+             imu_pushed: AtomicU64::new(0),
+             pose_queries: AtomicU64::new(0),
+             pose_valid: AtomicU64::new(0),
++            accel_sum: std::sync::Mutex::new([0.0; 4]),
+         }
+     }
+ }
+@@ -50,6 +53,79 @@ fn imu_ts_scale() -> i64 {
+     })
+ }
+ 
++/// Gate for the HMD's device clock before it reaches the shared skew tracker (which also times camera frames and
++/// controllers). A report is accepted when its device clock advanced like the host clock (within 100 ms) since the
++/// last accepted report. Otherwise it becomes a candidate, and the next report consistent with the candidate rebases
++/// onto it. So a single outlier (a corrupted report, or the stale report left in the USB buffer from before start-up,
++/// seen 6 s old; also flushed for the first 300 ms) never reaches the tracker, and a genuine device clock restart costs one report.
++fn hmd_timestamp_plausible(device_ns: i64) -> bool {
++    use std::sync::Mutex;
++    static STATE: Mutex<(Option<(i64, i64)>, Option<(i64, i64)>)> = Mutex::new((None, None));
++    let host = now_ns();
++    // The USB buffer still holds reports from before start-up (seen 6 s old) and they arrive back to back, so
++    // they are consistent with each other: discard everything from the first 300 ms of the stream.
++    static FIRST: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
++    if host - *FIRST.get_or_init(|| host) < 300_000_000 {
++        return false;
++    }
++    let consistent = |(d, h): (i64, i64)| device_ns > d && ((device_ns - d) - (host - h)).abs() < 100_000_000;
++    let mut state = STATE.lock().unwrap();
++    let (last, candidate) = &mut *state;
++    if last.is_some_and(consistent) {
++        *last = Some((device_ns, host));
++        *candidate = None;
++        return true;
++    }
++    if candidate.is_some_and(consistent) {
++        if let Some((d, h)) = *last {
++            warn!(
++                "HMD clock rebased: reports now {:.3} ms off the previous base",
++                ((device_ns - d) - (host - h)) as f64 / 1e6
++            );
++        }
++        *last = Some((device_ns, host));
++        *candidate = None;
++        return true;
++    }
++    if let Some((d, h)) = *last {
++        warn!(
++            "HMD report dropped: device clock advanced {:.3} ms while the host advanced {:.3} ms",
++            (device_ns - d) as f64 / 1e6,
++            (host - h) as f64 / 1e6
++        );
++    }
++    *candidate = Some((device_ns, host));
++    false
++}
++
++/// Controller IMU axis adapter, `PIMAX_CTRL_IMU_AXES` = three of x,y,z with optional '-' (default "x,y,z" = raw).
++/// The HMD's IMU needs (-x, y, -z) to land in its calibration frame (`to_headset_frame_vec`).
++fn controller_axes(v: [f64; 3]) -> [f64; 3] {
++    static MAP: std::sync::OnceLock<[(usize, f64); 3]> = std::sync::OnceLock::new();
++    let map = MAP.get_or_init(|| {
++        let raw = std::env::var("PIMAX_CTRL_IMU_AXES").unwrap_or_else(|_| "x,y,z".into());
++        let parsed: Option<Vec<(usize, f64)>> = raw
++            .split(',')
++            .map(|t| {
++                let t = t.trim();
++                let (sign, axis) = t.strip_prefix('-').map_or((1.0, t), |a| (-1.0, a));
++                ["x", "y", "z"].iter().position(|n| *n == axis).map(|i| (i, sign))
++            })
++            .collect();
++        match parsed.filter(|v| v.len() == 3) {
++            Some(v) => {
++                info!("controller IMU axes: {raw}");
++                [v[0], v[1], v[2]]
++            }
++            None => {
++                warn!("PIMAX_CTRL_IMU_AXES={raw}: want e.g. -x,y,-z; using raw axes");
++                [(0, 1.0), (1, 1.0), (2, 1.0)]
++            }
++        }
++    });
++    map.map(|(i, s)| v[i] * s)
++}
++
+ fn log_controller_diag(now: i64) {
+     let last = DIAG_LAST_NS.load(Ordering::Relaxed);
+     if now - (last as i64) < 1_000_000_000 {
+@@ -57,11 +133,19 @@ fn log_controller_diag(now: i64) {
+     }
+     DIAG_LAST_NS.store(now as u64, Ordering::Relaxed);
+     let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
++    let mean = |d: &ControllerDiag| {
++        let mut a = d.accel_sum.lock().unwrap();
++        let n = a[3].max(1.0);
++        let m = [a[0] / n, a[1] / n, a[2] / n];
++        *a = [0.0; 4];
++        m
++    };
+     let [l, r] = &CONTROLLER_DIAG;
+     info!(
+-        "controllers 1 s: L reports {} no_clock {} imu {} pose {}/{} | R reports {} no_clock {} imu {} pose {}/{}",
++        "controllers 1 s: L reports {} no_clock {} imu {} pose {}/{} | R reports {} no_clock {} imu {} pose {}/{} | raw accel g L {:.3?} R {:.3?}",
+         take(&l.reports), take(&l.no_clock), take(&l.imu_pushed), take(&l.pose_valid), take(&l.pose_queries),
+         take(&r.reports), take(&r.no_clock), take(&r.imu_pushed), take(&r.pose_valid), take(&r.pose_queries),
++        mean(l), mean(r),
+     );
+ }
+ use std::thread;
+@@ -116,6 +200,9 @@ pub(super) trait OnReport: Sized {
+ impl OnReport for HmdStatus {
+     fn on_status(self, tracking: &Tracking) {
+         let device_ns = self.imu[0].timestamp_us as i64 * 1000;
++        if !hmd_timestamp_plausible(device_ns) {
++            return;
++        }
+         let host_ns = tracking.clock.lock().unwrap().observe(device_ns, now_ns());
+         trace!("received HMD status: {device_ns} => {host_ns}");
+         log_controller_diag(now_ns());
+@@ -125,6 +212,11 @@ impl OnReport for HmdStatus {
+         {
+             for sample in self.imu {
+                 let timestamp_ns = host_ns + (sample.timestamp_us as i64 * imu_ts_scale()) - device_ns;
++                // A sample from the future would make every later one "older than last" for SLAM.
++                if timestamp_ns > now_ns() + 20_000_000 {
++                    warn!("dropping HMD IMU sample {} ms in the future", (timestamp_ns - now_ns()) / 1_000_000);
++                    continue;
++                }
+ 
+                 let accel_m_s2 =
+                     to_headset_frame_vec(sample.accel.map(|g| g as f64 * MATH_GRAVITY_M_S2).into());
+@@ -173,17 +265,24 @@ impl OnReport for ControllerStatus {
+                 let Some(sample_ns) = to_host(sample) else {
+                     continue;
+                 };
+-                // A zero offset would hand the fusion two samples at one instant.
+-                if sample_ns <= last_ns {
++                // A zero offset would hand the fusion two samples at one instant; a future one breaks ordering.
++                if sample_ns <= last_ns || sample_ns > now_ns() + 20_000_000 {
+                     continue;
+                 }
+                 last_ns = sample_ns;
+                 diag.imu_pushed.fetch_add(1, Ordering::Relaxed);
++                {
++                    let mut a = diag.accel_sum.lock().unwrap();
++                    for i in 0..3 {
++                        a[i] += sample.accel[i] as f64;
++                    }
++                    a[3] += 1.0;
++                }
+                 constellation.push_controller_imu(
+                     hand,
+                     sample_ns,
+-                    sample.accel.map(|g| g as f64 * MATH_GRAVITY_M_S2),
+-                    sample.gyro.map(|dps| dps.to_radians() as f64),
++                    controller_axes(sample.accel.map(|g| g as f64 * MATH_GRAVITY_M_S2)),
++                    controller_axes(sample.gyro.map(|dps| dps.to_radians() as f64)),
+                 );
+             }
+         }
+-- 
+2.56.0
+

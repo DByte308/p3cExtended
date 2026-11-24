@@ -1,0 +1,84 @@
+#!/bin/bash
+# One-command headset test. Put the headset on, switch both controllers on, run this, follow the voice:
+#   1. view sizes (automatic)
+#   2. controller frame: when told, point both controllers straight ahead like laser pointers, thumbs up, and hold
+#      still until "done". The capture decides which controller aim frame is right (tools/xrgaze/ctrl_frame.py).
+# Results stay local in $PIMAX_CACHE/headset-test/<time>/ (default ~/.cache/pimax-linux; poses only, no camera images).
+# Uses a running monado-service (e.g. Envision's) if there is one; otherwise starts its own and stops it after.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+OUT="$PIMAX_CACHE/headset-test/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$OUT"
+RUN="$PIMAX_RUNTIME_DIR"
+say() { echo ">> $*"; spd-say -w "$*" 2>/dev/null || true; }
+
+if ! lsusb | grep -qi '34a4:'; then
+    echo "No Pimax headset on USB (vendor 34a4). Plug it in and power it on first."; exit 1
+fi
+
+# Runtime manifest pointing at the client libs in /usr (same as run-vr.sh).
+MAN="$HOME/.config/openxr/1/active_runtime.json"
+CLIENT_LIB=$(pimax_libdir /usr libopenxr_monado.so) || { echo "no libopenxr_monado.so under /usr"; exit 1; }
+python3 -I - "$MAN" "$CLIENT_LIB" <<'PY'
+import json, pathlib, sys
+dst = pathlib.Path(sys.argv[1])
+src = json.loads(pathlib.Path('/usr/share/openxr/1/openxr_monado.json').read_text())
+src['runtime']['library_path'] = sys.argv[2] + '/libopenxr_monado.so'
+src['runtime']['MND_libmonado_path'] = sys.argv[2] + '/libmonado.so'
+dst.parent.mkdir(parents=True, exist_ok=True)
+dst.unlink(missing_ok=True)
+dst.write_text(json.dumps(src, indent=4) + "\n")
+PY
+export XR_RUNTIME_JSON="$MAN"
+
+OWN_PID=""; SUB=""
+SVC=$(pgrep -x monado-service | head -1)
+if [ -n "$SVC" ]; then
+    echo "using running monado-service (pid $SVC)"
+else
+    rm -f "$RUN/monado_comp_ipc" "$RUN/monado.pid"
+    echo "starting monado-service, log: $OUT/service.log"
+    ( unset PIMAX_AIM_OFFSET_L PIMAX_AIM_OFFSET_R
+      export VIT_SYSTEM_LIBRARY_PATH="$(pimax_libdir "$PIMAX_PREFIX" libbasalt.so || echo "$PIMAX_PREFIX/lib")/libbasalt.so" XRT_COMPOSITOR_COMPUTE=1 \
+             U_PACING_COMP_TIME_FRACTION_PERCENT=95 XRT_COMPOSITOR_USE_PRESENT_WAIT=1 ORT_DISABLE_TELEMETRY=1
+      tail -f /dev/null | XRT_LOG=info /usr/bin/monado-service > "$OUT/service.log" 2>&1 ) &
+    SUB=$!
+    for _ in $(seq 1 60); do [ -S "$RUN/monado_comp_ipc" ] && break; sleep 0.5; done
+    SVC=$(pgrep -x monado-service | head -1)
+    [ -n "$SVC" ] && [ -S "$RUN/monado_comp_ipc" ] || { echo "service did not come up, see $OUT/service.log"; exit 1; }
+    OWN_PID=$SVC
+fi
+# Stop only what we started: the service by its PID, then the tail keeping its stdin open (a child of our subshell).
+cleanup() { [ -n "$OWN_PID" ] && kill "$OWN_PID" 2>/dev/null; [ -n "$SUB" ] && pimax_stop_pid "$(pgrep -P "$SUB" -x tail)"; }
+trap cleanup EXIT
+
+# An aim offset already applied by the service is removed in the analysis.
+UNDO=()
+for h in L R; do
+    v=$(tr '\0' '\n' < "/proc/$SVC/environ" 2>/dev/null | sed -n "s/^PIMAX_AIM_OFFSET_$h=//p")
+    [ -n "$v" ] && UNDO+=("--undo-$(echo $h | tr LR lr)" "$v")
+done
+
+echo; echo "== 1. view sizes"
+xrsizes | tee "$OUT/xrsizes.txt"
+
+echo; echo "== 2. controller frame"
+say "Controller test. Look around the room for a few seconds."
+T0=$(date +%s.%N)
+XRCTRL_CSV="$OUT/controllers.csv" xrctrl 32 > "$OUT/xrctrl.log" 2>&1 &
+CTRL=$!
+sleep 10
+say "Now point both controllers straight ahead, like laser pointers, thumbs up. Hold still."
+T1=$(date +%s.%N)
+sleep 8
+T2=$(date +%s.%N)
+say "Done. You can relax."
+wait "$CTRL"
+tail -1 "$OUT/xrctrl.log"
+
+echo
+python3 -I "$PIMAX_REPO/tools/xrgaze/ctrl_frame.py" "$OUT/controllers.csv" "${UNDO[@]}" \
+    --from "$(echo "$T1 - $T0" | bc)" --to "$(echo "$T2 - $T0" | bc)" --json "$OUT/result.json" \
+    | tee "$OUT/result.txt"
+echo; echo "All results: $OUT"

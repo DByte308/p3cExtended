@@ -1,0 +1,45 @@
+From 0de6ae1ac43306f4fcbefcda8e046dc68fc8dc35 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:25:49 +0100
+Subject: [PATCH 27/28] d/pimax_p3c: default controller aim offset -48.4 deg
+ about device X
+
+Measured on 2026-11-24 with the controllers resting on their rings and
+confirmed in WayVR; matches the hand-held capture from 2026-11-23.
+---
+ .../drivers/pimax_p3c/src/device/controller/mod.rs   | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
+index bd0b776c3..35959e5b1 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
+@@ -153,9 +153,11 @@ unsafe extern "C" fn destroy(xdev: *mut xrt_device) {
+ }
+ 
+ /// Controller frame -> aim frame (x, y, z, w): `PIMAX_AIM_OFFSET_L` / `PIMAX_AIM_OFFSET_R` = "x,y,z,w". Default
+-/// identity (the raw LED-model frame) until a measurement taken with the clock fix in place; the 2026-11-23 captures
+-/// (L about -0.41,0.07,0.16,0.90) predate it and disagree between sessions. The right model is the mirror of the left
+-/// about device X, so R should be L with y and z negated.
++/// -48.4 deg about device X for both hands, measured on 2026-11-24: controllers resting on their rings (the LED ring
++/// plane is 53 deg from device +Y in the model) and a hand-held capture on 2026-11-23 agree, and in WayVR the beam
++/// follows the controller. A rotation about X is its own mirror image about device X, so both hands share it.
++const DEFAULT_AIM_OFFSET: [f32; 4] = [-0.410_032, 0.0, 0.0, 0.912_071];
++
+ fn aim_offset(hand: Hand) -> [f32; 4] {
+     static OFFSETS: std::sync::OnceLock<[[f32; 4]; 2]> = std::sync::OnceLock::new();
+     OFFSETS.get_or_init(|| {
+@@ -171,8 +173,8 @@ fn aim_offset(hand: Hand) -> [f32; 4] {
+             }
+         };
+         let o = [
+-            read("PIMAX_AIM_OFFSET_L", [0.0, 0.0, 0.0, 1.0]),
+-            read("PIMAX_AIM_OFFSET_R", [0.0, 0.0, 0.0, 1.0]),
++            read("PIMAX_AIM_OFFSET_L", DEFAULT_AIM_OFFSET),
++            read("PIMAX_AIM_OFFSET_R", DEFAULT_AIM_OFFSET),
+         ];
+         info!("controller aim offsets L {:?} R {:?}", o[0], o[1]);
+         o
+-- 
+2.56.0
+

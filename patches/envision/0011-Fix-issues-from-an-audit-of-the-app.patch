@@ -1,0 +1,664 @@
+From b5a10ef110cb9c9f1f073d1a9c046d4ad7b084d2 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:00:32 +0100
+Subject: [PATCH 11/13] Fix issues from an audit of the app
+
+- Closing Preferences no longer drops Pimax page changes made meanwhile
+  (e.g. a finished calibration); pages share one env map refreshed on close;
+  the restart banner also shows for Preferences changes.
+- Render resolution row edits the same render-scale preference as
+  Preferences instead of a second env var with a different default.
+- SLAM / controller tracking switches write explicit values (driver default
+  depends on the lighthouse faceplate); lens distance is an override switch.
+- Eye tracking: a recalibration is combined with the active correction
+  (reported by the driver) instead of replacing it; Stop is not a failure;
+  tools only run once the service is ready; partial calibration entries are
+  not saved; a running tool is stopped when Envision quits.
+- Developer mode hides the profile switch again; no second back button on
+  Logs; Monado's spellings of false are understood.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/app.rs                | 51 ++++++++++++++++++----
+ src/ui/debug_view.rs         |  9 ++++
+ src/ui/main_view.rs          | 18 ++++++--
+ src/ui/pimax_common.rs       | 26 +++++++----
+ src/ui/pimax_eye.rs          | 84 ++++++++++++++++++++++++++++++------
+ src/ui/pimax_pages.rs        | 74 +++++++++++++++++++++----------
+ src/ui/preferences_window.rs | 14 ------
+ 7 files changed, 209 insertions(+), 67 deletions(-)
+
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 194b9f1..a9369b7 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -103,6 +103,8 @@ pub struct App {
+     inhibit_fail_notif: Option<NotificationHandle>,
+ 
+     preferences_win: Option<AsyncController<PreferencesWindow>>,
++    /// Pimax page writes since Preferences was opened; re-applied when it closes (it returns its own config copy).
++    env_changes_while_prefs_open: Vec<(String, Option<String>)>,
+ 
+     theme_engine: ThemeEngine,
+     build_alerts: VecDeque<adw::AlertDialog>,
+@@ -530,6 +532,7 @@ impl AsyncComponent for App {
+             Msg::EnableDebugViewChanged(val) => {
+                 self.config.debug_view_enabled = val;
+                 self.config.save();
++                self.debug_view.emit(DebugViewMsg::DevModeChanged(val));
+                 // disabling debug view also disables profiles
+                 if !val {
+                     sender.input(Msg::ProfilesEnabledChanged(false));
+@@ -1080,6 +1083,7 @@ impl AsyncComponent for App {
+                 }
+             }
+             Msg::OpenPreferences => {
++                self.env_changes_while_prefs_open.clear();
+                 self.config.prune_xr_plugins();
+                 let preferences_win = PreferencesWindow::builder()
+                     .launch(PreferencesWindowInit {
+@@ -1095,14 +1099,8 @@ impl AsyncComponent for App {
+                 self.preferences_win = Some(preferences_win);
+             }
+             Msg::SetGlobalEnvVar(key, value) => {
+-                match value {
+-                    Some(v) => {
+-                        self.config.global_preferences.env_vars.insert(key, v);
+-                    }
+-                    None => {
+-                        self.config.global_preferences.env_vars.remove(&key);
+-                    }
+-                }
++                self.env_changes_while_prefs_open.push((key.clone(), value.clone()));
++                apply_env_change(&mut self.config, key, value);
+                 self.config.save();
+                 // env vars only apply on the next XR service start
+                 let service_running = self
+@@ -1114,8 +1112,23 @@ impl AsyncComponent for App {
+                 }
+             }
+             Msg::OnPreferencesWindowClose(config) => {
++                let changed = config.global_preferences != self.config.global_preferences;
+                 self.config = config;
++                // keep what the Pimax pages wrote while the dialog was open (e.g. a finished calibration)
++                for (k, v) in std::mem::take(&mut self.env_changes_while_prefs_open) {
++                    apply_env_change(&mut self.config, k, v);
++                }
+                 self.config.save();
++                self.main_view.emit(MainViewMsg::ReloadPimaxEnv(
++                    self.config.global_preferences.env_vars.clone(),
++                ));
++                let service_running = self
++                    .xrservice_worker
++                    .as_ref()
++                    .is_some_and(|w| w.state.lock().unwrap().exit_status.is_none());
++                if changed && service_running {
++                    self.shell.banner.set_revealed(true);
++                }
+                 sender.input(Msg::ProfileSelected(self.get_selected_profile()));
+             }
+             Msg::LaunchMonadoGui => {
+@@ -1319,6 +1332,7 @@ impl AsyncComponent for App {
+                     profile: selected_profile,
+                     root_win: root.clone().into(),
+                     profiles_enabled: config.profiles_enabled,
++                    dev_mode: config.debug_view_enabled,
+                 })
+                 .forward(sender.input_sender(), |message| match message {
+                     DebugViewOutMsg::StartWithDebug => Msg::StartWithDebug,
+@@ -1372,6 +1386,7 @@ impl AsyncComponent for App {
+             xrservice_ready: false,
+             inhibit_fail_notif: None,
+             preferences_win: None,
++            env_changes_while_prefs_open: Vec::new(),
+             build_alerts: VecDeque::new(),
+         };
+ 
+@@ -1466,3 +1481,23 @@ new_stateless_action!(pub ThemeManagerAction, AppActionGroup, "thememanager");
+ 
+ new_stateless_action!(pub DebugOpenDataAction, AppActionGroup, "debugopendata");
+ new_stateless_action!(pub DebugOpenPrefixAction, AppActionGroup, "debugopenprefix");
++
++/// Store a global env var change. The render scale has its own preference (it is always passed to the service as
++/// XRT_COMPOSITOR_SCALE_PERCENTAGE), so the Pimax row writes that instead of a second copy in env_vars.
++fn apply_env_change(config: &mut Config, key: String, value: Option<String>) {
++    if key == "XRT_COMPOSITOR_SCALE_PERCENTAGE" {
++        if let Some(v) = value.as_deref().and_then(|v| v.trim().parse::<u16>().ok()) {
++            config.global_preferences.scale_percentage = v;
++        }
++        config.global_preferences.env_vars.remove(&key);
++        return;
++    }
++    match value {
++        Some(v) => {
++            config.global_preferences.env_vars.insert(key, v);
++        }
++        None => {
++            config.global_preferences.env_vars.remove(&key);
++        }
++    }
++}
+diff --git a/src/ui/debug_view.rs b/src/ui/debug_view.rs
+index 019c47a..8e7fe41 100644
+--- a/src/ui/debug_view.rs
++++ b/src/ui/debug_view.rs
+@@ -44,6 +44,8 @@ pub enum DebugViewMsg {
+     SearchFindMatch(SearchDirection),
+     LogLevelChanged(LogLevel),
+     XRServiceActiveChanged(bool),
++    /// Developer mode toggled: the profile switch is a developer feature.
++    DevModeChanged(bool),
+     UpdateSelectedProfile(Profile),
+     CopyProfileId,
+     SetColorScheme,
+@@ -77,6 +79,7 @@ pub enum DebugViewOutMsg {
+ #[tracker::track]
+ pub struct DebugView {
+     xrservice_active: bool,
++    dev_mode: bool,
+     #[tracker::do_not_track]
+     dropdown: Option<gtk::DropDown>,
+     #[tracker::do_not_track]
+@@ -107,6 +110,7 @@ pub struct DebugViewInit {
+     pub root_win: gtk::Window,
+     /// grab this from Config
+     pub profiles_enabled: bool,
++    pub dev_mode: bool,
+ }
+ 
+ impl DebugView {
+@@ -169,6 +173,7 @@ impl AsyncComponent for DebugView {
+                 set_show_start_title_buttons: false,
+                 set_show_end_title_buttons: false,
+                 set_show_title: false,
++                set_show_back_button: false,
+                 pack_end: debug_menu_btn = &gtk::MenuButton {
+                     set_icon_name: "view-more-symbolic",
+                     set_tooltip_text: Some("Debug Actions"),
+@@ -236,6 +241,8 @@ impl AsyncComponent for DebugView {
+                 connect_entry: &search_entry,
+             },
+             add_bottom_bar: prof_toggle_box = &gtk::ListBox{
++                #[track = "model.changed(Self::dev_mode())"]
++                set_visible: model.dev_mode,
+                 set_selection_mode: gtk::SelectionMode::None,
+                 add_css_class: "background",
+                 adw::SwitchRow {
+@@ -615,6 +622,7 @@ impl AsyncComponent for DebugView {
+                 );
+                 rebuild_dialog.present(Some(&self.root_win));
+             }
++            Self::Input::DevModeChanged(on) => self.set_dev_mode(on),
+             Self::Input::ProfilesEnabledChanged(enabled) => {
+                 self.set_profiles_enabled(enabled);
+                 self.profile_id_widget.set_visible(enabled);
+@@ -741,6 +749,7 @@ impl AsyncComponent for DebugView {
+ 
+         let mut model = Self {
+             xrservice_active: false,
++            dev_mode: init.dev_mode,
+             tracker: 0,
+             dropdown: None,
+             log_level: LogLevel::Trace,
+diff --git a/src/ui/main_view.rs b/src/ui/main_view.rs
+index a183aaf..8564bf7 100644
+--- a/src/ui/main_view.rs
++++ b/src/ui/main_view.rs
+@@ -58,6 +58,8 @@ pub struct MainView {
+     #[tracker::do_not_track]
+     pimax_summary: Controller<PimaxSummary>,
+     #[tracker::do_not_track]
++    pimax_env: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, String>>>,
++    #[tracker::do_not_track]
+     _headset_page: Controller<HeadsetPage>,
+     #[tracker::do_not_track]
+     eyetracking_page: Controller<EyeTrackingPage>,
+@@ -78,6 +80,8 @@ pub struct MainView {
+ #[derive(Debug)]
+ pub enum MainViewMsg {
+     ClockTicking,
++    /// Global env vars changed outside the Pimax pages (Preferences closed).
++    ReloadPimaxEnv(std::collections::HashMap<String, String>),
+     StartStopClicked,
+     RestartXRService,
+     XRServiceActiveChanged(bool, Option<Profile>, bool),
+@@ -377,6 +381,7 @@ impl AsyncComponent for MainView {
+ 
+         match message {
+             Self::Input::ClockTicking => {}
++            Self::Input::ReloadPimaxEnv(env) => *self.pimax_env.borrow_mut() = env,
+             Self::Input::StartStopClicked => {
+                 sender
+                     .output(Self::Output::DoStartStopXRService)
+@@ -398,9 +403,10 @@ impl AsyncComponent for MainView {
+                 self.openhmd_calibration_box
+                     .sender()
+                     .emit(OpenHmdCalibrationBoxMsg::XRServiceActiveChanged(active));
++                // The eye tools need a service that accepts clients, not just a spawned process.
+                 self.eyetracking_page
+                     .sender()
+-                    .emit(EyeTrackingMsg::XRServiceActiveChanged(active));
++                    .emit(EyeTrackingMsg::XRServiceActiveChanged(active && self.xrservice_ready));
+                 if !active {
+                     sender.input(Self::Input::UpdateDevices(vec![]));
+                     sender.input(Self::Input::UpdateClients(vec![]));
+@@ -440,6 +446,9 @@ impl AsyncComponent for MainView {
+             }
+             Self::Input::UpdateXrServiceReady(ready) => {
+                 self.set_xrservice_ready(ready);
++                self.eyetracking_page
++                    .sender()
++                    .emit(EyeTrackingMsg::XRServiceActiveChanged(self.xrservice_active && ready));
+             }
+             Self::Input::CheckSetcap => {
+                 let config = Config::get_config();
+@@ -524,8 +533,10 @@ impl AsyncComponent for MainView {
+ 
+         // Pimax pages: Home summary + Headset / Eye Tracking / Controllers pages in the shell's slots.
+         let pimax_init = PimaxPageInit {
+-            env_vars: init.config.global_preferences.env_vars.clone(),
++            env_vars: std::rc::Rc::new(std::cell::RefCell::new(init.config.global_preferences.env_vars.clone())),
++            scale_percentage: init.config.global_preferences.scale_percentage,
+         };
++        let pimax_env = pimax_init.env_vars.clone();
+         let pimax_out = |msg| match msg {
+             PimaxOutMsg::SetEnvVar(k, v) => MainViewOutMsg::SetEnvVar(k, v),
+         };
+@@ -539,7 +550,7 @@ impl AsyncComponent for MainView {
+             .launch(pimax_init.clone())
+             .forward(sender.output_sender(), pimax_out);
+         let controllers_page = ControllersPage::builder()
+-            .launch(pimax_init)
++            .launch(pimax_init.clone())
+             .forward(sender.output_sender(), pimax_out);
+         init.headset_slot.set_child(Some(headset_page.widget()));
+         init.eyetracking_slot.set_child(Some(eyetracking_page.widget()));
+@@ -571,6 +582,7 @@ impl AsyncComponent for MainView {
+ 
+         let model = Self {
+             pimax_summary,
++            pimax_env,
+             _headset_page: headset_page,
+             eyetracking_page,
+             _controllers_page: controllers_page,
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index 403414d..3014a71 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -23,8 +23,10 @@ pub enum PimaxOutMsg {
+ /// Init shared by all Pimax page components.
+ #[derive(Debug, Clone, Default)]
+ pub struct PimaxPageInit {
+-    /// Snapshot of `config.global_preferences.env_vars`.
+-    pub env_vars: HashMap<String, String>,
++    /// `config.global_preferences.env_vars`, shared by all pages; MainView refreshes it after Preferences closes.
++    pub env_vars: Rc<RefCell<HashMap<String, String>>>,
++    /// `config.global_preferences.scale_percentage` (the render scale always passed to the service).
++    pub scale_percentage: u16,
+ }
+ 
+ /// True when any USB device has the Pimax vendor id.
+@@ -42,6 +44,8 @@ pub fn pimax_plugged_in() -> bool {
+ pub struct EyeTrackingStatus {
+     pub enabled: Option<bool>,
+     pub calibrated: Option<bool>,
++    /// The correction the driver applies now (parsed PIMAX_EYE_CALIB), if any.
++    pub calib: Option<[f64; 6]>,
+ }
+ 
+ #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+@@ -138,18 +142,15 @@ pub struct Ctx {
+ 
+ impl Ctx {
+     pub fn new(init: &PimaxPageInit, out: &Sender<PimaxOutMsg>) -> Self {
+-        Self { env: Rc::new(RefCell::new(init.env_vars.clone())), out: out.clone() }
++        Self { env: init.env_vars.clone(), out: out.clone() }
+     }
+ 
+     pub fn get(&self, k: &str) -> Option<String> {
+         self.env.borrow().get(k).cloned()
+     }
+ 
+-    /// Update the local copy and tell the shell (only when the value actually changed).
++    /// Update the local copy and tell the shell. Always sent: the copy can be stale after edits in Preferences.
+     pub fn set(&self, k: &str, v: Option<String>) {
+-        if self.get(k) == v {
+-            return;
+-        }
+         match &v {
+             Some(v) => self.env.borrow_mut().insert(k.into(), v.clone()),
+             None => self.env.borrow_mut().remove(k),
+@@ -159,7 +160,7 @@ impl Ctx {
+ 
+     pub fn bool_var(&self, k: &str, default: bool) -> bool {
+         match self.get(k).as_deref() {
+-            Some("0" | "false" | "off" | "no") => false,
++            Some(v) if matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "f" | "off" | "no" | "n") => false,
+             Some(_) => true,
+             None => default,
+         }
+@@ -173,6 +174,15 @@ impl Ctx {
+         })
+     }
+ 
++    /// Switch that always writes an explicit "1"/"0", for options whose driver default depends on the hardware
++    /// (e.g. SLAM is off by default with a lighthouse faceplate). Shown as `shown_default` while unset.
++    pub fn explicit_bool_row(&self, k: &'static str, title: &str, desc: &str, shown_default: bool) -> adw::SwitchRow {
++        let c = self.clone();
++        super::preference_rows::switch_row(title, Some(desc), self.bool_var(k, shown_default), move |_, v| {
++            c.set(k, Some(if v { "1" } else { "0" }.to_string()));
++        })
++    }
++
+     /// Spin row for a numeric option; `unset` (shown as that value) removes the var.
+     #[allow(clippy::too_many_arguments)]
+     pub fn num_row(&self, k: &'static str, title: &str, desc: &str, unset: f64, min: f64, max: f64, step: f64) -> adw::SpinRow {
+diff --git a/src/ui/pimax_eye.rs b/src/ui/pimax_eye.rs
+index 5f01b62..b056f74 100644
+--- a/src/ui/pimax_eye.rs
++++ b/src/ui/pimax_eye.rs
+@@ -52,6 +52,31 @@ pub struct EyeTrackingPage {
+     calib_error: Option<String>,
+     log: Vec<String>,
+     worker: Option<JobWorker>,
++    /// The user pressed Stop: the exit code is not a failure.
++    stopped: bool,
++    /// Copy the stored value into the entry on the next view update (after a calibration saved one).
++    sync_entry: std::cell::Cell<bool>,
++}
++
++/// Parses "ay,by,cy,ap,bp,cp" as the driver does.
++fn parse_calib(v: &str) -> Option<[f64; 6]> {
++    let n: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
++    <[f64; 6]>::try_from(n).ok().filter(|c| c.iter().all(|x| x.is_finite()))
++}
++
++/// The tool measures gaze with the active correction `old` already applied, so its fit `new` maps corrected
++/// angles to true ones. Both are affine maps on (yaw, pitch); the full correction is new(old(raw)).
++fn compose_calib(new: [f64; 6], old: [f64; 6]) -> [f64; 6] {
++    let [n0, n1, n2, n3, n4, n5] = new;
++    let [o0, o1, o2, o3, o4, o5] = old;
++    [
++        n0 * o0 + n1 * o3,
++        n0 * o1 + n1 * o4,
++        n0 * o2 + n1 * o5 + n2,
++        n3 * o0 + n4 * o3,
++        n3 * o1 + n4 * o4,
++        n3 * o2 + n4 * o5 + n5,
++    ]
+ }
+ 
+ #[derive(Debug)]
+@@ -87,7 +112,7 @@ impl EyeTrackingPage {
+             .unwrap_or_else(|| self.ctx.get(EYE_CALIB_VAR).is_some_and(|v| !v.is_empty()));
+         if calibrated {
+             let sub = match &self.calib_error {
+-                Some(e) => format!("Mean error {e}"),
++                Some(e) => format!("Fit error: {e}"),
+                 None => "Calibration stored".into(),
+             };
+             ("Calibrated", sub, "success")
+@@ -105,10 +130,22 @@ impl EyeTrackingPage {
+             .rev()
+             .find_map(|l| l.strip_prefix("error after:"))
+             .map(|q| q.trim().to_string());
++        if self.stopped {
++            self.result = Some((false, "Calibration stopped; nothing was saved.".into()));
++            return;
++        }
++        // The tool saw gaze with the driver's active correction applied; combine with it.
++        let active = self.status.as_ref().and_then(|s| s.eye_tracking.as_ref()).and_then(|e| e.calib);
++        let value = value.and_then(|v| parse_calib(&v)).map(|fit| match active {
++            Some(old) => compose_calib(fit, old),
++            None => fit,
++        });
+         match (code, value) {
+-            (0, Some(v)) => {
+-                info!("pimax: new eye calibration {v}");
++            (0, Some(c)) => {
++                let v = c.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(",");
++                info!("pimax: new eye calibration {v} (fit on top of {active:?})");
+                 self.ctx.set(EYE_CALIB_VAR, Some(v));
++                self.sync_entry.set(true);
+                 self.calib_error = quality.clone();
+                 self.result = Some((
+                     true,
+@@ -273,8 +310,14 @@ impl SimpleComponent for EyeTrackingPage {
+         let calib_entry = {
+             let c = ctx.clone();
+             let e = super::preference_rows::entry_row("Calibration", &ctx.get(EYE_CALIB_VAR).unwrap_or_default(), move |r| {
++                // Store only complete values (empty = no correction); partial input is marked, not saved.
+                 let t = r.text().trim().to_string();
+-                c.set(EYE_CALIB_VAR, (!t.is_empty()).then_some(t));
++                if t.is_empty() || parse_calib(&t).is_some() {
++                    r.remove_css_class("error");
++                    c.set(EYE_CALIB_VAR, (!t.is_empty()).then_some(t));
++                } else {
++                    r.add_css_class("error");
++                }
+             });
+             e.set_tooltip_text(Some("Six numbers written by Recalibrate; clear to use the raw tracker output"));
+             e
+@@ -299,6 +342,8 @@ impl SimpleComponent for EyeTrackingPage {
+             calib_error: None,
+             log: vec![],
+             worker: None,
++            stopped: false,
++            sync_entry: std::cell::Cell::new(false),
+         };
+         ComponentParts {
+             model,
+@@ -320,9 +365,10 @@ impl SimpleComponent for EyeTrackingPage {
+             EyeTrackingMsg::XRServiceActiveChanged(active) => self.xrservice_active = active,
+             EyeTrackingMsg::Poll => self.status = read_status(),
+             EyeTrackingMsg::Run(t) => {
+-                if self.running.is_some() {
++                if self.running.is_some() || !self.xrservice_active {
+                     return;
+                 }
++                self.stopped = false;
+                 let (cmd, args) = t.command();
+                 if !std::path::Path::new(&cmd).exists() {
+                     self.result = Some((false, format!("{cmd} not found; install the pimax-linux tools")));
+@@ -343,9 +389,12 @@ impl SimpleComponent for EyeTrackingPage {
+             }
+             EyeTrackingMsg::Stop => {
+                 if let Some(w) = self.worker.as_ref() {
++                    self.stopped = true;
+                     w.stop();
+                 }
+             }
++            // Late lines from a finished run must not mix into the next run's log.
++            EyeTrackingMsg::OnLog(_) if self.running.is_none() => {}
+             EyeTrackingMsg::OnLog(lines) => self.log.extend(lines.into_iter().map(|l| l.trim_end().to_string())),
+             EyeTrackingMsg::OnExit(code) => {
+                 let t = self.running.take();
+@@ -353,10 +402,13 @@ impl SimpleComponent for EyeTrackingPage {
+                 match t {
+                     Some(PimaxTool::Calibrate) => self.finish_calibration(code),
+                     Some(t) => {
+-                        self.result = Some((
+-                            code == 0,
+-                            if code == 0 { format!("{} finished", t.label()) } else { format!("{} exited with code {code}", t.label()) },
+-                        ));
++                        self.result = Some(if self.stopped {
++                            (true, format!("{} stopped", t.label()))
++                        } else if code == 0 {
++                            (true, format!("{} finished", t.label()))
++                        } else {
++                            (false, format!("{} exited with code {code}: {}", t.label(), self.log.last().map(String::as_str).unwrap_or("no output")))
++                        });
+                     }
+                     None => {}
+                 }
+@@ -394,9 +446,17 @@ impl SimpleComponent for EyeTrackingPage {
+             }
+             None => w.result.set_visible(false),
+         }
+-        let cur = self.ctx.get(EYE_CALIB_VAR).unwrap_or_default();
+-        if w.calib_entry.text().trim() != cur {
+-            w.calib_entry.set_text(&cur);
++        if self.sync_entry.replace(false) {
++            w.calib_entry.set_text(&self.ctx.get(EYE_CALIB_VAR).unwrap_or_default());
++        }
++    }
++}
++
++impl Drop for EyeTrackingPage {
++    /// Don't leave a tool running in the headset when Envision quits.
++    fn drop(&mut self) {
++        if let Some(w) = self.worker.as_ref() {
++            w.stop();
+         }
+     }
+ }
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 41c5a2b..8dc9169 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -216,17 +216,21 @@ impl SimpleComponent for HeadsetPage {
+             "PIMAX_REFRESH_HZ",
+             "Refresh rate",
+             "72 Hz saves GPU time; 120 Hz is not offered by every model",
+-            &[("Default (90 Hz)", None), ("72 Hz", Some("72")), ("90 Hz", Some("90")), ("120 Hz", Some("120"))],
+-        ));
+-        display.add(&ctx.num_row(
+-            "XRT_COMPOSITOR_SCALE_PERCENTAGE",
+-            "Render resolution (%)",
+-            "Compositor render scale; 100 = native panel resolution",
+-            100.0,
+-            30.0,
+-            200.0,
+-            5.0,
++            &[("Headset default", None), ("72 Hz", Some("72")), ("90 Hz", Some("90")), ("120 Hz", Some("120"))],
+         ));
++        // Same setting as Preferences → Render scale (stored there, not as a separate env var).
++        display.add(&{
++            let c = ctx.clone();
++            super::preference_rows::spin_row(
++                "Render resolution (%)",
++                Some("Compositor render scale; 100 = native panel resolution. Same as Preferences \u{2192} Render scale"),
++                f64::from(init.scale_percentage),
++                30.0,
++                200.0,
++                5.0,
++                move |adj| c.set("XRT_COMPOSITOR_SCALE_PERCENTAGE", Some(format!("{:.0}", adj.value()))),
++            )
++        });
+         display.add(&ctx.choice_row(
+             "PIMAX_FOV_PERCENT",
+             "Field of view",
+@@ -299,25 +303,51 @@ impl SimpleComponent for HeadsetPage {
+ 
+         // Tracking (controller tracking lives on the Controllers page)
+         let trk = group("Tracking", None);
+-        trk.add(&ctx.bool_row(
++        trk.add(&ctx.explicit_bool_row(
+             "PIMAX_SLAM",
+             "Inside-out tracking (SLAM)",
+-            "Headset cameras; off when a lighthouse faceplate is used",
++            "Headset cameras; the driver turns it off by default when a lighthouse faceplate is used",
+             true,
+         ));
+         content.append(&trk);
+ 
+         // Advanced
+         let adv_group = group("Advanced", Some("Expert settings; the defaults are tuned for the Crystal Super."));
+-        adv_group.add(&ctx.num_row(
+-            "PIMAX_LENS_SEP_MM",
+-            "Lens centre distance (mm)",
+-            "Distortion centre spacing; 68.81 = unset (driver default for this headset); change only if both eyes don't fuse",
+-            68.81,
+-            60.0,
+-            76.0,
+-            0.05,
+-        ));
++        {
++            let stored = ctx.get("PIMAX_LENS_SEP_MM").and_then(|v| v.parse::<f64>().ok());
++            let spin = {
++                let c = ctx.clone();
++                super::preference_rows::spin_row(
++                    "Lens centre distance (mm)",
++                    Some("Distortion centre spacing; 68.81 is the measured Crystal Super value"),
++                    stored.unwrap_or(68.81).clamp(60.0, 76.0),
++                    60.0,
++                    76.0,
++                    0.05,
++                    move |adj| {
++                        if c.get("PIMAX_LENS_SEP_MM").is_some() {
++                            c.set("PIMAX_LENS_SEP_MM", Some(format!("{:.2}", adj.value())));
++                        }
++                    },
++                )
++            };
++            spin.set_sensitive(stored.is_some());
++            let sw = {
++                let c = ctx.clone();
++                let spin = spin.clone();
++                super::preference_rows::switch_row(
++                    "Override lens centre distance",
++                    Some("Off: use the headset's own value; change only if both eyes don't fuse"),
++                    stored.is_some(),
++                    move |_, on| {
++                        spin.set_sensitive(on);
++                        c.set("PIMAX_LENS_SEP_MM", on.then(|| format!("{:.2}", spin.value())));
++                    },
++                )
++            };
++            adv_group.add(&sw);
++            adv_group.add(&spin);
++        }
+         adv_group.add(&ctx.num_row(
+             "PIMAX_CANT_SCALE",
+             "View cant (%)",
+@@ -501,7 +531,7 @@ impl SimpleComponent for ControllersPage {
+             50.0,
+             1.0,
+         ));
+-        g.add(&ctx.bool_row(
++        g.add(&ctx.explicit_bool_row(
+             "PIMAX_CONSTELLATION",
+             "Controller tracking",
+             "Controller LEDs seen by the headset cameras",
+diff --git a/src/ui/preferences_window.rs b/src/ui/preferences_window.rs
+index d34014e..62e636e 100644
+--- a/src/ui/preferences_window.rs
++++ b/src/ui/preferences_window.rs
+@@ -33,8 +33,6 @@ pub enum PreferencesWindowMsg {
+     EnvVarChanged(String, String),
+     EnvVarDelete(String),
+     AddEnvVar(String),
+-    /// Reload the env var rows from the config (the Pimax page edits the config directly).
+-    RefreshEnvRows,
+ }
+ 
+ #[derive(Debug)]
+@@ -237,16 +235,6 @@ impl AsyncComponent for PreferencesWindow {
+                     self.env_rows.guard().remove(p);
+                 }
+             }
+-            Self::Input::RefreshEnvRows => {
+-                let mut guard = self.env_rows.guard();
+-                guard.clear();
+-                for (k, v) in self.config.borrow().global_preferences.env_vars.iter() {
+-                    guard.push_back(EnvVarModelInit {
+-                        name: k.clone(),
+-                        value: v.clone(),
+-                    });
+-                }
+-            }
+             Self::Input::AddEnvVar(var) => {
+                 let mut conf = self.config.borrow_mut();
+                 let (name, value) = parse_var(&var);
+@@ -337,8 +325,6 @@ impl AsyncComponent for PreferencesWindow {
+                     "failed to make env var preference group description selectable, please open a bug report"
+                 );
+             }
+-            let sender = sender.clone();
+-            pg.connect_map(move |_| sender.input(Self::Input::RefreshEnvRows));
+             pg
+         };
+ 
+-- 
+2.56.0
+

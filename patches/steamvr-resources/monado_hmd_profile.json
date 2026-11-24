@@ -1,0 +1,10 @@
+{
+  "jsonid": "input_profile",
+  "controller_type": "monado_hmd",
+  "device_class": "TrackedDeviceClass_HMD",
+  "resource_root": "monado",
+  "driver_name": "monado",
+  "input_bindingui_mode": "hmd",
+  "should_show_binding_errors": false,
+  "input_source": {}
+}

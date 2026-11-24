@@ -1,0 +1,314 @@
+From c8c4ccb11c2717f1ccb0058ab17110e80b8abd9a Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:26:44 +0100
+Subject: [PATCH 12/13] Pimax pages refresh after Preferences, debounced saves,
+ live options
+
+- Preferences closing rebuilds the Pimax pages (the eye page only when no
+  tool is running), so every row shows the current value.
+- Pimax page edits are saved 0.5 s after the last change (flushed on quit).
+- Live options (IPD offset, view cant, eye calibration and flip, stick dead
+  zone) are written to $XDG_RUNTIME_DIR/pimax-p3c/settings.json for the
+  running driver and no longer ask for a restart.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/app.rs          | 35 ++++++++++++++++++++++++++++++++---
+ src/ui/main_view.rs    | 41 ++++++++++++++++++++++++++++++++++++-----
+ src/ui/pimax_common.rs | 27 +++++++++++++++++++++++++++
+ src/ui/pimax_eye.rs    | 10 +++++++---
+ src/ui/pimax_pages.rs  |  6 +++---
+ 5 files changed, 105 insertions(+), 14 deletions(-)
+
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index a9369b7..2d401e1 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -105,6 +105,8 @@ pub struct App {
+     preferences_win: Option<AsyncController<PreferencesWindow>>,
+     /// Pimax page writes since Preferences was opened; re-applied when it closes (it returns its own config copy).
+     env_changes_while_prefs_open: Vec<(String, Option<String>)>,
++    /// Debounced config save after Pimax page edits: only the latest scheduled save runs.
++    save_generation: u64,
+ 
+     theme_engine: ThemeEngine,
+     build_alerts: VecDeque<adw::AlertDialog>,
+@@ -114,6 +116,8 @@ pub struct App {
+ pub enum Msg {
+     /// Set (Some) or remove (None) a global env var and save the config.
+     SetGlobalEnvVar(String, Option<String>),
++    /// Save the config if no newer edit happened since this generation was scheduled.
++    SaveConfigDebounced(u64),
+     OnServiceLog(Vec<String>),
+     OnServiceExit(i32),
+     OnPluginsExit(i32),
+@@ -153,6 +157,12 @@ pub enum Msg {
+ }
+ 
+ impl App {
++    /// Tell a running driver the current live options (profile env over global, as the service gets them).
++    fn write_live_settings(&mut self) {
++        let env = self.get_selected_profile().environment_with_fallback(&self.config.global_preferences);
++        crate::ui::pimax_common::write_live_settings(&env);
++    }
++
+     pub fn get_selected_profile(&mut self) -> Profile {
+         if self.config.profiles_enabled {
+             self.config.get_selected_profile(&self.profiles)
+@@ -399,6 +409,8 @@ impl AsyncComponent for App {
+     }
+ 
+     fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
++        // flush a debounced save that has not run yet
++        self.config.save();
+         if let Some(worker) = self.xrservice_worker.as_ref() {
+             worker.stop();
+         }
+@@ -1100,17 +1112,31 @@ impl AsyncComponent for App {
+             }
+             Msg::SetGlobalEnvVar(key, value) => {
+                 self.env_changes_while_prefs_open.push((key.clone(), value.clone()));
++                let live = crate::ui::pimax_common::LIVE_KEYS.contains(&key.as_str());
+                 apply_env_change(&mut self.config, key, value);
+-                self.config.save();
+-                // env vars only apply on the next XR service start
++                // Spin steps and keystrokes arrive quickly: save once they settle.
++                self.save_generation += 1;
++                let generation = self.save_generation;
++                let s = sender.input_sender().clone();
++                gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
++                    s.emit(Msg::SaveConfigDebounced(generation));
++                });
++                // Live options reach the running driver through the live settings file; the rest apply on the
++                // next XR service start.
+                 let service_running = self
+                     .xrservice_worker
+                     .as_ref()
+                     .is_some_and(|w| w.state.lock().unwrap().exit_status.is_none());
+-                if service_running {
++                if service_running && !live {
+                     self.shell.banner.set_revealed(true);
+                 }
+             }
++            Msg::SaveConfigDebounced(generation) => {
++                if generation == self.save_generation {
++                    self.config.save();
++                    self.write_live_settings();
++                }
++            }
+             Msg::OnPreferencesWindowClose(config) => {
+                 let changed = config.global_preferences != self.config.global_preferences;
+                 self.config = config;
+@@ -1119,8 +1145,10 @@ impl AsyncComponent for App {
+                     apply_env_change(&mut self.config, k, v);
+                 }
+                 self.config.save();
++                self.write_live_settings();
+                 self.main_view.emit(MainViewMsg::ReloadPimaxEnv(
+                     self.config.global_preferences.env_vars.clone(),
++                    self.config.global_preferences.scale_percentage,
+                 ));
+                 let service_running = self
+                     .xrservice_worker
+@@ -1387,6 +1415,7 @@ impl AsyncComponent for App {
+             inhibit_fail_notif: None,
+             preferences_win: None,
+             env_changes_while_prefs_open: Vec::new(),
++            save_generation: 0,
+             build_alerts: VecDeque::new(),
+         };
+ 
+diff --git a/src/ui/main_view.rs b/src/ui/main_view.rs
+index 8564bf7..d3c8608 100644
+--- a/src/ui/main_view.rs
++++ b/src/ui/main_view.rs
+@@ -57,8 +57,11 @@ pub struct MainView {
+     steamvr_calibration_box: Controller<SteamVrCalibrationBox>,
+     #[tracker::do_not_track]
+     pimax_summary: Controller<PimaxSummary>,
++    /// Shared env map + scale for the Pimax pages, and the slots they live in (pages are rebuilt on reload).
+     #[tracker::do_not_track]
+-    pimax_env: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, String>>>,
++    pimax_init: PimaxPageInit,
++    #[tracker::do_not_track]
++    pimax_slots: [adw::Bin; 3],
+     #[tracker::do_not_track]
+     _headset_page: Controller<HeadsetPage>,
+     #[tracker::do_not_track]
+@@ -81,7 +84,7 @@ pub struct MainView {
+ pub enum MainViewMsg {
+     ClockTicking,
+     /// Global env vars changed outside the Pimax pages (Preferences closed).
+-    ReloadPimaxEnv(std::collections::HashMap<String, String>),
++    ReloadPimaxEnv(std::collections::HashMap<String, String>, u16),
+     StartStopClicked,
+     RestartXRService,
+     XRServiceActiveChanged(bool, Option<Profile>, bool),
+@@ -381,7 +384,35 @@ impl AsyncComponent for MainView {
+ 
+         match message {
+             Self::Input::ClockTicking => {}
+-            Self::Input::ReloadPimaxEnv(env) => *self.pimax_env.borrow_mut() = env,
++            Self::Input::ReloadPimaxEnv(env, scale) => {
++                *self.pimax_init.env_vars.borrow_mut() = env;
++                self.pimax_init.scale_percentage = scale;
++                // Rebuild the settings pages so every row shows the current value.
++                let out = |msg| match msg {
++                    PimaxOutMsg::SetEnvVar(k, v) => MainViewOutMsg::SetEnvVar(k, v),
++                };
++                let headset = HeadsetPage::builder()
++                    .launch(self.pimax_init.clone())
++                    .forward(sender.output_sender(), out);
++                self.pimax_slots[0].set_child(Some(headset.widget()));
++                self._headset_page = headset;
++                let controllers = ControllersPage::builder()
++                    .launch(self.pimax_init.clone())
++                    .forward(sender.output_sender(), out);
++                self.pimax_slots[2].set_child(Some(controllers.widget()));
++                self._controllers_page = controllers;
++                // Keep a running eye tool alive: rebuilding would stop it. That page refreshes when it is idle.
++                if !self.eyetracking_page.model().is_running() {
++                    let eye = EyeTrackingPage::builder()
++                        .launch(self.pimax_init.clone())
++                        .forward(sender.output_sender(), out);
++                    eye.emit(EyeTrackingMsg::XRServiceActiveChanged(
++                        self.xrservice_active && self.xrservice_ready,
++                    ));
++                    self.pimax_slots[1].set_child(Some(eye.widget()));
++                    self.eyetracking_page = eye;
++                }
++            }
+             Self::Input::StartStopClicked => {
+                 sender
+                     .output(Self::Output::DoStartStopXRService)
+@@ -536,7 +567,6 @@ impl AsyncComponent for MainView {
+             env_vars: std::rc::Rc::new(std::cell::RefCell::new(init.config.global_preferences.env_vars.clone())),
+             scale_percentage: init.config.global_preferences.scale_percentage,
+         };
+-        let pimax_env = pimax_init.env_vars.clone();
+         let pimax_out = |msg| match msg {
+             PimaxOutMsg::SetEnvVar(k, v) => MainViewOutMsg::SetEnvVar(k, v),
+         };
+@@ -582,7 +612,8 @@ impl AsyncComponent for MainView {
+ 
+         let model = Self {
+             pimax_summary,
+-            pimax_env,
++            pimax_init: pimax_init.clone(),
++            pimax_slots: [init.headset_slot.clone(), init.eyetracking_slot.clone(), init.controllers_slot.clone()],
+             _headset_page: headset_page,
+             eyetracking_page,
+             _controllers_page: controllers_page,
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index 3014a71..1146451 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -20,6 +20,33 @@ pub enum PimaxOutMsg {
+     SetEnvVar(String, Option<String>),
+ }
+ 
++/// Options the driver re-reads while the service runs (from `live_settings_path()`), so no restart is needed.
++pub const LIVE_KEYS: &[&str] =
++    &["PIMAX_IPD_OFFSET_MM", "PIMAX_CANT_SCALE", "PIMAX_EYE_CALIB", "PIMAX_EYE_FLIP", "PIMAX_STICK_DEADZONE"];
++
++pub fn live_settings_path() -> Option<std::path::PathBuf> {
++    std::env::var_os("XDG_RUNTIME_DIR").map(|d| std::path::PathBuf::from(d).join("pimax-p3c/settings.json"))
++}
++
++/// Write the current value (or null = driver default) of every live key for the running driver.
++/// `env` is the environment the service gets (profile over global).
++pub fn write_live_settings(env: &HashMap<String, String>) {
++    let Some(path) = live_settings_path() else { return };
++    let map: serde_json::Map<String, serde_json::Value> = LIVE_KEYS
++        .iter()
++        .map(|k| (k.to_string(), env.get(*k).map(|v| serde_json::Value::String(v.clone())).unwrap_or(serde_json::Value::Null)))
++        .collect();
++    let res = (|| -> std::io::Result<()> {
++        std::fs::create_dir_all(path.parent().unwrap())?;
++        let tmp = path.with_extension("json.tmp");
++        std::fs::write(&tmp, serde_json::to_vec_pretty(&map)?)?;
++        std::fs::rename(&tmp, &path)
++    })();
++    if let Err(e) = res {
++        tracing::warn!("pimax: could not write {}: {e}", path.display());
++    }
++}
++
+ /// Init shared by all Pimax page components.
+ #[derive(Debug, Clone, Default)]
+ pub struct PimaxPageInit {
+diff --git a/src/ui/pimax_eye.rs b/src/ui/pimax_eye.rs
+index b056f74..7147b5d 100644
+--- a/src/ui/pimax_eye.rs
++++ b/src/ui/pimax_eye.rs
+@@ -101,6 +101,10 @@ pub struct EyeTrackingWidgets {
+ }
+ 
+ impl EyeTrackingPage {
++    pub fn is_running(&self) -> bool {
++        self.running.is_some()
++    }
++
+     fn state(&self) -> (&'static str, String, &'static str) {
+         let et = self.status.as_ref().and_then(|s| s.eye_tracking.clone());
+         let enabled = et.as_ref().and_then(|e| e.enabled).unwrap_or_else(|| self.ctx.bool_var("PIMAX_EYE_TRACKING", true));
+@@ -150,7 +154,7 @@ impl EyeTrackingPage {
+                 self.result = Some((
+                     true,
+                     format!(
+-                        "Calibration saved{}. Restart the session to apply it.",
++                        "Calibration saved and applied{}.",
+                         quality.map(|q| format!(" (error {q})")).unwrap_or_default()
+                     ),
+                 ));
+@@ -319,14 +323,14 @@ impl SimpleComponent for EyeTrackingPage {
+                     r.add_css_class("error");
+                 }
+             });
+-            e.set_tooltip_text(Some("Six numbers written by Recalibrate; clear to use the raw tracker output"));
++            e.set_tooltip_text(Some("Six numbers written by Recalibrate; clear to use the raw tracker output. Applies immediately"));
+             e
+         };
+         adv.add_row(&calib_entry);
+         adv.add_row(&ctx.choice_row(
+             "PIMAX_EYE_FLIP",
+             "Axis flip",
+-            "Raw axis mirroring before calibration; normally None (calibration handles it)",
++            "Raw axis mirroring before calibration; normally None (calibration handles it). Applies immediately",
+             &[("None", None), ("Horizontal (x)", Some("x")), ("Vertical (y)", Some("y")), ("Both (xy)", Some("xy"))],
+         ));
+         settings.add(&adv);
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 8dc9169..a884706 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -293,7 +293,7 @@ impl SimpleComponent for HeadsetPage {
+         ipd_group.add(&ctx.num_row(
+             "PIMAX_IPD_OFFSET_MM",
+             "Render IPD offset (mm)",
+-            "Added to the rendered eye distance only (world scale); 0 = none",
++            "Added to the rendered eye distance only (world scale); 0 = none. Applies immediately",
+             0.0,
+             -5.0,
+             5.0,
+@@ -351,7 +351,7 @@ impl SimpleComponent for HeadsetPage {
+         adv_group.add(&ctx.num_row(
+             "PIMAX_CANT_SCALE",
+             "View cant (%)",
+-            "Scales the outward rotation of the canted panels; 100 = as the headset reports",
++            "Scales the outward rotation of the canted panels; 100 = as the headset reports. Applies immediately",
+             100.0,
+             -100.0,
+             150.0,
+@@ -525,7 +525,7 @@ impl SimpleComponent for ControllersPage {
+         g.add(&ctx.num_row(
+             "PIMAX_STICK_DEADZONE",
+             "Thumbstick dead zone (%)",
+-            "Ignore small thumbstick movement; 0 = none",
++            "Ignore small thumbstick movement; 0 = none. Applies immediately",
+             0.0,
+             0.0,
+             50.0,
+-- 
+2.56.0
+

@@ -1,0 +1,109 @@
+From bda8f94a6159c516f1ea1ece099862e5b61c81ca Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:00:42 +0100
+Subject: [PATCH 02/28] st/oxr: XR_VARJO_foveated_rendering; do not parallelize
+ native inset views
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                      |  1 +
+ cmake/MonadoSetOptions.cmake                        |  1 +
+ src/xrt/include/xrt/xrt_config_build.h.cmake_in     |  1 +
+ .../oxr/extension_support/oxr_extension_support.py  |  1 +
+ src/xrt/state_trackers/oxr/oxr_session.c            |  7 +++++--
+ src/xrt/state_trackers/oxr/oxr_system.c             | 13 +++++++++++++
+ 6 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a9f212d22..47c03dec1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -426,6 +426,7 @@ option(XRT_FEATURE_OPENXR_PLANE_DETECTION "Enable XR_EXT_plane_detection" OFF)
+ option(XRT_FEATURE_OPENXR_USER_PRESENCE "Enable XR_EXT_user_presence" ON)
+ option(XRT_FEATURE_OPENXR_VIEW_CONFIGURATION_VIEWS_CHANGE "Enable XR_EXT_view_configuration_views_change" ON)
+ option(XRT_FEATURE_OPENXR_VARJO_QUAD_VIEWS "Enable XR_VARJO_quad_views" ON)
++option(XRT_FEATURE_OPENXR_VARJO_FOVEATED_RENDERING "Enable XR_VARJO_foveated_rendering" ON)
+ option(XRT_FEATURE_OPENXR_VISIBILITY_MASK "Enable XR_KHR_visibility_mask" ON)
+ option(XRT_FEATURE_OPENXR_VULKAN_SWAPCHAIN_FORMAT_LIST "Enable XR_KHR_vulkan_swapchain_format_list" ON)
+ option(XRT_FEATURE_OPENXR_XDEV_SPACE "Enable XR_MNDX_xdev_space" ON)
+diff --git a/cmake/MonadoSetOptions.cmake b/cmake/MonadoSetOptions.cmake
+index e23f9880c..ddc6bd4e4 100644
+--- a/cmake/MonadoSetOptions.cmake
++++ b/cmake/MonadoSetOptions.cmake
+@@ -172,6 +172,7 @@ function(monado_set_options)
+ 		XRT_FEATURE_OPENXR_USER_PRESENCE
+ 		XRT_FEATURE_OPENXR_VIEW_CONFIGURATION_VIEWS_CHANGE
+ 		XRT_FEATURE_OPENXR_VARJO_QUAD_VIEWS
++		XRT_FEATURE_OPENXR_VARJO_FOVEATED_RENDERING
+ 		XRT_FEATURE_OPENXR_VISIBILITY_MASK
+ 		XRT_FEATURE_OPENXR_VULKAN_SWAPCHAIN_FORMAT_LIST
+ 		XRT_FEATURE_OPENXR_XDEV_SPACE
+diff --git a/src/xrt/include/xrt/xrt_config_build.h.cmake_in b/src/xrt/include/xrt/xrt_config_build.h.cmake_in
+index c05b71d33..1305464d3 100644
+--- a/src/xrt/include/xrt/xrt_config_build.h.cmake_in
++++ b/src/xrt/include/xrt/xrt_config_build.h.cmake_in
+@@ -106,6 +106,7 @@
+ #cmakedefine XRT_FEATURE_OPENXR_SPACE_UNBOUNDED
+ #cmakedefine XRT_FEATURE_OPENXR_USER_PRESENCE
+ #cmakedefine XRT_FEATURE_OPENXR_VARJO_QUAD_VIEWS
++#cmakedefine XRT_FEATURE_OPENXR_VARJO_FOVEATED_RENDERING
+ #cmakedefine XRT_FEATURE_OPENXR_VIEW_CONFIGURATION_VIEWS_CHANGE
+ #cmakedefine XRT_FEATURE_OPENXR_VISIBILITY_MASK
+ #cmakedefine XRT_FEATURE_OPENXR_VULKAN_SWAPCHAIN_FORMAT_LIST
+diff --git a/src/xrt/state_trackers/oxr/extension_support/oxr_extension_support.py b/src/xrt/state_trackers/oxr/extension_support/oxr_extension_support.py
+index fa26afab5..b02860e19 100644
+--- a/src/xrt/state_trackers/oxr/extension_support/oxr_extension_support.py
++++ b/src/xrt/state_trackers/oxr/extension_support/oxr_extension_support.py
+@@ -118,6 +118,7 @@ EXTENSIONS = (
+     ['XR_MSFT_unbounded_reference_space', 'XRT_FEATURE_OPENXR_SPACE_UNBOUNDED'],
+     ['XR_OPPO_controller_interaction', 'XRT_FEATURE_OPENXR_INTERACTION_OPPO'],
+     ['XR_VARJO_quad_views', 'XRT_FEATURE_OPENXR_VARJO_QUAD_VIEWS'],
++    ['XR_VARJO_foveated_rendering', 'XRT_FEATURE_OPENXR_VARJO_FOVEATED_RENDERING'],
+     # Experimental extensions, sorted alphabetically.
+     ['XR_EXTX_overlay', 'XRT_FEATURE_OPENXR_OVERLAY'],
+     ['XR_HTCX_vive_tracker_interaction', 'ALWAYS_DISABLED'],
+diff --git a/src/xrt/state_trackers/oxr/oxr_session.c b/src/xrt/state_trackers/oxr/oxr_session.c
+index 3e4051150..dc18af6c0 100644
+--- a/src/xrt/state_trackers/oxr/oxr_session.c
++++ b/src/xrt/state_trackers/oxr/oxr_session.c
+@@ -962,8 +962,11 @@ oxr_session_locate_views(struct oxr_logger *log,
+ 
+ 		struct xrt_pose view_pose = data.poses[i];
+ 
+-		bool parallelize_views =
+-		    sess->sys->inst->quirks.parallel_views && !math_quat_is_identity(&view_pose.orientation, 0.0001f);
++		// Native inset views (views 2-3 from a device with get_views_quad) are already expressed in head space,
++		// possibly steered by eye tracking, so they must not be parallelized (that would reset their orientation).
++		bool native_inset = xdev->supported.get_views_quad && i >= 2;
++		bool parallelize_views = sess->sys->inst->quirks.parallel_views && !native_inset &&
++		                         !math_quat_is_identity(&view_pose.orientation, 0.0001f);
+ 
+ 		if (parallelize_views) {
+ 			view_pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+diff --git a/src/xrt/state_trackers/oxr/oxr_system.c b/src/xrt/state_trackers/oxr/oxr_system.c
+index bbf2f3869..c8c3d639e 100644
+--- a/src/xrt/state_trackers/oxr/oxr_system.c
++++ b/src/xrt/state_trackers/oxr/oxr_system.c
+@@ -893,6 +893,19 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
+ 	}
+ #endif
+ 
++#ifdef OXR_HAVE_VARJO_foveated_rendering
++	// Foveated rendering = quad views whose inset follows the eye gaze (done by the eyes device / driver).
++	XrSystemFoveatedRenderingPropertiesVARJO *foveated_props = NULL;
++	if (sys->inst->extensions.VARJO_foveated_rendering) {
++		foveated_props = OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_SYSTEM_FOVEATED_RENDERING_PROPERTIES_VARJO,
++		                                           XrSystemFoveatedRenderingPropertiesVARJO);
++	}
++
++	if (foveated_props) {
++		foveated_props->supportsFoveatedRendering = oxr_system_get_eye_gaze_support(log, sys->inst);
++	}
++#endif
++
+ #ifdef OXR_HAVE_MNDX_force_feedback_curl
+ 	XrSystemForceFeedbackCurlPropertiesMNDX *force_feedback_props = NULL;
+ 	if (sys->inst->extensions.MNDX_force_feedback_curl) {
+-- 
+2.56.0
+

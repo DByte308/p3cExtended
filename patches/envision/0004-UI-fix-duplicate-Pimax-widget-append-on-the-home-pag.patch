@@ -1,0 +1,25 @@
+From 0b6e3dfbb4beb0d0af357657aee6ea0c991b9c28 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:22:18 +0100
+Subject: [PATCH 04/13] UI: fix duplicate Pimax widget append on the home page
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/main_view.rs | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/src/ui/main_view.rs b/src/ui/main_view.rs
+index dbbada4..be2672a 100644
+--- a/src/ui/main_view.rs
++++ b/src/ui/main_view.rs
+@@ -312,7 +312,6 @@ impl AsyncComponent for MainView {
+                         },
+ 
+                         model.steam_launch_options_box.widget(),
+-                        model.pimax_box.widget(),
+                         model.steamvr_calibration_box.widget(),
+                         model.openhmd_calibration_box.widget(),
+ 
+-- 
+2.56.0
+

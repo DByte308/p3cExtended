@@ -1,0 +1,59 @@
+From 55c31948b4fe984a90481bae41d9c10d0d240918 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:41:37 +0100
+Subject: [PATCH 15/28] t/slam, d/pimax_p3c: SLAM_EUROC_RECORD and
+ PIMAX_BASALT_SAVE for offline replay
+
+SLAM_EUROC_RECORD=<dir> records a EuRoC dataset of everything the SLAM
+tracker receives from the start (the recorder was only reachable from the
+debug UI). PIMAX_BASALT_SAVE=<dir> keeps a copy of the generated Basalt
+config, which is otherwise deleted after loading. Together they allow
+replaying a session with monado-cli slambatch (keep stdin open: it quits
+on EOF).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/auxiliary/tracking/t_tracker_slam.cpp       |  4 +++-
+ src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs | 11 +++++++++++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/auxiliary/tracking/t_tracker_slam.cpp b/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
+index a1d7bca41..9a60270fe 100644
+--- a/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
++++ b/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
+@@ -1616,7 +1616,9 @@ t_slam_create(struct xrt_frame_context *xfctx,
+ 
+ 	xrt_frame_context_add(xfctx, &t.node);
+ 
+-	t.euroc_recorder = euroc_recorder_create(xfctx, NULL, t.cam_count, IMU_COUNT, false);
++	// SLAM_EUROC_RECORD=<dir>: record a EuRoC dataset of everything the tracker receives, from the start.
++	const char *euroc_path = getenv("SLAM_EUROC_RECORD");
++	t.euroc_recorder = euroc_recorder_create(xfctx, euroc_path, t.cam_count, IMU_COUNT, euroc_path != NULL);
+ 
+ 	t.last_imu_ts = INT64_MIN;
+ 	t.last_cam_ts = vector<timepoint_ns>(t.cam_count, INT64_MIN);
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs b/src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs
+index 3592cefcb..9809e59ad 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs
+@@ -25,6 +25,17 @@ impl ConfigFiles {
+         fs::write(&vio_path, VIO_CONFIG)?;
+         fs::write(&unified_path, format!("cam-calib = {calib_path:?}\nconfig-path = {vio_path:?}\n"))?;
+ 
++        // PIMAX_BASALT_SAVE=<dir>: keep a copy of the generated Basalt config (for replaying EuRoC recordings).
++        if let Some(save) = std::env::var_os("PIMAX_BASALT_SAVE") {
++            let save = PathBuf::from(save);
++            let _ = fs::create_dir_all(&save);
++            let _ = fs::copy(&calib_path, save.join("calibration.json"));
++            let _ = fs::copy(&vio_path, save.join("vio_config.json"));
++            let _ = fs::write(
++                save.join("basalt.toml"),
++                format!("cam-calib = {:?}\nconfig-path = {:?}\n", save.join("calibration.json"), save.join("vio_config.json")),
++            );
++        }
+         files.unified = CString::new(unified_path.into_os_string().into_encoded_bytes()).map_err(io::Error::other)?;
+         Ok(files)
+     }
+-- 
+2.56.0
+

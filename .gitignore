@@ -1,0 +1,10 @@
+# upstream checkouts, build trees and machine-specific snapshots stay local
+/src/
+/build/
+/baseline/
+*.bin
+*.csv
+*.log
+captures/
+__pycache__/
+/notes/

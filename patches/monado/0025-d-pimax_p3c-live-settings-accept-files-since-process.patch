@@ -1,0 +1,86 @@
+From 4ed183dc4697971195efbab53eca8d5709d33fbd Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:40:31 +0100
+Subject: [PATCH 25/28] d/pimax_p3c: live settings: accept files since process
+ start, report support
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/pimax_p3c/src/device/eye.rs   |  4 +++-
+ .../src/device/session/status_file.rs         |  2 ++
+ src/xrt/drivers/pimax_p3c/src/live.rs         | 20 +++++++++++++++----
+ 3 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/eye.rs b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+index 10d30391c..26cb91ded 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/eye.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+@@ -456,7 +456,9 @@ pub fn calib_coeffs() -> Option<[f32; 6]> {
+             }
+         }
+     });
+-    info!("eye calibration: {parsed:?}");
++    if cache.is_none_or(|(_, old)| old != parsed) {
++        info!("eye calibration: {parsed:?}");
++    }
+     *cache = Some((generation, parsed));
+     parsed
+ }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
+index 35e268f5c..6f30d830a 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
+@@ -89,6 +89,8 @@ impl StatusFile {
+                 "calib": crate::device::eye::calib_coeffs(),
+             },
+             "foveation": option_bool("PIMAX_FOVEATION", true),
++            // This driver re-reads settings.json (crate::live), so Envision can skip the restart for live options.
++            "live_settings": true,
+             "fov_percent": (crate::device::hmd::views::fov_scale() * 100.0).round(),
+             "controllers": {
+                 "left": controller(Hand::Left),
+diff --git a/src/xrt/drivers/pimax_p3c/src/live.rs b/src/xrt/drivers/pimax_p3c/src/live.rs
+index 9357c2a40..d02fa4d52 100644
+--- a/src/xrt/drivers/pimax_p3c/src/live.rs
++++ b/src/xrt/drivers/pimax_p3c/src/live.rs
+@@ -1,8 +1,9 @@
+ //! Options that can change while the service runs.
+ //!
+ //! Envision writes `$XDG_RUNTIME_DIR/pimax-p3c/settings.json` (`{"NAME": "value" | null}`) when one of these options
+-//! changes. A file older than this driver instance is ignored, so a stale file from an earlier session never
+-//! overrides the environment the service was started with. A key in the file wins over the environment; `null`
++//! changes. A file older than this service process is ignored, so a stale file from an earlier session never
++//! overrides the environment the service was started with; an edit made while the service was starting up (after its
++//! environment was fixed) still counts. A key in the file wins over the environment; `null`
+ //! means "unset" (driver default). Keys not in the file come from the environment.
+ 
+ use std::collections::HashMap;
+@@ -21,12 +22,23 @@ struct State {
+ static STATE: LazyLock<Mutex<State>> =
+     LazyLock::new(|| Mutex::new(State { last_check: None, mtime: None, map: HashMap::new(), generation: 0 }));
+ 
++/// Start time of this process (from /proc: start ticks after boot vs uptime; /proc uses USER_HZ = 100).
++fn process_start() -> Option<SystemTime> {
++    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
++    // Field 22 (starttime), counted after the ")" that ends the command name.
++    let start_ticks: f64 = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()?;
++    let uptime: f64 = std::fs::read_to_string("/proc/uptime").ok()?.split_whitespace().next()?.parse().ok()?;
++    let age = (uptime - start_ticks / 100.0).max(0.0);
++    SystemTime::now().checked_sub(Duration::from_secs_f64(age))
++}
++
+ fn started() -> SystemTime {
+     static T: OnceLock<SystemTime> = OnceLock::new();
+-    *T.get_or_init(SystemTime::now)
++    // 1 s margin for the coarse tick resolution; the env of a process can't change after exec anyway.
++    *T.get_or_init(|| process_start().map(|t| t - Duration::from_secs(1)).unwrap_or_else(SystemTime::now))
+ }
+ 
+-/// Call once at driver start-up: files written before this moment are ignored.
++/// Call once at driver start-up.
+ pub fn init() {
+     started();
+ }
+-- 
+2.56.0
+

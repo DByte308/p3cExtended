@@ -1,0 +1,2 @@
+# Tobii EyeChip inside the Pimax Crystal (2104:0220): allow members of 'users' to open it without root.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2104", ATTRS{idProduct}=="0220", MODE="0660", GROUP="users", TAG+="uaccess"

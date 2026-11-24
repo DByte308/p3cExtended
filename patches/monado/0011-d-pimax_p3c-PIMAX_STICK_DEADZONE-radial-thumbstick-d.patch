@@ -1,0 +1,103 @@
+From 59bfbce341ce6888e6f86c9d803d84f1b091b96e Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:07:57 +0100
+Subject: [PATCH 11/28] d/pimax_p3c: PIMAX_STICK_DEADZONE radial thumbstick
+ deadzone
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/controller/inputs.rs | 73 ++++++++++++++++++-
+ 1 file changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/controller/inputs.rs b/src/xrt/drivers/pimax_p3c/src/device/controller/inputs.rs
+index a792380f9..a54037fc8 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/controller/inputs.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/controller/inputs.rs
+@@ -18,6 +18,35 @@ pub const GRIP_POSE: usize = 12;
+ pub const AIM_POSE: usize = 13;
+ pub const COUNT: usize = 14;
+ 
++const DEADZONE_ENV: &str = "PIMAX_STICK_DEADZONE";
++
++/// Percent, 0..=50; read once.
++fn deadzone() -> f32 {
++    static DEADZONE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    *DEADZONE.get_or_init(|| {
++        let pct = crate::util::option_num(DEADZONE_ENV, 0);
++        if !(0..=50).contains(&pct) {
++            warn!("{DEADZONE_ENV}={pct}: need 0..50 percent; clamping");
++        }
++        pct.clamp(0, 50) as f32 / 100.0
++    })
++}
++
++/// Radial deadzone: zero inside `deadzone` (fraction of full deflection), rescaled so the magnitude runs 0..1
++/// from the deadzone edge to full deflection; direction is preserved.
++pub fn apply_deadzone(stick: [f32; 2], deadzone: f32) -> [f32; 2] {
++    let magnitude = stick[0].hypot(stick[1]);
++    if deadzone <= 0.0 || magnitude <= 0.0 {
++        return stick;
++    }
++    if magnitude <= deadzone {
++        return [0.0, 0.0];
++    }
++    let scaled = ((magnitude - deadzone) / (1.0 - deadzone)).min(1.0);
++    let k = scaled / magnitude;
++    [stick[0] * k, stick[1] * k]
++}
++
+ pub type Inputs = [xrt_input; COUNT];
+ 
+ pub fn names(hand: Hand) -> [xrt_input_name; COUNT] {
+@@ -76,8 +105,44 @@ pub fn apply(inputs: &mut Inputs, status: &ControllerStatus, timestamp_ns: i64)
+     set_f32(TRIGGER_VALUE, status.trigger);
+ 
+     inputs[THUMBSTICK].timestamp = timestamp_ns;
+-    inputs[THUMBSTICK].value.vec2 = xrt_vec2 {
+-        x: status.thumbstick[0],
+-        y: status.thumbstick[1],
+-    };
++    let [x, y] = apply_deadzone(status.thumbstick, deadzone());
++    inputs[THUMBSTICK].value.vec2 = xrt_vec2 { x, y };
++}
++
++#[cfg(test)]
++mod tests {
++    use super::apply_deadzone;
++
++    fn close(a: [f32; 2], b: [f32; 2]) -> bool {
++        (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5
++    }
++
++    #[test]
++    fn zero_deadzone_is_identity() {
++        assert_eq!(apply_deadzone([0.3, -0.4], 0.0), [0.3, -0.4]);
++    }
++
++    #[test]
++    fn inside_is_zero() {
++        assert_eq!(apply_deadzone([0.05, 0.05], 0.2), [0.0, 0.0]);
++        assert_eq!(apply_deadzone([0.2, 0.0], 0.2), [0.0, 0.0]);
++    }
++
++    #[test]
++    fn full_deflection_stays_full() {
++        assert!(close(apply_deadzone([1.0, 0.0], 0.3), [1.0, 0.0]));
++        assert!(close(apply_deadzone([0.0, -1.0], 0.5), [0.0, -1.0]));
++    }
++
++    #[test]
++    fn rescales_radially_keeping_direction() {
++        // magnitude 0.6, deadzone 0.2 -> (0.6-0.2)/0.8 = 0.5
++        assert!(close(apply_deadzone([0.36, 0.48], 0.2), [0.3, 0.4]));
++    }
++
++    #[test]
++    fn corners_are_clamped() {
++        let [x, y] = apply_deadzone([1.0, 1.0], 0.1);
++        assert!((x.hypot(y) - 1.0).abs() < 1e-5);
++    }
+ }
+-- 
+2.56.0
+

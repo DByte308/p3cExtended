@@ -1,0 +1,143 @@
+From 1723d9385a1d068ac8c776aef4b1d05d899148f6 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:00:53 +0100
+Subject: [PATCH 03/28] st/steamvr_drv: publish eye tracking (/eyetracking)
+ from the eyes device
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../steamvr_drv/ovrd_driver.cpp               | 63 ++++++++++++++++++-
+ 1 file changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp b/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
+index 45bd020b0..e83db53cd 100644
+--- a/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
++++ b/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
+@@ -1134,7 +1134,8 @@ private:
+ class CDeviceDriver_Monado : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponent
+ {
+ public:
+-	CDeviceDriver_Monado(struct xrt_instance *xinst, struct xrt_device *xdev) : m_xdev(xdev)
++	CDeviceDriver_Monado(struct xrt_instance *xinst, struct xrt_device *xdev, struct xrt_device *xeyes = NULL)
++	    : m_xdev(xdev), m_xeyes(xeyes)
+ 	{
+ 		//! @todo latency
+ 		m_flSecondsFromVsyncToPhotons = 0.011f;
+@@ -1194,6 +1195,10 @@ public:
+ 
+ private:
+ 	struct xrt_device *m_xdev = NULL;
++	// Optional eye tracking device (role "eyes"); gaze is published as SteamVR's /eyetracking component.
++	struct xrt_device *m_xeyes = NULL;
++	vr::VRInputComponentHandle_t m_eyeComponent = vr::k_ulInvalidInputComponentHandle;
++	void UpdateEyeTracking();
+ 
+ 	// clang-format off
+ 
+@@ -1237,12 +1242,17 @@ void
+ CDeviceDriver_Monado::PoseUpdateThreadFunction()
+ {
+ 	ovrd_log("Starting HMD pose update thread\n");
++	int eye_tick = 0;
+ 
+ 	while (m_poseUpdating) {
+ 		//! @todo figure out the best pose update rate
+ 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+ 		vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_trackedDeviceIndex, GetPose(),
+ 		                                                   sizeof(vr::DriverPose_t));
++		if (m_eyeComponent != vr::k_ulInvalidInputComponentHandle && ++eye_tick >= 10) {
++			eye_tick = 0;
++			UpdateEyeTracking();
++		}
+ 	}
+ 	ovrd_log("Stopping HMD pose update thread\n");
+ }
+@@ -1263,6 +1273,10 @@ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
+ 	vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_TrackingSystemName_String, "monado");
+ 	vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ManufacturerName_String, "Monado");
+ 	vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ModelNumber_String, m_xdev->str);
++	if (m_xeyes != NULL) {
++		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_InputProfilePath_String, "{monado}/input/monado_hmd_profile.json");
++		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_SupportsXrEyeGazeInteraction_Bool, true);
++	}
+ 	vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_UserIpdMeters_Float, m_flIPD);
+ 	vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_UserHeadToEyeDepthMeters_Float, 0.f);
+ 	vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_DisplayFrequency_Float, m_flDisplayFrequency);
+@@ -1286,6 +1300,18 @@ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
+ 	vr::VRServerDriverHost()->SetDisplayEyeToHead(m_trackedDeviceIndex, left, right);
+ 
+ 
++	if (m_xeyes != NULL && m_xeyes->supported.eye_gaze) {
++		vr::EVRInputError e = vr::VRDriverInput()->CreateEyeTrackingComponent(m_ulPropertyContainer, "/eyetracking",
++		                                                                      &m_eyeComponent);
++		if (e == vr::VRInputError_None) {
++			xrt_result_t xret = xrt_device_begin_feature(m_xeyes, XRT_DEVICE_FEATURE_EYE_TRACKING);
++			ovrd_log("Eye tracking component created, begin_feature -> %d\n", (int)xret);
++		} else {
++			ovrd_log("CreateEyeTrackingComponent failed: %d\n", (int)e);
++			m_eyeComponent = vr::k_ulInvalidInputComponentHandle;
++		}
++	}
++
+ 	m_poseUpdateThread = new std::thread(&CDeviceDriver_Monado::PoseUpdateThreadFunction, this);
+ 	if (!m_poseUpdateThread) {
+ 		ovrd_log("Unable to create pose updated thread for %s\n", m_xdev->str);
+@@ -1300,6 +1326,10 @@ CDeviceDriver_Monado::Deactivate()
+ {
+ 	m_poseUpdating = false;
+ 	m_poseUpdateThread->join();
++	if (m_eyeComponent != vr::k_ulInvalidInputComponentHandle && m_xeyes != NULL) {
++		xrt_device_end_feature(m_xeyes, XRT_DEVICE_FEATURE_EYE_TRACKING);
++		m_eyeComponent = vr::k_ulInvalidInputComponentHandle;
++	}
+ 	ovrd_log("Deactivate\n");
+ }
+ 
+@@ -1321,6 +1351,35 @@ CDeviceDriver_Monado::GetComponent(const char *pchComponentNameAndVersion)
+ 	return NULL;
+ }
+ 
++void
++CDeviceDriver_Monado::UpdateEyeTracking()
++{
++	// The eyes device returns head pose composed with the gaze rotation (tracking-origin space); SteamVR wants the
++	// gaze in head space, so remove the head orientation again.
++	timepoint_ns now_ns = os_monotonic_get_ns();
++	struct xrt_space_relation gaze = XRT_SPACE_RELATION_ZERO, head = XRT_SPACE_RELATION_ZERO;
++	xrt_device_get_tracked_pose(m_xeyes, XRT_INPUT_GENERIC_EYE_GAZE_POSE, now_ns, &gaze);
++	xrt_device_get_tracked_pose(m_xdev, XRT_INPUT_GENERIC_HEAD_POSE, now_ns, &head);
++
++	vr::VREyeTrackingData_t data = {};
++	data.bActive = true;
++	bool valid = (gaze.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0;
++	data.bValid = valid;
++	data.bTracked = valid;
++	if (valid) {
++		struct xrt_quat head_inv;
++		math_quat_invert(&head.pose.orientation, &head_inv);
++		struct xrt_quat q;
++		math_quat_rotate(&head_inv, &gaze.pose.orientation, &q);
++		struct xrt_vec3 forward = {0.f, 0.f, -1.f}, dir;
++		math_quat_rotate_vec3(&q, &forward, &dir);
++		// Cyclopean origin at the head centre; fixation point 2 m along the gaze ray.
++		data.vGazeOrigin = {0.f, 0.f, 0.f};
++		data.vGazeTarget = {dir.x * 2.f, dir.y * 2.f, dir.z * 2.f};
++	}
++	vr::VRDriverInput()->UpdateEyeTrackingComponent(m_eyeComponent, &data, 0.0);
++}
++
+ void
+ CDeviceDriver_Monado::DebugRequest(const char *pchRequest, char *pchResponseBuffer, uint32_t unResponseBufferSize)
+ {
+@@ -1591,7 +1650,7 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
+ 	m_xhmd = m_xsysd->static_roles.head;
+ 
+ 	ovrd_log("Selected HMD %s\n", m_xhmd->str);
+-	m_MonadoDeviceDriver = new CDeviceDriver_Monado(m_xinst, m_xhmd);
++	m_MonadoDeviceDriver = new CDeviceDriver_Monado(m_xinst, m_xhmd, m_xsysd->static_roles.eyes);
+ 	//! @todo provide a serial number
+ 	vr::VRServerDriverHost()->TrackedDeviceAdded(m_xhmd->str, vr::TrackedDeviceClass_HMD, m_MonadoDeviceDriver);
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,132 @@
+From c28c08c2d22094550e4fba8ebcfd5ef5b774e0e1 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:42:25 +0100
+Subject: [PATCH 09/13] Pimax pages: foveation detail, FOV level and advanced
+ rows
+
+Eye Tracking: sharp area size, sharp area resolution, periphery resolution.
+Headset: field-of-view level; Advanced group with lens centre distance,
+view cant, lighthouse faceplate and a headset-view capture switch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/pimax_eye.rs   | 33 ++++++++++++++++++++++++++++
+ src/ui/pimax_pages.rs | 51 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 84 insertions(+)
+
+diff --git a/src/ui/pimax_eye.rs b/src/ui/pimax_eye.rs
+index fa52a94..5f01b62 100644
+--- a/src/ui/pimax_eye.rs
++++ b/src/ui/pimax_eye.rs
+@@ -236,6 +236,39 @@ impl SimpleComponent for EyeTrackingPage {
+             "Apps that support XR_VARJO_quad_views render a sharp inset where you look",
+             true,
+         ));
++        // Foveation detail: level presets, plus the three values behind them.
++        let fov_detail = adw::ExpanderRow::builder()
++            .title("Foveation detail")
++            .subtitle("Size and sharpness of the sharp area, resolution of the periphery")
++            .build();
++        fov_detail.add_row(&ctx.num_row(
++            "XRT_FOVEATION_INSET_DEG",
++            "Sharp area size (\u{b0})",
++            "Width of the area that follows your gaze; larger hides the edge better, costs more",
++            40.0,
++            20.0,
++            80.0,
++            5.0,
++        ));
++        fov_detail.add_row(&ctx.num_row(
++            "XRT_FOVEATION_INSET_DENSITY_PERCENT",
++            "Sharp area resolution (%)",
++            "100 = the panel's native sharpness; above 100 supersamples where you look",
++            100.0,
++            50.0,
++            200.0,
++            10.0,
++        ));
++        fov_detail.add_row(&ctx.num_row(
++            "XRT_FOVEATION_CONTEXT_PERCENT",
++            "Periphery resolution (%)",
++            "Resolution outside the sharp area; lower saves the most GPU time",
++            100.0,
++            25.0,
++            100.0,
++            5.0,
++        ));
++        settings.add(&fov_detail);
+         let adv = adw::ExpanderRow::builder().title("Advanced").subtitle("Calibration value and axis flip").build();
+         let calib_entry = {
+             let c = ctx.clone();
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 5b38fc0..1848abf 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -213,6 +213,17 @@ impl SimpleComponent for HeadsetPage {
+             200.0,
+             5.0,
+         ));
++        display.add(&ctx.choice_row(
++            "PIMAX_FOV_PERCENT",
++            "Field of view",
++            "A smaller FOV renders fewer pixels at the same sharpness",
++            &[
++                ("Large (100 %)", None),
++                ("Normal (90 %)", Some("90")),
++                ("Small (80 %)", Some("80")),
++                ("Potato (65 %)", Some("65")),
++            ],
++        ));
+         display.add(&ctx.choice_row(
+             "PIMAX_GPU",
+             "GPU",
+@@ -282,6 +293,46 @@ impl SimpleComponent for HeadsetPage {
+         ));
+         content.append(&trk);
+ 
++        // Advanced
++        let adv_group = group("Advanced", Some("Expert settings; the defaults are tuned for the Crystal Super."));
++        adv_group.add(&ctx.num_row(
++            "PIMAX_LENS_SEP_MM",
++            "Lens centre distance (mm)",
++            "Distortion centre spacing; change only if both eyes don't fuse",
++            68.81,
++            60.0,
++            76.0,
++            0.05,
++        ));
++        adv_group.add(&ctx.num_row(
++            "PIMAX_CANT_SCALE",
++            "View cant (%)",
++            "Scales the outward rotation of the canted panels; 100 = as the headset reports",
++            100.0,
++            -100.0,
++            150.0,
++            5.0,
++        ));
++        adv_group.add(&ctx.bool_row(
++            "PIMAX_LIGHTHOUSE",
++            "Lighthouse faceplate",
++            "Use base-station tracking when a lighthouse faceplate dongle is plugged in",
++            true,
++        ));
++        let view_dir = gtk::glib::home_dir().join(".cache/pimax-linux/view");
++        let capture = {
++            let c = ctx.clone();
++            let dir = view_dir.to_string_lossy().to_string();
++            super::preference_rows::switch_row(
++                "Capture headset view",
++                Some(&format!("Debug: saves about 5 images per second of the left eye to {dir}; costs some GPU time")),
++                ctx.get("XRT_MIRROR_DUMP").is_some(),
++                move |_, on| c.set("XRT_MIRROR_DUMP", on.then(|| dir.clone())),
++            )
++        };
++        adv_group.add(&capture);
++        content.append(&adv_group);
++
+         spawn_poll(sender.input_sender(), || HeadsetMsg::Poll);
+         ComponentParts {
+             model: Self { status: read_status() },
+-- 
+2.56.0
+

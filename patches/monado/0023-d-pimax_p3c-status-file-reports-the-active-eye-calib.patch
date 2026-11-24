@@ -1,0 +1,45 @@
+From 7756f57a85495a9270a3aae3982f2e09a9286871 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:00:32 +0100
+Subject: [PATCH 23/28] d/pimax_p3c: status file reports the active eye
+ calibration
+
+Envision fits a recalibration on top of it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/pimax_p3c/src/device/eye.rs                 | 2 +-
+ src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs | 4 +++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/eye.rs b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+index e82831520..183c8300f 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/eye.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/eye.rs
+@@ -436,7 +436,7 @@ unsafe extern "C" fn eye_get_tracked_pose(
+ /// `PIMAX_EYE_CALIB="ay,by,cy,ap,bp,cp"`: affine map in degrees from the measured gaze angles to the true ones,
+ /// `yaw = ay*m_yaw + by*m_pitch + cy`, `pitch = ap*m_yaw + bp*m_pitch + cp` (yaw + right, pitch + up, head frame).
+ /// Fitted by `tools/xrgaze/xrcalib` + `tools/xrgaze/fit_calib.py`. Unset or malformed: no correction.
+-fn calib_coeffs() -> Option<[f32; 6]> {
++pub fn calib_coeffs() -> Option<[f32; 6]> {
+     static C: std::sync::OnceLock<Option<[f32; 6]>> = std::sync::OnceLock::new();
+     *C.get_or_init(|| {
+         let s = option_str("PIMAX_EYE_CALIB")?;
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
+index 834c25665..278a7ac42 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status_file.rs
+@@ -84,7 +84,9 @@ impl StatusFile {
+             "ipd_mm": ipd_mm,
+             "eye_tracking": {
+                 "enabled": option_bool("PIMAX_EYE_TRACKING", true),
+-                "calibrated": option_str("PIMAX_EYE_CALIB").is_some(),
++                "calibrated": crate::device::eye::calib_coeffs().is_some(),
++                // The correction actually applied (parsed PIMAX_EYE_CALIB); a recalibration is fitted on top of it.
++                "calib": crate::device::eye::calib_coeffs(),
+             },
+             "foveation": option_bool("PIMAX_FOVEATION", true),
+             "fov_percent": (crate::device::hmd::views::fov_scale() * 100.0).round(),
+-- 
+2.56.0
+

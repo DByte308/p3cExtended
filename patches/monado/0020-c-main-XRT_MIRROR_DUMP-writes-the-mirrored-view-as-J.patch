@@ -1,0 +1,110 @@
+From 2c373772de911f4e3a7fea2e4cfd51f9c079540a Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:41:07 +0100
+Subject: [PATCH 20/28] c/main: XRT_MIRROR_DUMP writes the mirrored view as
+ JPGs
+
+Turns on the debug-GUI readback without the GUI and writes about five
+left-eye frames per second to the given directory, so what the user saw
+can be checked afterwards. Diagnostic: disables the fast path and encodes
+on the compositor thread.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../main/comp_mirror_to_debug_gui.c           | 59 ++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/compositor/main/comp_mirror_to_debug_gui.c b/src/xrt/compositor/main/comp_mirror_to_debug_gui.c
+index 6a57d7b1b..bb9f0ec43 100644
+--- a/src/xrt/compositor/main/comp_mirror_to_debug_gui.c
++++ b/src/xrt/compositor/main/comp_mirror_to_debug_gui.c
+@@ -18,6 +18,58 @@
+ 
+ #include "render/render_interface.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#define STB_IMAGE_WRITE_STATIC
++#define STB_IMAGE_WRITE_IMPLEMENTATION
++#include "../../../external/stb/stb_image_write.h"
++
++/*!
++ * XRT_MIRROR_DUMP=<dir>: write the mirrored left-eye view as JPGs (about 5 per second) to <dir>, so a session can be
++ * looked at afterwards without the debug GUI.
++ */
++static const char *
++mirror_dump_dir(void)
++{
++	static const char *dir = NULL;
++	static bool read = false;
++	if (!read) {
++		read = true;
++		dir = getenv("XRT_MIRROR_DUMP");
++		if (dir != NULL && dir[0] == '\0') {
++			dir = NULL;
++		}
++		if (dir != NULL) {
++			mkdir(dir, 0755);
++		}
++	}
++	return dir;
++}
++
++static void
++mirror_dump_frame(struct xrt_frame *frame)
++{
++	const char *dir = mirror_dump_dir();
++	if (dir == NULL) {
++		return;
++	}
++	char path[1024];
++	snprintf(path, sizeof(path), "%s/%015lld.jpg", dir, (long long)frame->timestamp);
++	size_t row = (size_t)frame->width * 4;
++	uint8_t *packed = malloc(row * frame->height);
++	if (packed == NULL) {
++		return;
++	}
++	for (uint32_t y = 0; y < frame->height; y++) {
++		memcpy(packed + y * row, frame->data + y * frame->stride, row);
++	}
++	stbi_write_jpg(path, (int)frame->width, (int)frame->height, 4, packed, 70);
++	free(packed);
++}
++
+ 
+ /*
+  *
+@@ -381,6 +433,10 @@ comp_mirror_add_debug_vars(struct comp_mirror_to_debug_gui *m, struct comp_compo
+ {
+ 	// Reset state.
+ 	m->push_every_frame_out_of_X = 2;
++	if (mirror_dump_dir() != NULL) {
++		c->mirroring_to_debug_gui = true;
++		m->push_every_frame_out_of_X = 18;
++	}
+ 
+ 	// Init widget.
+ 	u_frame_times_widget_init(&m->push_frame_times, 0.f, 0.f);
+@@ -420,7 +476,7 @@ comp_mirror_is_ready_and_active(struct comp_mirror_to_debug_gui *m,
+                                 struct comp_compositor *c,
+                                 uint64_t predicted_display_time_ns)
+ {
+-	if (!c->mirroring_to_debug_gui || !u_sink_debug_is_active(&m->debug_sink)) {
++	if (!c->mirroring_to_debug_gui || (!u_sink_debug_is_active(&m->debug_sink) && mirror_dump_dir() == NULL)) {
+ 		return false;
+ 	}
+ 
+@@ -676,6 +732,7 @@ comp_mirror_do_blit(struct comp_mirror_to_debug_gui *m,
+ 	wrap = NULL;
+ 
+ 	u_sink_debug_push_frame(&m->debug_sink, frame);
++	mirror_dump_frame(frame);
+ 
+ 	u_frame_times_widget_push_sample(&m->push_frame_times, predicted_display_time_ns);
+ 
+-- 
+2.56.0
+
