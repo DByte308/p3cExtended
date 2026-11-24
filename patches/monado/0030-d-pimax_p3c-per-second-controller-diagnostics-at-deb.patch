@@ -1,0 +1,29 @@
+From 308dbd7d79ebb2f4f2a1c8191b82799574a316bf Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:15:34 +0100
+Subject: [PATCH 1/2] d/pimax_p3c: per-second controller diagnostics at debug
+ level
+
+The line was logged at info once per second and filled the log view.
+Enable it with PIMAX_LOG=debug.
+---
+ src/xrt/drivers/pimax_p3c/src/device/session/status.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index ba0d1947a..f9f97a08f 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -141,7 +141,8 @@ fn log_controller_diag(now: i64) {
+         m
+     };
+     let [l, r] = &CONTROLLER_DIAG;
+-    info!(
++    // Diagnostics for controller tracking; once per second, so only at debug level.
++    debug!(
+         "controllers 1 s: L reports {} no_clock {} imu {} pose {}/{} | R reports {} no_clock {} imu {} pose {}/{} | raw accel g L {:.3?} R {:.3?}",
+         take(&l.reports), take(&l.no_clock), take(&l.imu_pushed), take(&l.pose_valid), take(&l.pose_queries),
+         take(&r.reports), take(&r.no_clock), take(&r.imu_pushed), take(&r.pose_valid), take(&r.pose_queries),
+-- 
+2.56.0
+

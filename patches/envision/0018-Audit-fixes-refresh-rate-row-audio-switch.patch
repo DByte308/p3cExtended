@@ -1,0 +1,402 @@
+From df1a6e85631212022bcad6e76f9136fa0a9741fb Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:20:43 +0100
+Subject: [PATCH] Audit fixes: refresh-rate row, audio switch
+
+- Refresh rate: showing the page with the headset off no longer resets a
+  stored rate; the subtitle says when the chosen rate is not offered. The
+  popup is re-bound on map and selection so check marks and greyed-out
+  entries stay current.
+- Audio: USB ids compared without the 0x prefix (PulseAudio reports them
+  without it); devices are switched on a background thread that waits up
+  to 20 s for the headset's audio to appear; a restart keeps the defaults
+  from before the first start.
+- Render resolution: a stored value outside 0.30x-1.50x is clamped for the
+  caption too.
+- EDID parser copy in sync with the driver (checksums, 24-255 Hz).
+---
+ src/audio_switch.rs    | 84 +++++++++++++++++++++++++++++-------------
+ src/headset_edid.rs    | 19 ++++++++--
+ src/ui/app.rs          | 32 ++++++++++++----
+ src/ui/pimax_common.rs | 52 +++++++++++++++++---------
+ src/ui/pimax_pages.rs  |  3 +-
+ 5 files changed, 135 insertions(+), 55 deletions(-)
+
+diff --git a/src/audio_switch.rs b/src/audio_switch.rs
+index 6968a9f..4bd43b7 100644
+--- a/src/audio_switch.rs
++++ b/src/audio_switch.rs
+@@ -11,7 +11,12 @@ use tracing::{info, warn};
+ pub const HEADSET: &str = "headset";
+ 
+ /// USB vendor id of the headset.
+-const HEADSET_VENDOR: &str = "0x34a4";
++const HEADSET_VENDOR: &str = "34a4";
++
++/// USB ids as lower-case hex without "0x" (PipeWire reports "0x34a4", PulseAudio "34a4").
++fn norm_id(v: &str) -> String {
++    v.trim().trim_start_matches("0x").trim_start_matches("0X").to_ascii_lowercase()
++}
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Kind {
+@@ -54,7 +59,7 @@ pub struct Device {
+     pub description: String,
+     /// The headset's own audio device.
+     pub headset: bool,
+-    /// USB vendor id of the device, if it reports one.
++    /// USB vendor id of the device (lower-case hex, no "0x"), if it reports one.
+     pub vendor_id: Option<String>,
+ }
+ 
+@@ -84,7 +89,7 @@ pub fn list(kind: Kind) -> Vec<Device> {
+             // A device of the headset itself (USB vendor 34a4), its audio chip (USB 3654:5678), or a description
+             // naming the headset.
+             dev.headset = vendor.as_deref() == Some(HEADSET_VENDOR)
+-                || (vendor.as_deref() == Some("0x3654") && product.as_deref() == Some("0x5678"))
++                || (vendor.as_deref() == Some("3654") && product.as_deref() == Some("5678"))
+                 || dev.description.to_lowercase().contains("pimax");
+             dev.vendor_id = vendor;
+             out.push(dev);
+@@ -112,9 +117,9 @@ pub fn list(kind: Kind) -> Vec<Device> {
+         } else if let Some(v) = prop("device.class") {
+             *monitor |= v == "monitor";
+         } else if let Some(v) = prop("device.vendor.id") {
+-            *vendor = Some(v);
++            *vendor = Some(norm_id(&v));
+         } else if let Some(v) = prop("device.product.id") {
+-            *product = Some(v);
++            *product = Some(norm_id(&v));
+         }
+     }
+     finish(cur.take(), &mut out);
+@@ -146,50 +151,77 @@ fn set_default(kind: Kind, name: &str) -> bool {
+     ok
+ }
+ 
+-/// Device name for a stored choice: None/empty = do not change, HEADSET = the headset's device, else the name
+-/// itself if that device is present right now.
+-fn resolve(kind: Kind, choice: Option<&str>) -> Option<String> {
+-    let choice = choice.filter(|c| !c.is_empty())?;
++/// Device name for a stored choice (HEADSET = the headset's device, else the name itself) if that device is
++/// present right now.
++fn resolve(kind: Kind, choice: &str) -> Option<String> {
+     let devices = list(kind);
+-    let found = if choice == HEADSET {
++    if choice == HEADSET {
+         headset_device(&devices).map(|d| d.name.clone())
+     } else {
+         devices.into_iter().find(|d| d.name == choice).map(|d| d.name)
+-    };
+-    if found.is_none() {
+-        warn!("audio: {kind:?} device {choice:?} is not connected; leaving the default unchanged");
+     }
+-    found
+ }
+ 
+ /// What a session switched: (kind, default before, device set).
+ #[derive(Debug, Default)]
+ pub struct Switched(Vec<(Kind, String, String)>);
+ 
+-/// Switch the defaults for the session. Returns what to restore afterwards.
+-pub fn apply(output: Option<&str>, input: Option<&str>) -> Switched {
++/// Whether there is anything to switch (None or empty = do not change).
++pub fn wanted(output: Option<&str>, input: Option<&str>) -> bool {
++    !(output.is_none_or(str::is_empty) && input.is_none_or(str::is_empty))
++}
++
++/// Switch the defaults for the session and return what to restore afterwards. The headset's audio device can
++/// appear only once the headset powers up, so a device that is missing is looked for again every second for up
++/// to `wait`. Blocking: call it off the UI thread.
++pub fn apply(output: Option<&str>, input: Option<&str>, wait: std::time::Duration) -> Switched {
+     let mut done = Switched::default();
+-    if output.is_none_or(str::is_empty) && input.is_none_or(str::is_empty) {
++    if !wanted(output, input) {
+         return done;
+     }
+     if !available() {
+         warn!("audio: pactl or a PulseAudio/PipeWire sound server is not available; audio switching skipped");
+         return done;
+     }
+-    for (kind, choice) in [(Kind::Output, output), (Kind::Input, input)] {
+-        let Some(target) = resolve(kind, choice) else { continue };
+-        let before = current_default(kind).unwrap_or_default();
+-        if before == target {
+-            continue;
+-        }
+-        if set_default(kind, &target) {
+-            info!("audio: default {kind:?} {before} -> {target}");
+-            done.0.push((kind, before, target));
++    let mut pending: Vec<(Kind, &str)> = [(Kind::Output, output), (Kind::Input, input)]
++        .into_iter()
++        .filter_map(|(k, c)| c.filter(|c| !c.is_empty()).map(|c| (k, c)))
++        .collect();
++    let until = std::time::Instant::now() + wait;
++    loop {
++        pending.retain(|&(kind, choice)| {
++            let Some(target) = resolve(kind, choice) else { return true };
++            let before = current_default(kind).unwrap_or_default();
++            if before != target && set_default(kind, &target) {
++                info!("audio: default {kind:?} {before} -> {target}");
++                done.0.push((kind, before, target));
++            }
++            false
++        });
++        if pending.is_empty() || std::time::Instant::now() >= until {
++            break;
+         }
++        std::thread::sleep(std::time::Duration::from_secs(1));
++    }
++    for (kind, choice) in pending {
++        warn!("audio: {kind:?} device {choice:?} did not appear; leaving the default unchanged");
+     }
+     done
+ }
+ 
++impl Switched {
++    /// Fold a later switch (session restart) into this one: the defaults from before the first switch are kept
++    /// as the restore target, and the device set last is what restore expects to find.
++    pub fn merge_later(&mut self, later: Switched) {
++        for (kind, before, set) in later.0 {
++            match self.0.iter_mut().find(|(k, _, _)| *k == kind) {
++                Some(e) => e.2 = set,
++                None => self.0.push((kind, before, set)),
++            }
++        }
++    }
++}
++
+ /// Undo `apply`, but only where the default is still the device the session set (a change made by hand during
+ /// the session is kept).
+ pub fn restore(s: Switched) {
+diff --git a/src/headset_edid.rs b/src/headset_edid.rs
+index 0e42341..6bde979 100644
+--- a/src/headset_edid.rs
++++ b/src/headset_edid.rs
+@@ -13,8 +13,13 @@ use std::fs;
+ /// PnP manufacturer id of the headset display.
+ const HEADSET_MANUFACTURER: &str = "PVR";
+ 
++/// Each 128-byte EDID block sums to 0 (mod 256); a half-read or corrupted block must not yield rates.
++fn checksum_ok(block: &[u8]) -> bool {
++    block.iter().fold(0u8, |a, b| a.wrapping_add(*b)) == 0
++}
++
+ fn manufacturer(edid: &[u8]) -> Option<String> {
+-    if edid.len() < 128 || edid[..8] != [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00] {
++    if edid.len() < 128 || edid[..8] != [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00] || !checksum_ok(&edid[..128]) {
+         return None;
+     }
+     let id = u16::from_be_bytes([edid[8], edid[9]]);
+@@ -26,7 +31,12 @@ fn manufacturer(edid: &[u8]) -> Option<String> {
+ }
+ 
+ fn rate(clock_hz: f64, h_total: u32, v_total: u32) -> Option<u32> {
+-    (h_total > 0 && v_total > 0 && clock_hz > 0.0).then(|| (clock_hz / (h_total as f64 * v_total as f64)).round() as u32)
++    if h_total == 0 || v_total == 0 || clock_hz <= 0.0 {
++        return None;
++    }
++    // Anything outside a plausible display range is a broken descriptor, never a rate to use.
++    let hz = (clock_hz / (h_total as f64 * v_total as f64)).round() as u32;
++    (24..=255).contains(&hz).then_some(hz)
+ }
+ 
+ /// 18-byte detailed timing descriptor (base block, CTA-861 block).
+@@ -54,7 +64,7 @@ pub fn edid_rates(edid: &[u8]) -> BTreeSet<u32> {
+         return out;
+     }
+     out.extend([54, 72, 90, 108].iter().filter_map(|&o| dtd_rate(&edid[o..o + 18])));
+-    for block in edid[128..].chunks_exact(128) {
++    for block in edid[128..].chunks_exact(128).filter(|b| checksum_ok(b)) {
+         match block[0] {
+             // CTA-861: DTDs from the offset in byte 2 up to the checksum
+             0x02 => {
+@@ -127,6 +137,9 @@ mod tests {
+         // "PVR": P=16 V=22 R=18 -> 0b0_10000_10110_10010
+         let id: u16 = (16 << 10) | (22 << 5) | 18;
+         e[8..10].copy_from_slice(&id.to_be_bytes());
++        e[127] = 0u8.wrapping_sub(e[..127].iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+         assert_eq!(manufacturer(&e).as_deref(), Some("PVR"));
++        e[20] ^= 1; // corrupted block
++        assert_eq!(manufacturer(&e), None);
+     }
+ }
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 9a60410..594a53d 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -126,6 +126,8 @@ pub enum Msg {
+     SaveConfigDebounced(u64),
+     OnServiceLog(Vec<String>),
+     OnServiceExit(i32),
++    /// Audio defaults switched for the session (from a background thread).
++    AudioSwitched(crate::audio_switch::Switched),
+     OnPluginsExit(i32),
+     OnBuildLog(Vec<String>),
+     OnBuildExit(i32),
+@@ -301,13 +303,18 @@ impl App {
+         self.xrservice_worker = Some(worker);
+         {
+             let env = prof.environment_with_fallback(&self.config.global_preferences);
+-            let switched = crate::audio_switch::apply(
+-                env.get("PIMAX_AUDIO_OUTPUT").map(String::as_str),
+-                env.get("PIMAX_AUDIO_INPUT").map(String::as_str),
+-            );
+-            // On a restart keep the defaults from before the first start.
+-            if self.audio_restore.is_none() {
+-                self.audio_restore = Some(switched);
++            let output = env.get("PIMAX_AUDIO_OUTPUT").cloned();
++            let input = env.get("PIMAX_AUDIO_INPUT").cloned();
++            if crate::audio_switch::wanted(output.as_deref(), input.as_deref()) {
++                let s = sender.input_sender().clone();
++                std::thread::spawn(move || {
++                    let switched = crate::audio_switch::apply(
++                        output.as_deref(),
++                        input.as_deref(),
++                        std::time::Duration::from_secs(20),
++                    );
++                    s.emit(Msg::AudioSwitched(switched));
++                });
+             }
+         }
+         let set_sniper_launch_opts_res =
+@@ -484,6 +491,17 @@ impl AsyncComponent for App {
+                         .emit(DebugViewMsg::LogUpdated(rows));
+                 }
+             }
++            Msg::AudioSwitched(switched) => {
++                if self.xrservice_worker.is_none() {
++                    // the session ended while the devices were being switched
++                    crate::audio_switch::restore(switched);
++                } else if let Some(prev) = self.audio_restore.as_mut() {
++                    // a restart: keep the defaults from before the first start
++                    prev.merge_later(switched);
++                } else {
++                    self.audio_restore = Some(switched);
++                }
++            }
+             Msg::OnServiceExit(code) => {
+                 self.shell.banner.set_revealed(false);
+                 self.set_inhibit_session(false);
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index b709f3e..57ef4d9 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -226,6 +226,8 @@ impl Ctx {
+ 
+     /// Refresh rate choice. Rates the connected headset does not list in its EDID are greyed out and cannot be
+     /// picked; without a visible headset only "Headset default" can be picked. Re-checked whenever the row is shown.
++    /// A stored rate is never changed here unless the user picks something (the headset may just be off); the
++    /// driver itself refuses rates the headset does not list.
+     pub fn refresh_rate_row(&self, k: &'static str, choices: &'static [(&'static str, Option<u32>)]) -> adw::ComboRow {
+         const DESC: &str = "72 Hz saves GPU time";
+         let rates: Rc<RefCell<Option<std::collections::BTreeSet<u32>>>> =
+@@ -240,24 +242,34 @@ impl Ctx {
+         };
+         let subtitle = {
+             let rates = rates.clone();
+-            move || match rates.borrow().as_ref() {
+-                Some(r) => format!(
+-                    "{DESC}. This headset offers {} Hz",
+-                    r.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+-                ),
+-                None => format!("{DESC}. Headset display not detected: only the headset default can be chosen"),
++            let allowed = allowed.clone();
++            move |selected: usize| {
++                let base = match rates.borrow().as_ref() {
++                    Some(r) => format!(
++                        "{DESC}. This headset offers {} Hz",
++                        r.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
++                    ),
++                    None => format!(
++                        "{DESC}. Headset display not detected (it shows up while the headset is on): only the headset default can be chosen"
++                    ),
++                };
++                if allowed(selected) {
++                    base
++                } else {
++                    format!("{base}. The chosen rate is not offered, so the driver uses the headset default")
++                }
+             }
+         };
+ 
+         let row = adw::ComboRow::builder()
+             .title("Refresh rate")
+-            .subtitle(subtitle())
+             .subtitle_lines(0)
+             .model(&gtk::StringList::new(&choices.iter().map(|(l, _)| *l).collect::<Vec<_>>()))
+             .build();
+         let cur = self.get(k).and_then(|v| v.parse::<u32>().ok());
+         let cur_idx = choices.iter().position(|(_, v)| *v == cur).unwrap_or(0);
+         row.set_selected(cur_idx as u32);
++        row.set_subtitle(&subtitle(cur_idx));
+ 
+         // Popup entries: label plus check mark, greyed out and not selectable when the headset lacks the rate.
+         let factory = gtk::SignalListItemFactory::new();
+@@ -290,30 +302,34 @@ impl Ctx {
+             });
+         }
+         row.set_list_factory(Some(&factory));
++        // Re-binding the popup entries updates their check marks and greyed-out state.
++        let rebind = move |row: &adw::ComboRow| {
++            row.set_list_factory(gtk::ListItemFactory::NONE);
++            row.set_list_factory(Some(&factory));
++        };
+ 
+         {
+             let c = self.clone();
+             let allowed = allowed.clone();
++            let subtitle = subtitle.clone();
++            let rebind = rebind.clone();
+             row.connect_selected_notify(move |row| {
+                 let i = row.selected() as usize;
+                 if !allowed(i) {
+-                    // keyboard or a stale list: fall back to the headset default
++                    // picked by keyboard although not offered: back to the headset default
+                     row.set_selected(0);
+                     return;
+                 }
+                 c.set(k, choices.get(i).and_then(|(_, v)| *v).map(|v| v.to_string()));
++                row.set_subtitle(&subtitle(i));
++                rebind(row);
+             });
+         }
+-        {
+-            let rates = rates.clone();
+-            row.connect_map(move |row| {
+-                *rates.borrow_mut() = crate::headset_edid::headset_rates();
+-                row.set_subtitle(&subtitle());
+-                if !allowed(row.selected() as usize) {
+-                    row.set_selected(0);
+-                }
+-            });
+-        }
++        row.connect_map(move |row| {
++            *rates.borrow_mut() = crate::headset_edid::headset_rates();
++            row.set_subtitle(&subtitle(row.selected() as usize));
++            rebind(row);
++        });
+         row
+     }
+ 
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index f50103d..d6bd907 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -18,11 +18,12 @@ fn render_resolution_row<F: Fn(f64) + 'static>(percent: f64, on_change: F) -> ad
+         let f = pct / 100.0;
+         format!("{f:.2}\u{00d7}  \u{00b7}  {:.0} % of the native pixels", f * f * 100.0)
+     }
++    let percent = percent.clamp(30.0, 150.0);
+     let row = adw::ActionRow::builder()
+         .title("Render resolution")
+         .subtitle(caption(percent))
+         .build();
+-    let adj = gtk::Adjustment::new(percent.clamp(30.0, 150.0), 30.0, 150.0, 5.0, 10.0, 0.0);
++    let adj = gtk::Adjustment::new(percent, 30.0, 150.0, 5.0, 10.0, 0.0);
+     let scale = gtk::Scale::builder()
+         .adjustment(&adj)
+         .draw_value(false)
+-- 
+2.56.0
+

@@ -1,0 +1,401 @@
+From a247771539de0dae28d832a7345d737e6e759692 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:13:57 +0100
+Subject: [PATCH] Headset page: switch sound output and microphone for the
+ session
+
+New Audio group with two choices: Don't change, Headset (automatic), or any
+output/microphone present now. On Start the chosen devices become the
+system defaults; when the session ends (or Envision closes) the previous
+defaults come back, unless they were changed by hand meanwhile.
+
+Uses pactl, so it works with PulseAudio and with PipeWire's pulse server
+on any desktop. Monitor sources are not listed; a stored device that is
+not connected stays selectable. Settings: PIMAX_AUDIO_OUTPUT,
+PIMAX_AUDIO_INPUT.
+---
+ src/audio_switch.rs    | 204 +++++++++++++++++++++++++++++++++++++++++
+ src/main.rs            |   1 +
+ src/ui/app.rs          |  20 ++++
+ src/ui/pimax_common.rs |  62 +++++++++++++
+ src/ui/pimax_pages.rs  |   9 ++
+ 5 files changed, 296 insertions(+)
+ create mode 100644 src/audio_switch.rs
+
+diff --git a/src/audio_switch.rs b/src/audio_switch.rs
+new file mode 100644
+index 0000000..6968a9f
+--- /dev/null
++++ b/src/audio_switch.rs
+@@ -0,0 +1,204 @@
++//! Switch the default audio output and microphone while a VR session runs, and restore them afterwards.
++//!
++//! Uses `pactl`, which talks to PulseAudio and to PipeWire's PulseAudio server (pipewire-pulse), so it works the
++//! same on any desktop (Plasma, GNOME, others) and any distro that ships one of the two. Device names (stable
++//! across reboots) are stored, not indices.
++
++use std::process::Command;
++use tracing::{info, warn};
++
++/// Stored choice meaning "the headset's own audio device".
++pub const HEADSET: &str = "headset";
++
++/// USB vendor id of the headset.
++const HEADSET_VENDOR: &str = "0x34a4";
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Kind {
++    Output,
++    Input,
++}
++
++impl Kind {
++    fn list_arg(self) -> &'static str {
++        match self {
++            Self::Output => "sinks",
++            Self::Input => "sources",
++        }
++    }
++    fn block_prefix(self) -> &'static str {
++        match self {
++            Self::Output => "Sink #",
++            Self::Input => "Source #",
++        }
++    }
++    fn default_label(self) -> &'static str {
++        match self {
++            Self::Output => "Default Sink: ",
++            Self::Input => "Default Source: ",
++        }
++    }
++    fn set_cmd(self) -> &'static str {
++        match self {
++            Self::Output => "set-default-sink",
++            Self::Input => "set-default-source",
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Device {
++    /// Stable device name (what gets stored and passed to pactl).
++    pub name: String,
++    /// Human readable description.
++    pub description: String,
++    /// The headset's own audio device.
++    pub headset: bool,
++    /// USB vendor id of the device, if it reports one.
++    pub vendor_id: Option<String>,
++}
++
++fn pactl(args: &[&str]) -> Option<String> {
++    // C locale: the field labels ("Name:", "Description:") are translated otherwise.
++    let out = Command::new("pactl").args(args).env("LC_ALL", "C").output().ok()?;
++    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
++}
++
++/// Whether a PulseAudio-compatible sound server is reachable.
++pub fn available() -> bool {
++    pactl(&["info"]).is_some()
++}
++
++/// Audio devices of one kind. Monitor sources (the "what you hear" copy of each output) are left out.
++pub fn list(kind: Kind) -> Vec<Device> {
++    let Some(text) = pactl(&["list", kind.list_arg()]) else {
++        return Vec::new();
++    };
++    let mut out = Vec::new();
++    let mut cur: Option<(Device, bool, Option<String>, Option<String>)> = None;
++    let finish = |d: Option<(Device, bool, Option<String>, Option<String>)>, out: &mut Vec<Device>| {
++        if let Some((mut dev, monitor, vendor, product)) = d {
++            if monitor || dev.name.is_empty() {
++                return;
++            }
++            // A device of the headset itself (USB vendor 34a4), its audio chip (USB 3654:5678), or a description
++            // naming the headset.
++            dev.headset = vendor.as_deref() == Some(HEADSET_VENDOR)
++                || (vendor.as_deref() == Some("0x3654") && product.as_deref() == Some("0x5678"))
++                || dev.description.to_lowercase().contains("pimax");
++            dev.vendor_id = vendor;
++            out.push(dev);
++        }
++    };
++    for line in text.lines() {
++        if line.starts_with(kind.block_prefix()) {
++            finish(cur.take(), &mut out);
++            cur = Some((Device { name: String::new(), description: String::new(), headset: false, vendor_id: None }, false, None, None));
++            continue;
++        }
++        let Some((dev, monitor, vendor, product)) = cur.as_mut() else { continue };
++        let t = line.trim();
++        let prop = |key: &str| {
++            t.strip_prefix(key)
++                .and_then(|r| r.trim_start().strip_prefix('='))
++                .map(|v| v.trim().trim_matches('"').to_string())
++        };
++        if let Some(v) = t.strip_prefix("Name: ") {
++            dev.name = v.to_string();
++        } else if let Some(v) = t.strip_prefix("Description: ") {
++            dev.description = v.to_string();
++        } else if let Some(v) = t.strip_prefix("Monitor of Sink: ") {
++            *monitor |= v != "n/a";
++        } else if let Some(v) = prop("device.class") {
++            *monitor |= v == "monitor";
++        } else if let Some(v) = prop("device.vendor.id") {
++            *vendor = Some(v);
++        } else if let Some(v) = prop("device.product.id") {
++            *product = Some(v);
++        }
++    }
++    finish(cur.take(), &mut out);
++    out
++}
++
++/// The device "Headset (automatic)" stands for: a device of the headset itself (USB vendor 34a4) before the
++/// separate audio chip.
++pub fn headset_device(devices: &[Device]) -> Option<&Device> {
++    devices
++        .iter()
++        .find(|d| d.vendor_id.as_deref() == Some(HEADSET_VENDOR))
++        .or_else(|| devices.iter().find(|d| d.headset))
++}
++
++/// Name of the current default device.
++pub fn current_default(kind: Kind) -> Option<String> {
++    pactl(&["info"])?
++        .lines()
++        .find_map(|l| l.strip_prefix(kind.default_label()).map(|v| v.trim().to_string()))
++        .filter(|v| !v.is_empty())
++}
++
++fn set_default(kind: Kind, name: &str) -> bool {
++    let ok = pactl(&[kind.set_cmd(), name]).is_some();
++    if !ok {
++        warn!("audio: could not set the default {kind:?} to {name}");
++    }
++    ok
++}
++
++/// Device name for a stored choice: None/empty = do not change, HEADSET = the headset's device, else the name
++/// itself if that device is present right now.
++fn resolve(kind: Kind, choice: Option<&str>) -> Option<String> {
++    let choice = choice.filter(|c| !c.is_empty())?;
++    let devices = list(kind);
++    let found = if choice == HEADSET {
++        headset_device(&devices).map(|d| d.name.clone())
++    } else {
++        devices.into_iter().find(|d| d.name == choice).map(|d| d.name)
++    };
++    if found.is_none() {
++        warn!("audio: {kind:?} device {choice:?} is not connected; leaving the default unchanged");
++    }
++    found
++}
++
++/// What a session switched: (kind, default before, device set).
++#[derive(Debug, Default)]
++pub struct Switched(Vec<(Kind, String, String)>);
++
++/// Switch the defaults for the session. Returns what to restore afterwards.
++pub fn apply(output: Option<&str>, input: Option<&str>) -> Switched {
++    let mut done = Switched::default();
++    if output.is_none_or(str::is_empty) && input.is_none_or(str::is_empty) {
++        return done;
++    }
++    if !available() {
++        warn!("audio: pactl or a PulseAudio/PipeWire sound server is not available; audio switching skipped");
++        return done;
++    }
++    for (kind, choice) in [(Kind::Output, output), (Kind::Input, input)] {
++        let Some(target) = resolve(kind, choice) else { continue };
++        let before = current_default(kind).unwrap_or_default();
++        if before == target {
++            continue;
++        }
++        if set_default(kind, &target) {
++            info!("audio: default {kind:?} {before} -> {target}");
++            done.0.push((kind, before, target));
++        }
++    }
++    done
++}
++
++/// Undo `apply`, but only where the default is still the device the session set (a change made by hand during
++/// the session is kept).
++pub fn restore(s: Switched) {
++    for (kind, before, set) in s.0 {
++        if before.is_empty() || current_default(kind).as_deref() != Some(set.as_str()) {
++            continue;
++        }
++        if set_default(kind, &before) {
++            info!("audio: default {kind:?} restored to {before}");
++        }
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 3bbea10..4e8ffee 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -41,6 +41,7 @@ pub mod device_prober;
+ pub mod downloader;
+ pub mod env_var_descriptions;
+ pub mod file_builders;
++pub mod audio_switch;
+ pub mod gpu_profile;
+ pub mod headset_edid;
+ pub mod is_appimage;
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 1529e4d..9a60410 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -86,6 +86,8 @@ pub struct App {
+ 
+     config: Config,
+     xrservice_worker: Option<JobWorker>,
++    /// Audio defaults changed for the running session, restored when it ends.
++    audio_restore: Option<crate::audio_switch::Switched>,
+     plugins_worker: Option<JobWorker>,
+     restart_xrservice: bool,
+     build_worker: Option<JobWorker>,
+@@ -297,6 +299,17 @@ impl App {
+         };
+         worker.start();
+         self.xrservice_worker = Some(worker);
++        {
++            let env = prof.environment_with_fallback(&self.config.global_preferences);
++            let switched = crate::audio_switch::apply(
++                env.get("PIMAX_AUDIO_OUTPUT").map(String::as_str),
++                env.get("PIMAX_AUDIO_INPUT").map(String::as_str),
++            );
++            // On a restart keep the defaults from before the first start.
++            if self.audio_restore.is_none() {
++                self.audio_restore = Some(switched);
++            }
++        }
+         let set_sniper_launch_opts_res =
+             set_sniper_runtime_entrypoint_launch_opts_from_profile(&prof);
+         let set_soldier_launch_opts_res =
+@@ -429,6 +442,9 @@ impl AsyncComponent for App {
+         if let Some(worker) = self.xrservice_worker.as_ref() {
+             worker.stop();
+         }
++        if let Some(s) = self.audio_restore.take() {
++            crate::audio_switch::restore(s);
++        }
+         self.restore_openxr_openvr_files();
+     }
+ 
+@@ -497,6 +513,9 @@ impl AsyncComponent for App {
+                     self.restart_xrservice = false;
+                     self.start_xrservice(sender, false);
+                 } else {
++                    if let Some(s) = self.audio_restore.take() {
++                        crate::audio_switch::restore(s);
++                    }
+                     // run AfterStop plugins
+                     sender.input(Msg::RunAfterStopPlugins);
+                 }
+@@ -1441,6 +1460,7 @@ impl AsyncComponent for App {
+             config,
+             profiles,
+             xrservice_worker: None,
++            audio_restore: None,
+             plugins_worker: None,
+             build_worker: None,
+             monado_gui_worker: None,
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index e2e8299..b709f3e 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -317,6 +317,68 @@ impl Ctx {
+         row
+     }
+ 
++    /// Audio device choice for the session: "Don't change", "Headset (automatic)" or one of the devices present
++    /// now. A stored device that is not connected stays selectable so the choice is not lost. The list is read
++    /// again whenever the row is shown.
++    pub fn audio_row(&self, k: &'static str, title: &str, kind: crate::audio_switch::Kind) -> adw::ComboRow {
++        use crate::audio_switch::{self as audio, HEADSET};
++        let values: Rc<RefCell<Vec<Option<String>>>> = Rc::new(RefCell::new(Vec::new()));
++        let updating = Rc::new(std::cell::Cell::new(false));
++        let row = adw::ComboRow::builder().title(title).subtitle_lines(0).build();
++
++        let rebuild = {
++            let c = self.clone();
++            let values = values.clone();
++            let updating = updating.clone();
++            move |row: &adw::ComboRow| {
++                let cur = c.get(k).filter(|v| !v.is_empty());
++                let ok = audio::available();
++                let devices = if ok { audio::list(kind) } else { Vec::new() };
++                let headset = audio::headset_device(&devices).map(|d| d.description.clone());
++                let mut labels = vec![
++                    "Don't change".to_string(),
++                    match &headset {
++                        Some(h) => format!("Headset (automatic): {h}"),
++                        None => "Headset (automatic, not connected)".to_string(),
++                    },
++                ];
++                let mut vals = vec![None, Some(HEADSET.to_string())];
++                for d in &devices {
++                    labels.push(d.description.clone());
++                    vals.push(Some(d.name.clone()));
++                }
++                if let Some(cur) = cur.as_ref().filter(|c| *c != HEADSET && !vals.iter().any(|v| v.as_ref() == Some(*c))) {
++                    labels.push(format!("{cur} (not connected)"));
++                    vals.push(Some(cur.clone()));
++                }
++                updating.set(true);
++                row.set_model(Some(&gtk::StringList::new(&labels.iter().map(String::as_str).collect::<Vec<_>>())));
++                row.set_selected(vals.iter().position(|v| *v == cur).unwrap_or(0) as u32);
++                updating.set(false);
++                *values.borrow_mut() = vals;
++                row.set_sensitive(ok);
++                row.set_subtitle(if ok {
++                    "Set as the system default while the session runs, restored when it stops"
++                } else {
++                    "Needs pactl with PulseAudio or PipeWire (pipewire-pulse); not found"
++                });
++            }
++        };
++        rebuild(&row);
++        {
++            let c = self.clone();
++            row.connect_selected_notify(move |row| {
++                if updating.get() {
++                    return;
++                }
++                let v = values.borrow().get(row.selected() as usize).cloned().flatten();
++                c.set(k, v);
++            });
++        }
++        row.connect_map(move |row| rebuild(row));
++        row
++    }
++
+     /// Spin row for a numeric option; `unset` (shown as that value) removes the var.
+     #[allow(clippy::too_many_arguments)]
+     pub fn num_row(&self, k: &'static str, title: &str, desc: &str, unset: f64, min: f64, max: f64, step: f64) -> adw::SpinRow {
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 0815f13..f50103d 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -282,6 +282,15 @@ impl SimpleComponent for HeadsetPage {
+         ));
+         content.append(&display);
+ 
++        // Audio
++        let audio = group(
++            "Audio",
++            Some("Switch the system sound output and microphone when the session starts; the previous ones come back when it stops."),
++        );
++        audio.add(&ctx.audio_row("PIMAX_AUDIO_OUTPUT", "Sound output", crate::audio_switch::Kind::Output));
++        audio.add(&ctx.audio_row("PIMAX_AUDIO_INPUT", "Microphone", crate::audio_switch::Kind::Input));
++        content.append(&audio);
++
+         // IPD
+         let ipd_group = group(
+             "IPD",
+-- 
+2.56.0
+

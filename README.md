@@ -24,9 +24,11 @@ Full list with details: [docs/FEATURES.md](docs/FEATURES.md).
   about 0.44° mean error after calibration); gaze test app.
 - **Foveated rendering**: gaze-steered quad views and `XR_VARJO_foveated_rendering` in Monado
   (driver done; testing in games still to do). FOV levels (`PIMAX_FOV_PERCENT`, built, untested).
-- **Envision pages**: Home (start/stop, status, summary tiles), Headset (device info, self-test, display, IPD,
+- **Envision pages**: Home (start/stop, status, summary tiles), Headset (device info, self-test, display, audio, IPD,
   tracking, advanced), Eye Tracking (calibration, gaze and foveation tests, foveation detail), Controllers
   (status, dead zone), Devices & Apps, Logs. Some settings apply live, the rest on the next start.
+  Audio switching needs `pactl` (Fedora: pulseaudio-utils, Arch: libpulse, Debian/Ubuntu: pulseaudio-utils), which
+  works with PulseAudio and with PipeWire (pipewire-pulse).
 - **Headset speakers**: a WirePlumber rule maps the built-in audio correctly.
 - Device info: firmware version, serial number and self-test in a status file and in Envision.
 

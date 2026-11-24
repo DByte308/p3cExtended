@@ -1,0 +1,189 @@
+From fa9c1a9cc836333b57f801b27e583b392e36056f Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:20:44 +0100
+Subject: [PATCH 2/2] d/pimax_p3c: refresh rate checked when the headset
+ display is up
+
+- The rate is resolved right before SetRate, after the video work mode is
+  set: the headset display and its EDID may only appear then.
+- EDID blocks with a bad checksum are ignored; rates outside 24-255 Hz are
+  never returned.
+- If the model default is not listed either, the highest listed rate
+  below it is used, else the lowest listed one (never an unlisted rate).
+---
+ .../pimax_p3c/src/device/session/bringup.rs   |  7 ++--
+ .../pimax_p3c/src/device/session/edid.rs      | 19 +++++++++--
+ .../pimax_p3c/src/device/session/mod.rs       | 33 ++++++++++---------
+ .../pimax_p3c/src/device/session/video.rs     |  8 +++--
+ 4 files changed, 43 insertions(+), 24 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+index f45637ebf..4be460c81 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+@@ -146,9 +146,8 @@ pub fn bring_up(interfaces: Interfaces, identity: &Identity) -> BringUp {
+     let calibration = calibration::load(&cmd, serial);
+     let device_info = DeviceInfo::query(&cmd);
+ 
+-    let rate_hz = refresh_hz(model);
+-    let required_rate = match video::start_video(&cmd, rate_hz) {
+-        Ok(()) => rate_hz,
++    let required_rate = match video::start_video(&cmd, model) {
++        Ok(rate_hz) => rate_hz,
+         Err(e) => {
+             error!("video bring-up failed: {e}");
+             0
+@@ -176,7 +175,7 @@ pub fn bring_up(interfaces: Interfaces, identity: &Identity) -> BringUp {
+         sessions: Sessions {
+             cmd,
+             required_rate,
+-            status_file: StatusFile::new(model.variant_name(), serial, device_info, rate_hz),
++            status_file: StatusFile::new(model.variant_name(), serial, device_info, refresh_hz(model)),
+             hmd_status_stream,
+             controller_status_stream,
+             log_thread,
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs b/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
+index 876b44f10..e94c3479b 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/edid.rs
+@@ -13,8 +13,13 @@ use std::fs;
+ /// PnP manufacturer id of the headset display.
+ const HEADSET_MANUFACTURER: &str = "PVR";
+ 
++/// Each 128-byte EDID block sums to 0 (mod 256); a half-read or corrupted block must not yield rates.
++fn checksum_ok(block: &[u8]) -> bool {
++    block.iter().fold(0u8, |a, b| a.wrapping_add(*b)) == 0
++}
++
+ fn manufacturer(edid: &[u8]) -> Option<String> {
+-    if edid.len() < 128 || edid[..8] != [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00] {
++    if edid.len() < 128 || edid[..8] != [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00] || !checksum_ok(&edid[..128]) {
+         return None;
+     }
+     let id = u16::from_be_bytes([edid[8], edid[9]]);
+@@ -26,7 +31,12 @@ fn manufacturer(edid: &[u8]) -> Option<String> {
+ }
+ 
+ fn rate(clock_hz: f64, h_total: u32, v_total: u32) -> Option<u32> {
+-    (h_total > 0 && v_total > 0 && clock_hz > 0.0).then(|| (clock_hz / (h_total as f64 * v_total as f64)).round() as u32)
++    if h_total == 0 || v_total == 0 || clock_hz <= 0.0 {
++        return None;
++    }
++    // Anything outside a plausible display range is a broken descriptor, never a rate to use.
++    let hz = (clock_hz / (h_total as f64 * v_total as f64)).round() as u32;
++    (24..=255).contains(&hz).then_some(hz)
+ }
+ 
+ /// 18-byte detailed timing descriptor (base block, CTA-861 block).
+@@ -54,7 +64,7 @@ pub fn edid_rates(edid: &[u8]) -> BTreeSet<u32> {
+         return out;
+     }
+     out.extend([54, 72, 90, 108].iter().filter_map(|&o| dtd_rate(&edid[o..o + 18])));
+-    for block in edid[128..].chunks_exact(128) {
++    for block in edid[128..].chunks_exact(128).filter(|b| checksum_ok(b)) {
+         match block[0] {
+             // CTA-861: DTDs from the offset in byte 2 up to the checksum
+             0x02 => {
+@@ -127,6 +137,9 @@ mod tests {
+         // "PVR": P=16 V=22 R=18 -> 0b0_10000_10110_10010
+         let id: u16 = (16 << 10) | (22 << 5) | 18;
+         e[8..10].copy_from_slice(&id.to_be_bytes());
++        e[127] = 0u8.wrapping_sub(e[..127].iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+         assert_eq!(manufacturer(&e).as_deref(), Some("PVR"));
++        e[20] ^= 1; // corrupted block
++        assert_eq!(manufacturer(&e), None);
+     }
+ }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
+index 2d95aa7d2..9c6c08887 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/mod.rs
+@@ -33,7 +33,8 @@ fn default_refresh_hz(model: PimaxP3CHmdDisplay) -> u8 {
+ }
+ /// The refresh rate sent to the headset. A requested rate (PIMAX_REFRESH_HZ) is only used if the headset's own
+ /// display lists it in its EDID: the rate goes to the headset unchecked, and a rate the panel cannot drive must
+-/// never reach it. Without a readable headset EDID only the model default is used. Resolved once per process.
++/// never reach it. Without a readable headset EDID only the model default is used. Resolved once per process,
++/// first right before the rate is sent (after the headset's video work mode is set, when its display is up).
+ pub fn refresh_hz(model: PimaxP3CHmdDisplay) -> u8 {
+     static RATE: OnceLock<u8> = OnceLock::new();
+     *RATE.get_or_init(|| {
+@@ -48,25 +49,27 @@ pub fn refresh_hz(model: PimaxP3CHmdDisplay) -> u8 {
+             sleep(Duration::from_millis(300));
+             rates = edid::headset_rates();
+         }
+-        match (&rates, requested) {
+-            (Some(r), _) => info!("headset display modes: {r:?} Hz"),
+-            (None, _) => warn!("no headset EDID found; refresh rate stays at the model default {default} Hz"),
++        match &rates {
++            Some(r) => info!("headset display modes: {r:?} Hz"),
++            None => warn!("no headset EDID found; refresh rate stays at the model default {default} Hz"),
+         }
+-        let supported = |hz: i64| rates.as_ref().is_some_and(|r| u32::try_from(hz).is_ok_and(|hz| r.contains(&hz)));
++        let Some(rates) = rates else { return default };
++        let listed = |hz: i64| u32::try_from(hz).is_ok_and(|hz| rates.contains(&hz));
+         if requested > 0 && i64::from(default) != requested {
+-            if supported(requested) {
+-                return requested as u8;
++            if let (true, Ok(hz)) = (listed(requested), u8::try_from(requested)) {
++                return hz;
+             }
+-            warn!("{REFRESH_HZ_ENV}={requested} is not offered by this headset; using {default} Hz instead");
++            warn!("{REFRESH_HZ_ENV}={requested} is not offered by this headset; using the default instead");
+         }
+-        if rates.is_some() && !supported(default.into()) {
+-            // The model default is not in the EDID either: pick the highest listed rate at or below it.
+-            if let Some(&hz) = rates.as_ref().and_then(|r| r.range(..=u32::from(default)).next_back()) {
+-                warn!("the model default {default} Hz is not offered by this headset; using {hz} Hz");
+-                return hz as u8;
+-            }
++        if listed(default.into()) {
++            return default;
+         }
+-        default
++        // The model default is not listed either: the highest listed rate below it, else the lowest listed one.
++        // (edid_rates only returns 24..=255 Hz, so the conversion cannot fail.)
++        let hz = rates.range(..=u32::from(default)).next_back().or_else(|| rates.first()).copied();
++        let hz = hz.and_then(|hz| u8::try_from(hz).ok()).unwrap_or(default);
++        warn!("the model default {default} Hz is not offered by this headset; using {hz} Hz");
++        hz
+     })
+ }
+ 
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/video.rs b/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
+index a99492c89..8aadccc1d 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/video.rs
+@@ -1,6 +1,7 @@
+ use super::command::CommandSession;
+ use pimax_protocol::cmd::get_video_ctrl_info::CmdGetVideoCtrlInfo;
+ use pimax_protocol::cmd::video_ctrl::{CmdVideoCtrl, GpuType};
++use crate::device::hmd::PimaxP3CHmdDisplay;
+ use pimax_protocol::{CommandDevice, Error};
+ use std::thread::sleep;
+ 
+@@ -23,16 +24,19 @@ fn gpu_type() -> GpuType {
+     }
+ }
+ 
+-pub(super) fn start_video(cmd: &CommandDevice, rate_hz: u8) -> Result<(), Error> {
++/// Starts video and returns the refresh rate sent to the headset.
++pub(super) fn start_video(cmd: &CommandDevice, model: PimaxP3CHmdDisplay) -> Result<u8, Error> {
+     cmd.query(&CmdVideoCtrl::SetWorkMode(gpu_type()))?;
+     match cmd.query(&CmdGetVideoCtrlInfo) {
+         Ok(payload) => debug!("GetVideoCtrlInfo -> {payload:02X?}"),
+         Err(e) => warn!("GetVideoCtrlInfo: {e}"),
+     }
+     sleep(Duration::from_secs(6));
++    // Resolved here, not earlier: the headset display (and its EDID) may only be up after the work mode is set.
++    let rate_hz = super::refresh_hz(model);
+     cmd.query(&CmdVideoCtrl::SetRate(rate_hz))?;
+     cmd.query(&CmdVideoCtrl::Start)?;
+-    Ok(())
++    Ok(rate_hz)
+ }
+ 
+ impl CommandSession {
+-- 
+2.56.0
+

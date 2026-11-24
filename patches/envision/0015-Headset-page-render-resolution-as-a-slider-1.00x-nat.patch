@@ -1,0 +1,85 @@
+From 245ac33986e839d4891f92c4cb3257c059e63e9b Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 13:54:03 +0100
+Subject: [PATCH] Headset page: render resolution as a slider (1.00x = native)
+
+Replaces the percentage spin box with a slider from 0.30x to 1.50x, a mark at
+native, and a caption with the resulting share of native pixels (the factor
+applies per axis). Same setting as Preferences -> Render scale.
+---
+ src/ui/pimax_pages.rs | 52 +++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 43 insertions(+), 9 deletions(-)
+
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index b8cbf5f..97e28ec 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -11,6 +11,46 @@ use relm4::{ComponentParts, ComponentSender, SimpleComponent, gtk};
+ 
+ const DASH: &str = "\u{2014}";
+ 
++/// Render resolution slider: 1.00× = the panel's native resolution, lower values render fewer pixels.
++/// The factor applies per axis (width and height), so the pixel count goes with its square.
++fn render_resolution_row<F: Fn(f64) + 'static>(percent: f64, on_change: F) -> adw::ActionRow {
++    fn caption(pct: f64) -> String {
++        let f = pct / 100.0;
++        format!("{f:.2}\u{00d7}  \u{00b7}  {:.0} % of the native pixels", f * f * 100.0)
++    }
++    let row = adw::ActionRow::builder()
++        .title("Render resolution")
++        .subtitle(caption(percent))
++        .build();
++    let adj = gtk::Adjustment::new(percent.clamp(30.0, 150.0), 30.0, 150.0, 5.0, 10.0, 0.0);
++    let scale = gtk::Scale::builder()
++        .adjustment(&adj)
++        .draw_value(false)
++        .hexpand(true)
++        .width_request(260)
++        .valign(gtk::Align::Center)
++        .build();
++    scale.add_mark(100.0, gtk::PositionType::Bottom, Some("native"));
++    scale.set_tooltip_text(Some(
++        "Resolution the apps render at, relative to the panel. Left = faster, right of native = supersampling.",
++    ));
++    {
++        let row = row.clone();
++        adj.connect_value_changed(move |a| {
++            // snap to 5 % steps so the stored value stays readable
++            let v = (a.value() / 5.0).round() * 5.0;
++            if (v - a.value()).abs() > f64::EPSILON {
++                a.set_value(v);
++                return;
++            }
++            row.set_subtitle(&caption(v));
++            on_change(v);
++        });
++    }
++    row.add_suffix(&scale);
++    row
++}
++
+ fn page_root() -> gtk::Box {
+     gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).vexpand(true).build()
+ }
+@@ -221,15 +261,9 @@ impl SimpleComponent for HeadsetPage {
+         // Same setting as Preferences → Render scale (stored there, not as a separate env var).
+         display.add(&{
+             let c = ctx.clone();
+-            super::preference_rows::spin_row(
+-                "Render resolution (%)",
+-                Some("Compositor render scale; 100 = native panel resolution. Same as Preferences \u{2192} Render scale"),
+-                f64::from(init.scale_percentage),
+-                30.0,
+-                200.0,
+-                5.0,
+-                move |adj| c.set("XRT_COMPOSITOR_SCALE_PERCENTAGE", Some(format!("{:.0}", adj.value()))),
+-            )
++            render_resolution_row(f64::from(init.scale_percentage), move |pct| {
++                c.set("XRT_COMPOSITOR_SCALE_PERCENTAGE", Some(format!("{pct:.0}")))
++            })
+         });
+         display.add(&ctx.choice_row(
+             "PIMAX_FOV_PERCENT",
+-- 
+2.56.0
+

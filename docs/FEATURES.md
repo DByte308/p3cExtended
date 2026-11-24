@@ -35,11 +35,14 @@ Settings are stored as global env vars in `~/.config/envision/envision.json` and
 | Advanced page env-var list refreshes when shown | built |
 | Live options without a restart: render IPD offset, view cant, eye calibration and flip, stick dead zone. Envision writes the changed ones to `$XDG_RUNTIME_DIR/pimax-p3c/settings.json`; the driver re-reads it (files older than the service process are ignored) and reports `live_settings` in its status file, and only then does Envision skip the Restart banner. IPD offset and cant reach SteamVR games only on restart | built (patches 0024–0025, Envision 0012–0013), untested in the headset |
 | Pimax pages refresh when Preferences closes; edits are saved 0.5 s after the last change | built |
+| Render resolution slider (1.00× = native, 0.30×–1.50×, shows the share of native pixels) | built (patch 0015) |
+| Audio: switch sound output and microphone on Start (headset automatic or any device), restore on Stop; via `pactl` (PulseAudio or PipeWire); waits up to 20 s for the headset's audio to appear | built (patches 0017, 0018); tested switch and restore of the microphone, not yet in a full session |
+| Per-second controller diagnostics in the log | debug level only: `PIMAX_LOG=debug` (patch 0030) |
 
 ## Display
 | Feature | How | Status |
 |---|---|---|
-| Refresh rate 72 / 90 / 120 Hz | `PIMAX_REFRESH_HZ` → vision cmd 0x1A SetRate | driver support exists; **todo: test 72 Hz** (the NVIDIA direct-mode mode list must offer it) |
+| Refresh rate 72 / 90 / 120 Hz | `PIMAX_REFRESH_HZ` → vision cmd 0x1A SetRate | driver support exists; only rates listed in the headset display's EDID are sent, checked right before the rate is sent (EDID checksums verified); anything else falls back to the model default, or to a listed rate if the default is not listed (patches 0029, 0031); Envision greys out unlisted rates (patches 0016, 0018). The Crystal Super tested here lists 72 and 90 Hz. **todo: test 72 Hz** |
 | Render resolution | `XRT_COMPOSITOR_SCALE_PERCENTAGE` (Monado) | done (variable existed) |
 | Brightness 0–100 | probably KV param `pbrg` via CmdKvRead/CmdKvWrite (0x27/0x26) | todo M: key/format to be confirmed on the device |
 | Local dimming (OLED/mini-LED models) | KV `ld_level`, separate HID 34a4:0041, `local_dimming` table in the config | todo M–L |
