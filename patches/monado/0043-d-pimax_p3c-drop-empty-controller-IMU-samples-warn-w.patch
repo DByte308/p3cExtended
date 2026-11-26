@@ -1,0 +1,178 @@
+From df337c8528b64fa0cc6372a0de0ee2c98c5d2e35 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:06:03 +0100
+Subject: [PATCH 43/44] d/pimax_p3c: drop empty controller IMU samples, warn
+ when the IMU stalls
+
+Controllers send single samples with every accelerometer and gyro axis at
+exactly zero, about once a second (15-37 per minute-long recording, on both
+hands). They carry no measurement but were pushed to the tracker as a
+sudden stop with no gravity. They are now dropped like the placeholder
+samples after connect.
+
+Also warn (always, not only at debug level), once per occurrence and when it
+ends: when a controller sends reports but no IMU sample reaches tracking for
+5 s, and when its gyro repeats one unchanging value for 5 s. Both leave the
+orientation without rotation between camera solves. Nothing is checked while
+the controller tracker is not running (lighthouse faceplate, no calibration).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/session/status.rs    | 90 +++++++++++++++++--
+ 1 file changed, 83 insertions(+), 7 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index 76d937b79..be9d03e2d 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -21,10 +21,15 @@ pub struct ControllerDiag {
+     pub no_clock: AtomicU64,
+     pub imu_pushed: AtomicU64,
+     pub imu_placeholder: AtomicU64,
++    /// Reports that arrived while the controller tracker was not running (no IMU can be pushed then).
++    pub no_tracker: AtomicU64,
+     pub pose_queries: AtomicU64,
+     pub pose_valid: AtomicU64,
+     /// Raw accelerometer sum (g) and count since the last log line.
+     pub accel_sum: std::sync::Mutex<[f64; 4]>,
++    /// Last pushed gyro sample and the summed change between pushed samples since the last log line (deg/s); a
++    /// real gyro never repeats one value exactly for a whole second.
++    pub gyro_motion: std::sync::Mutex<Option<([f32; 3], f64)>>,
+ }
+ 
+ pub static CONTROLLER_DIAG: [ControllerDiag; 2] = [const { ControllerDiag::new() }, const { ControllerDiag::new() }];
+@@ -37,6 +42,8 @@ impl ControllerDiag {
+             no_clock: AtomicU64::new(0),
+             imu_pushed: AtomicU64::new(0),
+             imu_placeholder: AtomicU64::new(0),
++            no_tracker: AtomicU64::new(0),
++            gyro_motion: std::sync::Mutex::new(None),
+             pose_queries: AtomicU64::new(0),
+             pose_valid: AtomicU64::new(0),
+             accel_sum: std::sync::Mutex::new([0.0; 4]),
+@@ -128,9 +135,12 @@ fn controller_axes(v: [f64; 3]) -> [f64; 3] {
+     map.map(|(i, s)| v[i] * s)
+ }
+ 
+-/// All three gyro axes at the same large negative value: the placeholder a controller sends before its IMU runs.
+-fn is_placeholder_gyro(gyro: &[f32; 3]) -> bool {
+-    gyro[0] < -1000.0 && gyro[1] == gyro[0] && gyro[2] == gyro[0]
++/// A sample without a measurement: all three gyro axes at the same large negative value (the placeholder a
++/// controller sends before its IMU runs), or an accelerometer reading of exactly zero on every axis (an empty sample;
++/// a real accelerometer always sees gravity or motion).
++fn is_placeholder(sample: &ImuSample) -> bool {
++    let g = &sample.gyro;
++    (g[0] < -1000.0 && g[1] == g[0] && g[2] == g[0]) || sample.accel.iter().all(|&a| a == 0.0)
+ }
+ 
+ fn log_controller_diag(now: i64) {
+@@ -148,13 +158,68 @@ fn log_controller_diag(now: i64) {
+         m
+     };
+     let [l, r] = &CONTROLLER_DIAG;
++    let c: [[u64; 6]; 2] = [l, r].map(|d| {
++        [take(&d.reports), take(&d.no_clock), take(&d.imu_pushed), take(&d.imu_placeholder), take(&d.pose_valid), take(&d.pose_queries)]
++    });
+     // Diagnostics for controller tracking; once per second, so only at debug level.
+     debug!(
+         "controllers 1 s: L reports {} no_clock {} imu {} (placeholder {}) pose {}/{} | R reports {} no_clock {} imu {} (placeholder {}) pose {}/{} | raw accel g L {:.3?} R {:.3?}",
+-        take(&l.reports), take(&l.no_clock), take(&l.imu_pushed), take(&l.imu_placeholder), take(&l.pose_valid), take(&l.pose_queries),
+-        take(&r.reports), take(&r.no_clock), take(&r.imu_pushed), take(&r.imu_placeholder), take(&r.pose_valid), take(&r.pose_queries),
++        c[0][0], c[0][1], c[0][2], c[0][3], c[0][4], c[0][5],
++        c[1][0], c[1][1], c[1][2], c[1][3], c[1][4], c[1][5],
+         mean(l), mean(r),
+     );
++    for (hand, (c, d)) in c.iter().zip([l, r]).enumerate() {
++        let no_tracker = take(&d.no_tracker);
++        // Change summed over the second; the last sample is kept so the next second continues from it.
++        let gyro_change = d.gyro_motion.lock().unwrap().as_mut().map(|(_, sum)| std::mem::take(sum));
++        if no_tracker == 0 {
++            watch_imu_stall(hand, c[0], c[1], c[2], c[3]);
++            watch_gyro_frozen(hand, c[2], gyro_change);
++        }
++    }
++}
++
++/// Seconds in a row a controller sent reports without any IMU sample reaching tracking, per hand.
++static IMU_STALL_SECS: [AtomicU64; 2] = [const { AtomicU64::new(0) }, const { AtomicU64::new(0) }];
++/// Without IMU samples a controller's orientation is no longer carried between camera solves.
++const IMU_STALL_WARN_SECS: u64 = 5;
++
++/// Always-on warning (once per stall, and when it ends) for a controller whose reports arrive but whose IMU
++/// samples do not reach tracking; the counters say whether they were placeholders or had no clock.
++fn watch_imu_stall(hand: usize, reports: u64, no_clock: u64, imu: u64, placeholder: u64) {
++    let name = if hand == 0 { "left" } else { "right" };
++    let secs = &IMU_STALL_SECS[hand];
++    if reports > 0 && imu == 0 {
++        let n = secs.fetch_add(1, Ordering::Relaxed) + 1;
++        if n == IMU_STALL_WARN_SECS {
++            warn!(
++                "{name} controller: reports arrive but no IMU sample reached tracking for {n} s (last second: {reports} reports, {no_clock} without clock, {placeholder} empty samples)"
++            );
++        }
++    } else if secs.swap(0, Ordering::Relaxed) >= IMU_STALL_WARN_SECS {
++        if imu > 0 {
++            warn!("{name} controller: IMU samples reach tracking again");
++        } else {
++            warn!("{name} controller: stopped reporting (switched off or out of range)");
++        }
++    }
++}
++
++/// Seconds in a row a controller's pushed gyro samples did not change at all, per hand.
++static GYRO_FROZEN_SECS: [AtomicU64; 2] = [const { AtomicU64::new(0) }, const { AtomicU64::new(0) }];
++
++/// Always-on warning for a gyro that repeats one value while samples keep arriving: tracking then gets no rotation
++/// from it between camera solves.
++fn watch_gyro_frozen(hand: usize, imu: u64, change: Option<f64>) {
++    let name = if hand == 0 { "left" } else { "right" };
++    let secs = &GYRO_FROZEN_SECS[hand];
++    if imu > 1 && change == Some(0.0) {
++        if secs.fetch_add(1, Ordering::Relaxed) + 1 == IMU_STALL_WARN_SECS {
++            warn!("{name} controller: the gyro has reported one unchanging value for {IMU_STALL_WARN_SECS} s");
++        }
++    } else if secs.swap(0, Ordering::Relaxed) >= IMU_STALL_WARN_SECS && imu > 1 {
++        warn!("{name} controller: the gyro changes again");
++    }
+ }
+ use std::thread;
+ use std::thread::JoinHandle;
+@@ -263,6 +328,9 @@ impl OnReport for ControllerStatus {
+                 .unwrap()
+                 .to_host(sample.timestamp_us as i64 * 1000)
+         };
++        if tracking.constellation.get().is_none() {
++            diag.no_tracker.fetch_add(1, Ordering::Relaxed);
++        }
+         let Some(host_ns) = to_host(&self.imu[0]) else {
+             diag.no_clock.fetch_add(1, Ordering::Relaxed);
+             return;
+@@ -279,8 +347,9 @@ impl OnReport for ControllerStatus {
+                     continue;
+                 }
+                 // The first ~30 samples after a controller connects carry the lowest raw value on all three gyro
+-                // axes (about -4000 deg/s each): no measurement, and a large kick to the fusion if pushed.
+-                if is_placeholder_gyro(&sample.gyro) {
++                // axes (about -4000 deg/s each), and single empty (all-zero) samples show up about once a second:
++                // no measurement, and a kick to the fusion if pushed.
++                if is_placeholder(sample) {
+                     diag.imu_placeholder.fetch_add(1, Ordering::Relaxed);
+                     continue;
+                 }
+@@ -293,6 +362,13 @@ impl OnReport for ControllerStatus {
+                     }
+                     a[3] += 1.0;
+                 }
++                {
++                    let mut m = diag.gyro_motion.lock().unwrap();
++                    let change = m.map_or(0.0, |(prev, sum)| {
++                        sum + (0..3).map(|i| (sample.gyro[i] - prev[i]).abs() as f64).sum::<f64>()
++                    });
++                    *m = Some((sample.gyro, change));
++                }
+                 constellation.push_controller_imu(
+                     hand,
+                     sample_ns,
+-- 
+2.56.0
+

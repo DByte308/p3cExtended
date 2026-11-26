@@ -1,0 +1,192 @@
+From c486e9c53a66c24a8814dbe66e9969bca4505dd1 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:54:26 +0100
+Subject: [PATCH] t/constellation: reject re-acquisition whose blobs belong to
+ another device in 2D
+
+When a camera sees an actively tracked controller (e.g. dev 0) without solving
+it first, its unclaimed blobs can be fit by the other controller's mirror-image
+LED model during re-acquisition. That false solve lands ~10-12 cm off the other
+controller's origin (outside the 6-8 cm 3D exclusion radius) and yanks the
+prior away.
+
+Project each other actively tracked device's LED model into the current camera
+using pose_metrics_match_pose_to_blobs and refuse the re-acquisition if >=3
+claimed blobs match its LEDs or >=half fall inside its 2D LED bounds (with a
+15 px margin). Controlled by CONSTELLATION_REACQUIRE_2D_BLOB_CHECK (default 1).
+---
+ .../constellation/t_constellation_tracker.cpp | 95 +++++++++++++++----
+ 1 file changed, 75 insertions(+), 20 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index adfae6d7d..20ede8702 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -44,6 +44,9 @@ DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_gap_ms, "CONSTELLATION_PRIOR_
+ // with the device's own IMU-carried prediction; 0 disables the check. Needs the prior gate on (DEG > 0).
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_exclude_cm, "CONSTELLATION_REACQUIRE_EXCLUDE_CM", 6)
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_agree_deg, "CONSTELLATION_REACQUIRE_AGREE_DEG", 45)
++// 2D cross-projection check during re-acquisition: refuse if the claimed blobs fall on another tracked device's
++// projected LEDs in this camera (catches mirror-image false solves that land >8 cm off the other device's origin).
++DEBUG_GET_ONCE_BOOL_OPTION(constellation_reacquire_2d_blob_check, "CONSTELLATION_REACQUIRE_2D_BLOB_CHECK", true)
+ // Exclusion radius while the device's prior is untrusted (escape, and re-acquisition until the fusion has a prior).
+ // 15 cm refused the right controller's own solves while it pointed at the left hand (2026-11-25, 11-15 cm apart);
+ // mirrored-ring mis-solves landed within about 2 cm.
+@@ -985,15 +988,17 @@ reacquire_lands_on_other_device(ConstellationTracker *tracker,
+                                 const DeviceState &device_state,
+                                 const Device *device,
+                                 const xrt_pose &Txr_world_device,
++                                struct camera_model *cam_model,
+                                 int64_t gap_ns,
+                                 bool prior_untrusted)
+ {
+ 	int64_t exclude_cm = debug_get_num_option_constellation_reacquire_exclude_cm();
+-	if (exclude_cm <= 0) {
++	const bool check_2d = debug_get_bool_option_constellation_reacquire_2d_blob_check();
++	if (exclude_cm <= 0 && !check_2d) {
+ 		return false;
+ 	}
+ 	// The prior was just declared lost: its orientation cannot vouch for the solve, so use a wider radius instead.
+-	if (prior_untrusted) {
++	if (prior_untrusted && exclude_cm > 0) {
+ 		exclude_cm = std::max<int64_t>(exclude_cm, debug_get_num_option_constellation_reacquire_strict_cm());
+ 	}
+ 	// After a gap the predicted position is unreliable but the gyro-carried orientation is not: a solve that agrees
+@@ -1006,6 +1011,20 @@ reacquire_lands_on_other_device(ConstellationTracker *tracker,
+ 			return false;
+ 		}
+ 	}
++	// Copy the blobs claimed by `device` so we can test whether they actually belong to another tracked device's
++	// projected LEDs in this camera (without mutating sample.blobs).
++	t_blob claimed[XRT_CONSTELLATION_MAX_LEDS_PER_DEVICE];
++	uint32_t n_claimed = 0;
++	if (check_2d && cam_model != nullptr && sample.Txr_world_cam.has_value()) {
++		for (uint32_t i = 0; i < sample.blob_count && n_claimed < XRT_CONSTELLATION_MAX_LEDS_PER_DEVICE; i++) {
++			if (sample.blobs[i].matched_device_id == device->id) {
++				claimed[n_claimed] = sample.blobs[i];
++				claimed[n_claimed].matched_device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
++				claimed[n_claimed].matched_device_led_id = XRT_CONSTELLATION_INVALID_LED_ID;
++				n_claimed++;
++			}
++		}
++	}
+ 	// The caller holds tracker->device_lock (shared), which keeps tracker->devices stable.
+ 	for (const std::unique_ptr<Device> &other : tracker->devices) {
+ 		if (other.get() == device) {
+@@ -1020,26 +1039,60 @@ reacquire_lands_on_other_device(ConstellationTracker *tracker,
+ 			continue; // not tracked right now, so it has no claim on these LEDs
+ 		}
+ 		// Where the other device is now: its prediction for this sample, else its last optical pose.
+-		xrt_vec3 other_pos = other_last->Txr_world_device.position;
++		xrt_pose other_pose = other_last->Txr_world_device;
+ 		for (uint32_t i = 0; i < sample.device_count; i++) {
+ 			const DeviceState &ds = sample.device_states[i];
+ 			if (ds.device_id == other->id && ds.Txr_world_device_prior.has_value()) {
+-				other_pos = ds.Txr_world_device_prior->position;
++				other_pose = ds.Txr_world_device_prior.value();
+ 			}
+ 		}
+-		const float dist_cm = m_vec3_len(Txr_world_device.position - other_pos) * 100.0f;
+-		if (dist_cm > (float)exclude_cm) {
+-			continue;
++		const float dist_cm = m_vec3_len(Txr_world_device.position - other_pose.position) * 100.0f;
++		if (exclude_cm > 0 && dist_cm <= (float)exclude_cm) {
++			static std::atomic<uint64_t> refused[8];
++			const uint64_t n = ++refused[std::min<size_t>((size_t)device->id, 7)];
++			if (n <= 5 || (n & (n - 1)) == 0) {
++				CT_WARN(tracker,
++				        "Refused re-acquisition #%" PRIu64 " of device %d: %.0f cm from tracked device %d (limit %" PRIi64
++				        " cm)",
++				        n, (int)device->id, dist_cm, (int)other->id, exclude_cm);
++			}
++			return true;
+ 		}
+-		static std::atomic<uint64_t> refused[8];
+-		const uint64_t n = ++refused[std::min<size_t>((size_t)device->id, 7)];
+-		if (n <= 5 || (n & (n - 1)) == 0) {
+-			CT_WARN(tracker,
+-			        "Refused re-acquisition #%" PRIu64 " of device %d: %.0f cm from tracked device %d (limit %" PRIi64
+-			        " cm)",
+-			        n, (int)device->id, dist_cm, (int)other->id, exclude_cm);
++		// 2D cross-projection: if `other` is actively tracked (e.g. by another camera) and our claimed blobs in this
++		// camera fall on `other`'s projected LEDs, this solve stole `other`'s unclaimed blobs (mirror-image false
++		// solves can land ~10-12 cm off `other`'s origin, outside the 3D radius above).
++		if (n_claimed > 0) {
++			xrt_pose Txr_cam_world, Txr_cam_other, Tcv_cam_other;
++			math_pose_invert(&sample.Txr_world_cam.value(), &Txr_cam_world);
++			math_pose_transform(&Txr_cam_world, &other_pose, &Txr_cam_other);
++			math_pose_convert_from_opencv(&Txr_cam_other, &Tcv_cam_other);
++			pose_metrics_blob_match_info other_match;
++			if (pose_metrics_match_pose_to_blobs(&Tcv_cam_other, claimed, (int)n_claimed, &other->params.led_model,
++			                                     other->id, cam_model, &other_match)) {
++				constexpr float kMarginPx = 15.0f;
++				uint32_t in_bounds = 0;
++				for (uint32_t i = 0; i < n_claimed; i++) {
++					const float bx = claimed[i].center_undistorted.x;
++					const float by = claimed[i].center_undistorted.y;
++					if (bx >= other_match.bounds.left - kMarginPx && bx <= other_match.bounds.right + kMarginPx &&
++					    by >= other_match.bounds.top - kMarginPx && by <= other_match.bounds.bottom + kMarginPx) {
++						in_bounds++;
++					}
++				}
++				if (other_match.matched_blobs >= 3 || in_bounds * 2 >= n_claimed) {
++					static std::atomic<uint64_t> refused_2d[8];
++					const uint64_t n = ++refused_2d[std::min<size_t>((size_t)device->id, 7)];
++					if (n <= 5 || (n & (n - 1)) == 0) {
++						CT_WARN(tracker,
++						        "Refused 2D re-acquisition #%" PRIu64
++						        " of device %d: %u/%u blobs (%u LED matches) belong to tracked device %d (%.0f cm apart)",
++						        n, (int)device->id, in_bounds, n_claimed, other_match.matched_blobs, (int)other->id,
++						        dist_cm);
++					}
++					return true;
++				}
++			}
+ 		}
+-		return true;
+ 	}
+ 	return false;
+ }
+@@ -1049,7 +1102,8 @@ prior_gate_accepts(ConstellationTracker *tracker,
+                    const CameraSample &sample,
+                    const DeviceState &device_state,
+                    Device *device,
+-                   const xrt_pose &Tcv_cam_device)
++                   const xrt_pose &Tcv_cam_device,
++                   struct camera_model *cam_model)
+ {
+ 	const int64_t max_deg = debug_get_num_option_constellation_prior_gate_deg();
+ 	if (max_deg <= 0 || !sample.Txr_world_cam.has_value()) {
+@@ -1074,8 +1128,8 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 	const size_t lost_slot = std::min<size_t>((size_t)device->id, 7);
+ 	if (reacquire) {
+ 		const bool untrusted = prior_lost[lost_slot].load();
+-		return !reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, gap_ns,
+-		                                        untrusted);
++		return !reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, cam_model,
++		                                        gap_ns, untrusted);
+ 	}
+ 	prior_lost[lost_slot].store(false);
+ 
+@@ -1151,7 +1205,8 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 		}
+ 	}
+ 	if (escaped) {
+-		if (reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, gap_ns, true)) {
++		if (reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, cam_model, gap_ns,
++		                                    true)) {
+ 			rejected[slot]++;
+ 			return false;
+ 		}
+@@ -1264,7 +1319,7 @@ Camera::pushPose(CameraSample &camera_sample,
+ 		    NULL);                     //
+ 	}
+ 
+-	if (!prior_gate_accepts(tracker, camera_sample, device_state, device, Tcv_cam_device)) {
++	if (!prior_gate_accepts(tracker, camera_sample, device_state, device, Tcv_cam_device, &this->model)) {
+ 		// Leave the blobs free for the device they belong to.
+ 		for (uint32_t i = 0; i < camera_sample.blob_count; i++) {
+ 			t_blob &b = camera_sample.blobs[i];
+-- 
+2.56.0
+

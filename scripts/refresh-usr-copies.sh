@@ -15,9 +15,20 @@ fi
 L=$PIMAX_PREFIX
 SL=$(pimax_libdir "$L" libopenxr_monado.so) || { echo "no libopenxr_monado.so under $L" >&2; exit 1; }
 for dst in /usr /usr/local; do
+  # Only sync /usr/local if a copy already exists there; avoid creating a second stale copy.
+  if [ "$dst" = "/usr/local" ] && [ ! -e "$dst/bin/monado-service" ]; then
+    continue
+  fi
   DL=$(pimax_libdir "$dst" libopenxr_monado.so || echo "$dst/${SL#"$L"/}")
+  mkdir -p "$dst/bin" "$DL"
   install -m755 "$L/bin/monado-service" "$dst/bin/monado-service"
-  for f in libopenxr_monado.so libmonado.so.25.1.0; do install -m755 "$SL/$f" "$DL/$f"; done
+  install -m755 "$SL/libopenxr_monado.so" "$DL/libopenxr_monado.so"
+  # Copy libmonado.so and all versioned symlinks/targets without hardcoding a soversion,
+  # and without preserving non-root ownership or user_home_t SELinux labels.
+  cp -P --no-preserve=ownership,context "$SL"/libmonado.so* "$DL/"
+  for f in "$DL"/libmonado.so*; do
+    [ -f "$f" ] && [ ! -L "$f" ] && chmod 755 "$f"
+  done
   md5sum "$dst/bin/monado-service" "$DL/libopenxr_monado.so"
 done
 ldconfig

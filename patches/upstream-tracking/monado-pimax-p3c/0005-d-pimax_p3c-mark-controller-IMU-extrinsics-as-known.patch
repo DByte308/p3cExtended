@@ -1,0 +1,28 @@
+From 78ceaec333b1d80ea1436437706f4fb07d3a84bd Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:40:05 +0100
+Subject: [PATCH 5/6] d/pimax_p3c: mark controller IMU extrinsics as known
+
+The driver transforms the controller LED model into the IMU frame from
+calibration, so set imu_extrinsics_known=true to keep the model-to-IMU
+rotation fixed in sensor fusion.
+---
+ src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
+index 97d713cad..6a2d7300a 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
+@@ -44,6 +44,8 @@ impl Slot {
+         let mut params = t_constellation_tracker_device_params {
+             led_model: model.as_tracker_model(),
+             imu_sink: ptr::null_mut(),
++            // The LED model is moved into the IMU's frame above, using the controller's calibration.
++            imu_extrinsics_known: true,
+         };
+         let ret = unsafe {
+             t_constellation_tracker_add_device(tracker, &mut params, &mut slot.base, &mut slot.id)
+-- 
+2.56.0
+

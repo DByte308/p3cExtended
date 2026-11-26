@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared paths and helpers for the scripts in this directory. Source it, do not run it:
 #   . "$(dirname "$(readlink -f "$0")")/lib.sh"
 #

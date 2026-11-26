@@ -1,0 +1,255 @@
+From 5bf6482b78787ee4dcddd791460e4a8aa21f938a Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 08:40:00 +0100
+Subject: [PATCH] Audit fixes: audio-switch race, UI blocking, and session log
+ handle
+
+- Cancel the background audio-switch polling thread on session stop or
+  restart and tag completions with a generation counter so a stale thread
+  from before a restart preserves its pre-session defaults without
+  restoring audio mid-session or overwriting a newer switch.
+- Run audio_switch::restore off the UI thread on session stop (shutdown
+  still runs it synchronously so it completes before exit).
+- Probe pactl audio devices for audio_row off the GTK main thread so a
+  slow or hung sound server cannot freeze the Headset page.
+- Drop the session_log file handle when the XR service stops without
+  restarting.
+---
+ src/audio_switch.rs    | 24 ++++++++++++++++++++++-
+ src/ui/app.rs          | 39 ++++++++++++++++++++++++++++++-------
+ src/ui/pimax_common.rs | 44 ++++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 95 insertions(+), 12 deletions(-)
+
+diff --git a/src/audio_switch.rs b/src/audio_switch.rs
+index 4bd43b7..14794e1 100644
+--- a/src/audio_switch.rs
++++ b/src/audio_switch.rs
+@@ -174,7 +174,12 @@ pub fn wanted(output: Option<&str>, input: Option<&str>) -> bool {
+ /// Switch the defaults for the session and return what to restore afterwards. The headset's audio device can
+ /// appear only once the headset powers up, so a device that is missing is looked for again every second for up
+ /// to `wait`. Blocking: call it off the UI thread.
+-pub fn apply(output: Option<&str>, input: Option<&str>, wait: std::time::Duration) -> Switched {
++pub fn apply(
++    output: Option<&str>,
++    input: Option<&str>,
++    wait: std::time::Duration,
++    cancel: &std::sync::atomic::AtomicBool,
++) -> Switched {
+     let mut done = Switched::default();
+     if !wanted(output, input) {
+         return done;
+@@ -189,6 +194,9 @@ pub fn apply(output: Option<&str>, input: Option<&str>, wait: std::time::Duratio
+         .collect();
+     let until = std::time::Instant::now() + wait;
+     loop {
++        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
++            return done;
++        }
+         pending.retain(|&(kind, choice)| {
+             let Some(target) = resolve(kind, choice) else { return true };
+             let before = current_default(kind).unwrap_or_default();
+@@ -198,6 +206,9 @@ pub fn apply(output: Option<&str>, input: Option<&str>, wait: std::time::Duratio
+             }
+             false
+         });
++        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
++            return done;
++        }
+         if pending.is_empty() || std::time::Instant::now() >= until {
+             break;
+         }
+@@ -220,6 +231,17 @@ impl Switched {
+             }
+         }
+     }
++
++    /// Fold an earlier switch that arrived after a newer one (session restart): keep the earlier pre-session
++    /// default as the restore target, while keeping the newer switch's active device.
++    pub fn merge_earlier(&mut self, earlier: Switched) {
++        for (kind, before, set) in earlier.0 {
++            match self.0.iter_mut().find(|(k, _, _)| *k == kind) {
++                Some(e) => e.1 = before,
++                None => self.0.push((kind, before, set)),
++            }
++        }
++    }
+ }
+ 
+ /// Undo `apply`, but only where the default is still the device the session set (a change made by hand during
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index da0ae3c..3ab7243 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -90,6 +90,10 @@ pub struct App {
+     xrservice_worker: Option<JobWorker>,
+     /// Audio defaults changed for the running session, restored when it ends.
+     audio_restore: Option<crate::audio_switch::Switched>,
++    /// Cancellation flag for the background audio-switch polling thread.
++    audio_switch_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
++    /// Monotonic generation to order audio-switch completions across restarts.
++    audio_switch_gen: u64,
+     plugins_worker: Option<JobWorker>,
+     restart_xrservice: bool,
+     build_worker: Option<JobWorker>,
+@@ -131,7 +135,7 @@ pub enum Msg {
+     OnXrServiceLog(Vec<String>),
+     OnServiceExit(i32),
+     /// Audio defaults switched for the session (from a background thread).
+-    AudioSwitched(crate::audio_switch::Switched),
++    AudioSwitched(u64, crate::audio_switch::Switched),
+     OnPluginsExit(i32),
+     OnBuildLog(Vec<String>),
+     OnBuildExit(i32),
+@@ -309,18 +313,26 @@ impl App {
+             .then(crate::session_log::SessionLog::start)
+             .flatten();
+         {
++            if let Some(cancel) = self.audio_switch_cancel.take() {
++                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
++            }
++            self.audio_switch_gen = self.audio_switch_gen.wrapping_add(1);
++            let generation = self.audio_switch_gen;
+             let env = prof.environment_with_fallback(&self.config.global_preferences);
+             let output = env.get("PIMAX_AUDIO_OUTPUT").cloned();
+             let input = env.get("PIMAX_AUDIO_INPUT").cloned();
+             if crate::audio_switch::wanted(output.as_deref(), input.as_deref()) {
++                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++                self.audio_switch_cancel = Some(cancel.clone());
+                 let s = sender.input_sender().clone();
+                 std::thread::spawn(move || {
+                     let switched = crate::audio_switch::apply(
+                         output.as_deref(),
+                         input.as_deref(),
+                         std::time::Duration::from_secs(20),
++                        &cancel,
+                     );
+-                    s.emit(Msg::AudioSwitched(switched));
++                    s.emit(Msg::AudioSwitched(generation, switched));
+                 });
+             }
+         }
+@@ -456,6 +468,9 @@ impl AsyncComponent for App {
+         if let Some(worker) = self.xrservice_worker.as_ref() {
+             worker.stop();
+         }
++        if let Some(cancel) = self.audio_switch_cancel.take() {
++            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
++        }
+         if let Some(s) = self.audio_restore.take() {
+             crate::audio_switch::restore(s);
+         }
+@@ -504,13 +519,17 @@ impl AsyncComponent for App {
+                         .emit(DebugViewMsg::LogUpdated(rows));
+                 }
+             }
+-            Msg::AudioSwitched(switched) => {
++            Msg::AudioSwitched(generation, switched) => {
+                 if self.xrservice_worker.is_none() {
+                     // the session ended while the devices were being switched
+-                    crate::audio_switch::restore(switched);
++                    std::thread::spawn(move || crate::audio_switch::restore(switched));
+                 } else if let Some(prev) = self.audio_restore.as_mut() {
+-                    // a restart: keep the defaults from before the first start
+-                    prev.merge_later(switched);
++                    // a restart: keep the defaults from before the first start, regardless of completion order
++                    if generation == self.audio_switch_gen {
++                        prev.merge_later(switched);
++                    } else {
++                        prev.merge_earlier(switched);
++                    }
+                 } else {
+                     self.audio_restore = Some(switched);
+                 }
+@@ -549,8 +568,12 @@ impl AsyncComponent for App {
+                     self.restart_xrservice = false;
+                     self.start_xrservice(sender, false);
+                 } else {
++                    self.session_log = None;
++                    if let Some(cancel) = self.audio_switch_cancel.take() {
++                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
++                    }
+                     if let Some(s) = self.audio_restore.take() {
+-                        crate::audio_switch::restore(s);
++                        std::thread::spawn(move || crate::audio_switch::restore(s));
+                     }
+                     // run AfterStop plugins
+                     sender.input(Msg::RunAfterStopPlugins);
+@@ -1498,6 +1521,8 @@ impl AsyncComponent for App {
+             profiles,
+             xrservice_worker: None,
+             audio_restore: None,
++            audio_switch_cancel: None,
++            audio_switch_gen: 0,
+             plugins_worker: None,
+             build_worker: None,
+             monado_gui_worker: None,
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index 85e6acb..27c70ef 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -393,15 +393,14 @@ impl Ctx {
+         let values: Rc<RefCell<Vec<Option<String>>>> = Rc::new(RefCell::new(Vec::new()));
+         let updating = Rc::new(std::cell::Cell::new(false));
+         let row = adw::ComboRow::builder().title(title).subtitle_lines(0).build();
++        let req_gen = Rc::new(std::cell::Cell::new(0u64));
+ 
+-        let rebuild = {
++        let apply_devices = {
+             let c = self.clone();
+             let values = values.clone();
+             let updating = updating.clone();
+-            move |row: &adw::ComboRow| {
++            Rc::new(move |row: &adw::ComboRow, ok: bool, devices: Vec<audio::Device>| {
+                 let cur = c.get(k).filter(|v| !v.is_empty());
+-                let ok = audio::available();
+-                let devices = if ok { audio::list(kind) } else { Vec::new() };
+                 let headset = audio::headset_device(&devices).map(|d| d.description.clone());
+                 let mut labels = vec![
+                     "Don't change".to_string(),
+@@ -430,6 +429,43 @@ impl Ctx {
+                 } else {
+                     "Needs pactl with PulseAudio or PipeWire (pipewire-pulse); not found"
+                 });
++            })
++        };
++        let rebuild = {
++            let apply_devices = apply_devices.clone();
++            let req_gen = req_gen.clone();
++            move |row: &adw::ComboRow| {
++                let generation = req_gen.get().wrapping_add(1);
++                req_gen.set(generation);
++                let (tx, rx) = std::sync::mpsc::channel();
++                std::thread::spawn(move || {
++                    let ok = audio::available();
++                    let devices = if ok { audio::list(kind) } else { Vec::new() };
++                    let _ = tx.send((ok, devices));
++                });
++                let weak = row.downgrade();
++                let apply_devices = apply_devices.clone();
++                let req_gen = req_gen.clone();
++                gtk::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
++                    match rx.try_recv() {
++                        Ok((ok, devices)) => {
++                            if req_gen.get() == generation {
++                                if let Some(row) = weak.upgrade() {
++                                    apply_devices(&row, ok, devices);
++                                }
++                            }
++                            gtk::glib::ControlFlow::Break
++                        }
++                        Err(std::sync::mpsc::TryRecvError::Empty) => {
++                            if weak.upgrade().is_none() || req_gen.get() != generation {
++                                gtk::glib::ControlFlow::Break
++                            } else {
++                                gtk::glib::ControlFlow::Continue
++                            }
++                        }
++                        Err(std::sync::mpsc::TryRecvError::Disconnected) => gtk::glib::ControlFlow::Break,
++                    }
++                });
+             }
+         };
+         rebuild(&row);
+-- 
+2.56.0
+

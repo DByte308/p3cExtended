@@ -1,0 +1,290 @@
+From 86c47aba6481eac8310b5f235beef874ff367596 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:26:43 +0100
+Subject: [PATCH] d/pimax_p3c: 1-Euro still smoothing for controllers and HMD
+
+Adds a clean-room adaptive 1-Euro pose filter (position + SLERP quaternion)
+with timestamp deduplication so grip and aim queries on the same frame never
+double-filter, and automatic reset across gaps >250 ms.
+
+Live settings (applied without restart):
+- PIMAX_CTRL_SMOOTHING: gentle (default), strong, or off
+- PIMAX_HMD_SMOOTHING:  off (default) or gentle
+---
+ .../pimax_p3c/src/device/controller/mod.rs    |   1 +
+ .../drivers/pimax_p3c/src/device/hmd/mod.rs   |   5 +-
+ src/xrt/drivers/pimax_p3c/src/device/mod.rs   |   1 +
+ .../drivers/pimax_p3c/src/device/smoothing.rs | 216 ++++++++++++++++++
+ 4 files changed, 222 insertions(+), 1 deletion(-)
+ create mode 100644 src/xrt/drivers/pimax_p3c/src/device/smoothing.rs
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
+index 57c293aae..58d8b32f9 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
+@@ -137,6 +137,7 @@ unsafe extern "C" fn get_tracked_pose(
+     let mut relation = relation;
+     if relation.relation_flags.0 != 0 {
+         diag.pose_valid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        relation.pose = crate::device::smoothing::CTRL_FILTERS[me.hand as usize].filter_controller(at_ns, relation.pose);
+         let grip = matches!(
+             name,
+             xrt_input_name::XRT_INPUT_PIMAX_GRIP_POSE | xrt_input_name::XRT_INPUT_TOUCH_GRIP_POSE
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
+index f2844674e..01239d9e8 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/mod.rs
+@@ -213,12 +213,15 @@ unsafe extern "C" fn pimax_get_tracked_pose(
+     }
+     let me = unsafe { &*(xdev as *mut PimaxHmd) };
+ 
+-    let relation = me.tracking.slam_pose(at_ns).unwrap_or(xrt_space_relation {
++    let mut relation = me.tracking.slam_pose(at_ns).unwrap_or(xrt_space_relation {
+         relation_flags: xrt_space_relation_flags::XRT_SPACE_RELATION_ORIENTATION_VALID_BIT,
+         pose: XRT_POSE_IDENTITY,
+         linear_velocity: XRT_VEC3_ZERO,
+         angular_velocity: XRT_VEC3_ZERO,
+     });
++    if relation.relation_flags.0 != 0 {
++        relation.pose = crate::device::smoothing::HMD_FILTER.filter_hmd(at_ns, relation.pose);
++    }
+     unsafe { *out = relation };
+     xrt_result::XRT_SUCCESS
+ }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/mod.rs
+index cf1a50f4f..ab2d3ab71 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/mod.rs
+@@ -5,6 +5,7 @@ mod controller;
+ pub mod hmd;
+ pub mod session;
+ mod slam;
++pub(crate) mod smoothing;
+ mod tracking;
+ 
+ use crate::device::hmd::distortion::PimaxDeviceConfig;
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/smoothing.rs b/src/xrt/drivers/pimax_p3c/src/device/smoothing.rs
+new file mode 100644
+index 000000000..1336bfefb
+--- /dev/null
++++ b/src/xrt/drivers/pimax_p3c/src/device/smoothing.rs
+@@ -0,0 +1,216 @@
++//! Adaptive 1-Euro pose smoothing (Casiez et al., 2012) for controllers and HMD.
++//!
++//! Heavily smooths micro-jitter when held still and raises the cutoff linearly with speed so fast motion stays
++//! responsive. Controlled via live settings (no restart needed):
++//! - `PIMAX_CTRL_SMOOTHING`: `"off"` | `"gentle"` (default) | `"strong"`
++//! - `PIMAX_HMD_SMOOTHING`:  `"off"` (default) | `"gentle"`
++
++use monado_sys::{xrt_pose, xrt_quat, xrt_vec3};
++use std::f32::consts::TAU;
++use std::sync::Mutex;
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Mode {
++    Off,
++    Gentle,
++    Strong,
++}
++
++#[derive(Clone, Copy)]
++struct Params {
++    pos_min_cutoff: f32,
++    pos_beta: f32,
++    rot_min_cutoff: f32,
++    rot_beta: f32,
++    d_cutoff: f32,
++}
++
++const CTRL_GENTLE: Params = Params { pos_min_cutoff: 1.5, pos_beta: 60.0, rot_min_cutoff: 1.5, rot_beta: 15.0, d_cutoff: 30.0 };
++const CTRL_STRONG: Params = Params { pos_min_cutoff: 0.4, pos_beta: 120.0, rot_min_cutoff: 0.4, rot_beta: 30.0, d_cutoff: 30.0 };
++const HMD_GENTLE: Params = Params { pos_min_cutoff: 2.5, pos_beta: 100.0, rot_min_cutoff: 3.0, rot_beta: 40.0, d_cutoff: 30.0 };
++
++fn parse_mode(raw: Option<String>, default: Mode) -> Mode {
++    let Some(s) = raw else { return default };
++    match s.trim().to_ascii_lowercase().as_str() {
++        "0" | "off" | "false" | "none" => Mode::Off,
++        "1" | "gentle" | "low" | "on" | "true" => Mode::Gentle,
++        "2" | "strong" | "high" => Mode::Strong,
++        _ => default,
++    }
++}
++
++pub fn controller_mode() -> Mode {
++    parse_mode(crate::live::get_str("PIMAX_CTRL_SMOOTHING"), Mode::Gentle)
++}
++
++pub fn hmd_mode() -> Mode {
++    match parse_mode(crate::live::get_str("PIMAX_HMD_SMOOTHING"), Mode::Off) {
++        Mode::Off => Mode::Off,
++        Mode::Gentle | Mode::Strong => Mode::Gentle,
++    }
++}
++
++fn alpha(cutoff: f32, dt: f32) -> f32 {
++    let tau = 1.0 / (TAU * cutoff.max(1e-3));
++    1.0 / (1.0 + tau / dt)
++}
++
++fn norm_quat(q: [f32; 4]) -> [f32; 4] {
++    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
++    if n > 1e-6 { [q[0] / n, q[1] / n, q[2] / n, q[3] / n] } else { [0.0, 0.0, 0.0, 1.0] }
++}
++
++fn quat_angle(a: [f32; 4], b: [f32; 4]) -> f32 {
++    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]).abs().min(1.0);
++    2.0 * dot.acos()
++}
++
++fn slerp(a: [f32; 4], mut b: [f32; 4], t: f32) -> [f32; 4] {
++    let mut dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
++    if dot < 0.0 {
++        dot = -dot;
++        b = [-b[0], -b[1], -b[2], -b[3]];
++    }
++    if dot > 0.9995 {
++        return norm_quat([
++            a[0] + t * (b[0] - a[0]),
++            a[1] + t * (b[1] - a[1]),
++            a[2] + t * (b[2] - a[2]),
++            a[3] + t * (b[3] - a[3]),
++        ]);
++    }
++    let theta = dot.acos();
++    let sin_t = theta.sin();
++    let w0 = ((1.0 - t) * theta).sin() / sin_t;
++    let w1 = (t * theta).sin() / sin_t;
++    norm_quat([
++        w0 * a[0] + w1 * b[0],
++        w0 * a[1] + w1 * b[1],
++        w0 * a[2] + w1 * b[2],
++        w0 * a[3] + w1 * b[3],
++    ])
++}
++
++struct State {
++    last_ns: i64,
++    mode: Mode,
++    pos: [f32; 3],
++    rot: [f32; 4],
++    pos_speed: f32,
++    rot_speed: f32,
++}
++
++pub struct PoseFilter {
++    state: Mutex<Option<State>>,
++}
++
++impl PoseFilter {
++    pub const fn new() -> Self {
++        Self { state: Mutex::new(None) }
++    }
++
++    fn filter_with(&self, at_ns: i64, raw: xrt_pose, mode: Mode, params: Params) -> xrt_pose {
++        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        if mode == Mode::Off {
++            *guard = None;
++            return raw;
++        }
++        let raw_p = [raw.position.x, raw.position.y, raw.position.z];
++        let raw_q = norm_quat([raw.orientation.x, raw.orientation.y, raw.orientation.z, raw.orientation.w]);
++        if !raw_p.iter().all(|v| v.is_finite()) || !raw_q.iter().all(|v| v.is_finite()) {
++            *guard = None;
++            return raw;
++        }
++
++        let Some(st) = guard.as_mut() else {
++            *guard = Some(State { last_ns: at_ns, mode, pos: raw_p, rot: raw_q, pos_speed: 0.0, rot_speed: 0.0 });
++            return raw;
++        };
++
++        // Same timestamp (e.g. grip + aim queried for the same frame) or slightly older: return cached pose.
++        if at_ns <= st.last_ns {
++            return xrt_pose {
++                orientation: xrt_quat { x: st.rot[0], y: st.rot[1], z: st.rot[2], w: st.rot[3] },
++                position: xrt_vec3 { x: st.pos[0], y: st.pos[1], z: st.pos[2] },
++            };
++        }
++
++        let dt = (at_ns - st.last_ns) as f32 * 1e-9;
++        // Reset cleanly after a dropout (>250 ms) or mode change so the filter never drags across a gap.
++        if dt > 0.25 || st.mode != mode {
++            *st = State { last_ns: at_ns, mode, pos: raw_p, rot: raw_q, pos_speed: 0.0, rot_speed: 0.0 };
++            return raw;
++        }
++
++        let a_d = alpha(params.d_cutoff, dt);
++        let dp = [raw_p[0] - st.pos[0], raw_p[1] - st.pos[1], raw_p[2] - st.pos[2]];
++        let inst_pos_speed = (dp[0] * dp[0] + dp[1] * dp[1] + dp[2] * dp[2]).sqrt() / dt;
++        st.pos_speed += a_d * (inst_pos_speed - st.pos_speed);
++        let a_p = alpha(params.pos_min_cutoff + params.pos_beta * st.pos_speed, dt);
++        st.pos = [
++            st.pos[0] + a_p * (raw_p[0] - st.pos[0]),
++            st.pos[1] + a_p * (raw_p[1] - st.pos[1]),
++            st.pos[2] + a_p * (raw_p[2] - st.pos[2]),
++        ];
++
++        let inst_rot_speed = quat_angle(st.rot, raw_q) / dt;
++        st.rot_speed += a_d * (inst_rot_speed - st.rot_speed);
++        let a_r = alpha(params.rot_min_cutoff + params.rot_beta * st.rot_speed, dt);
++        st.rot = slerp(st.rot, raw_q, a_r);
++        st.last_ns = at_ns;
++
++        xrt_pose {
++            orientation: xrt_quat { x: st.rot[0], y: st.rot[1], z: st.rot[2], w: st.rot[3] },
++            position: xrt_vec3 { x: st.pos[0], y: st.pos[1], z: st.pos[2] },
++        }
++    }
++
++    pub fn filter_controller(&self, at_ns: i64, raw: xrt_pose) -> xrt_pose {
++        let mode = controller_mode();
++        let params = match mode {
++            Mode::Strong => CTRL_STRONG,
++            _ => CTRL_GENTLE,
++        };
++        self.filter_with(at_ns, raw, mode, params)
++    }
++
++    pub fn filter_hmd(&self, at_ns: i64, raw: xrt_pose) -> xrt_pose {
++        self.filter_with(at_ns, raw, hmd_mode(), HMD_GENTLE)
++    }
++}
++
++pub static CTRL_FILTERS: [PoseFilter; 2] = [PoseFilter::new(), PoseFilter::new()];
++pub static HMD_FILTER: PoseFilter = PoseFilter::new();
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn pose(x: f32) -> xrt_pose {
++        xrt_pose {
++            orientation: xrt_quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
++            position: xrt_vec3 { x, y: 0.0, z: 0.0 },
++        }
++    }
++
++    #[test]
++    fn smooths_still_jitter_and_deduplicates_timestamp() {
++        let f = PoseFilter::new();
++        let p0 = f.filter_with(1_000_000_000, pose(0.0), Mode::Gentle, CTRL_GENTLE);
++        assert_eq!(p0.position.x, 0.0);
++        // 1 mm jitter at 90 Hz is attenuated strongly.
++        let p1 = f.filter_with(1_011_111_111, pose(0.001), Mode::Gentle, CTRL_GENTLE);
++        assert!(p1.position.x > 0.0 && p1.position.x < 0.0005);
++        // Same timestamp returns cached pose without advancing.
++        let p1_dup = f.filter_with(1_011_111_111, pose(0.5), Mode::Gentle, CTRL_GENTLE);
++        assert_eq!(p1_dup.position.x, p1.position.x);
++    }
++
++    #[test]
++    fn resets_after_gap() {
++        let f = PoseFilter::new();
++        f.filter_with(1_000_000_000, pose(0.0), Mode::Gentle, CTRL_GENTLE);
++        let p = f.filter_with(2_000_000_000, pose(1.0), Mode::Gentle, CTRL_GENTLE);
++        assert_eq!(p.position.x, 1.0);
++    }
++}
+-- 
+2.56.0
+

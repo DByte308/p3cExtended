@@ -1,0 +1,180 @@
+From a4dffa55c5af6729d0ebdfb59d867d1a5d0d906d Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:22:25 +0100
+Subject: [PATCH] d/pimax_p3c: separate grip and aim offsets, grip origin lever
+
+Grip: +34 deg about device X and a (0, 20.2, -30.0) mm lever in the LED-model
+frame (verified in VRChat through xrizer); with the shared -48.4 deg aim
+offset, VRChat showed the hands about 90 deg too far forward. Aim keeps
+-48.4 deg (WayVR beam). Overrides: PIMAX_GRIP_OFFSET_L/R,
+PIMAX_AIM_OFFSET_L/R, PIMAX_GRIP_LEVER_L/R.
+---
+ .../pimax_p3c/src/device/controller/mod.rs    | 129 ++++++++++++++----
+ 1 file changed, 104 insertions(+), 25 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
+index 35959e5b1..57c293aae 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/controller/mod.rs
+@@ -5,7 +5,7 @@ use crate::device::tracking::{ControllerHapticFrame, Tracking};
+ use crate::util::set_str;
+ 
+ use std::sync::Arc;
+-use monado_sys::{u_device_populate_function_pointers, xrt_device, xrt_device_name, xrt_device_type, xrt_input_name, xrt_output, xrt_output_name, xrt_output_value, xrt_output_value_type, xrt_result, xrt_result_t, xrt_space_relation, xrt_tracking_origin};
++use monado_sys::{u_device_populate_function_pointers, xrt_device, xrt_device_name, xrt_device_type, xrt_input_name, xrt_output, xrt_output_name, xrt_output_value, xrt_output_value_type, xrt_result, xrt_result_t, xrt_space_relation, xrt_space_relation_flags, xrt_tracking_origin};
+ 
+ #[repr(C)]
+ pub struct PimaxController {
+@@ -137,10 +137,36 @@ unsafe extern "C" fn get_tracked_pose(
+     let mut relation = relation;
+     if relation.relation_flags.0 != 0 {
+         diag.pose_valid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-        // Rotate the LED-model frame so -Z points where the controller points (thumb up). Angular velocity is in
+-        // world space and the origin stays, so only the orientation changes.
++        let grip = matches!(
++            name,
++            xrt_input_name::XRT_INPUT_PIMAX_GRIP_POSE | xrt_input_name::XRT_INPUT_TOUCH_GRIP_POSE
++        );
++        let offsets = pose_offsets(me.hand);
++        let q = {
++            let o = &relation.pose.orientation;
++            [o.x, o.y, o.z, o.w]
++        };
++        if grip {
++            // Grip origin: the LED-model origin moved by a fixed lever in the model frame. Angular velocity is in
++            // world space, so the moved origin also gains w x r of linear velocity.
++            let r = rotate(q, offsets.grip_lever);
++            let p = &mut relation.pose.position;
++            (p.x, p.y, p.z) = (p.x + r[0], p.y + r[1], p.z + r[2]);
++            let vel = xrt_space_relation_flags::XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT.0
++                | xrt_space_relation_flags::XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT.0;
++            if relation.relation_flags.0 & vel == vel {
++                let w = &relation.angular_velocity;
++                let (wx, wy, wz) = (w.x, w.y, w.z);
++                let v = &mut relation.linear_velocity;
++                v.x += wy * r[2] - wz * r[1];
++                v.y += wz * r[0] - wx * r[2];
++                v.z += wx * r[1] - wy * r[0];
++            }
++        }
++        // Rotate the LED-model frame into the grip or aim frame (-Z forward, thumb up). Angular velocity is in
++        // world space, so only the orientation changes.
++        let r = mul(q, if grip { offsets.grip } else { offsets.aim });
+         let o = &mut relation.pose.orientation;
+-        let r = mul([o.x, o.y, o.z, o.w], aim_offset(me.hand));
+         (o.x, o.y, o.z, o.w) = (r[0], r[1], r[2], r[3]);
+     }
+     unsafe { *out = relation };
+@@ -152,35 +178,88 @@ unsafe extern "C" fn destroy(xdev: *mut xrt_device) {
+     drop(unsafe { Box::from_raw(xdev as *mut PimaxController) });
+ }
+ 
+-/// Controller frame -> aim frame (x, y, z, w): `PIMAX_AIM_OFFSET_L` / `PIMAX_AIM_OFFSET_R` = "x,y,z,w". Default
+-/// -48.4 deg about device X for both hands, measured on 2026-11-24: controllers resting on their rings (the LED ring
+-/// plane is 53 deg from device +Y in the model) and a hand-held capture on 2026-11-23 agree, and in WayVR the beam
+-/// follows the controller. A rotation about X is its own mirror image about device X, so both hands share it.
++/// Default aim offset: -48.4 deg about device X for both hands, measured on 2026-11-24 with the controllers resting on
++/// their rings (the LED ring plane is 53 deg from device +Y in the model) and a hand-held capture on 2026-11-23; in
++/// WayVR the beam follows the controller. A rotation about X is its own mirror image about device X, so both hands
++/// share it.
+ const DEFAULT_AIM_OFFSET: [f32; 4] = [-0.410_032, 0.0, 0.0, 0.912_071];
++/// Default grip offset: +34 deg about device X for both hands. With it the hands sit right in VRChat through
++/// xrizer (2026-11-25); with the aim offset they were about 90 deg too far forward.
++const DEFAULT_GRIP_OFFSET: [f32; 4] = [0.292_372, 0.0, 0.0, 0.956_305];
++/// Default grip origin offset in the LED-model frame, metres: Rx(34 deg) * (0, 0, -36.209 mm).
++const DEFAULT_GRIP_LEVER: [f32; 3] = [0.0, 0.020_248, -0.030_019];
+ 
+-fn aim_offset(hand: Hand) -> [f32; 4] {
+-    static OFFSETS: std::sync::OnceLock<[[f32; 4]; 2]> = std::sync::OnceLock::new();
+-    OFFSETS.get_or_init(|| {
+-        let read = |var: &str, default: [f32; 4]| -> [f32; 4] {
+-            let Ok(raw) = std::env::var(var) else { return default };
+-            let v: Vec<f32> = raw.split(',').filter_map(|c| c.trim().parse().ok()).collect();
+-            let n = v.iter().map(|c| c * c).sum::<f32>().sqrt();
+-            if v.len() == 4 && n > 1e-6 {
+-                [v[0] / n, v[1] / n, v[2] / n, v[3] / n]
+-            } else {
+-                warn!("{var}={raw}: want x,y,z,w; using the default");
+-                default
++struct PoseOffsets {
++    grip: [f32; 4],
++    aim: [f32; 4],
++    grip_lever: [f32; 3],
++}
++
++/// Controller (LED-model) frame -> grip and aim frames. Overrides, "x,y,z,w": `PIMAX_GRIP_OFFSET_L/R`,
++/// `PIMAX_AIM_OFFSET_L/R`; grip origin "x,y,z" in metres: `PIMAX_GRIP_LEVER_L/R`.
++fn pose_offsets(hand: Hand) -> &'static PoseOffsets {
++    static OFFSETS: std::sync::OnceLock<[PoseOffsets; 2]> = std::sync::OnceLock::new();
++    &OFFSETS.get_or_init(|| {
++        let floats = |var: &str| -> Option<Vec<f32>> {
++            let raw = std::env::var(var).ok()?;
++            let v: Vec<f32> = raw.split(',').map(|c| c.trim().parse().ok()).collect::<Option<_>>()?;
++            Some(v)
++        };
++        let quat = |var: &str, default: [f32; 4]| -> [f32; 4] {
++            if std::env::var_os(var).is_none() {
++                return default;
++            }
++            match floats(var) {
++                Some(v) if v.len() == 4 => {
++                    let n = v.iter().map(|c| c * c).sum::<f32>().sqrt();
++                    if n <= 1e-6 {
++                        warn!("{var}: zero quaternion; using the default");
++                        return default;
++                    }
++                    [v[0] / n, v[1] / n, v[2] / n, v[3] / n]
++                }
++                _ => {
++                    warn!("{var}: want x,y,z,w; using the default");
++                    default
++                }
+             }
+         };
+-        let o = [
+-            read("PIMAX_AIM_OFFSET_L", DEFAULT_AIM_OFFSET),
+-            read("PIMAX_AIM_OFFSET_R", DEFAULT_AIM_OFFSET),
+-        ];
+-        info!("controller aim offsets L {:?} R {:?}", o[0], o[1]);
++        let vec3 = |var: &str, default: [f32; 3]| -> [f32; 3] {
++            if std::env::var_os(var).is_none() {
++                return default;
++            }
++            match floats(var) {
++                Some(v) if v.len() == 3 => [v[0], v[1], v[2]],
++                _ => {
++                    warn!("{var}: want x,y,z in metres; using the default");
++                    default
++                }
++            }
++        };
++        let o = ["L", "R"].map(|h| PoseOffsets {
++            grip: quat(&format!("PIMAX_GRIP_OFFSET_{h}"), DEFAULT_GRIP_OFFSET),
++            aim: quat(&format!("PIMAX_AIM_OFFSET_{h}"), DEFAULT_AIM_OFFSET),
++            grip_lever: vec3(&format!("PIMAX_GRIP_LEVER_{h}"), DEFAULT_GRIP_LEVER),
++        });
++        for (h, p) in ["L", "R"].iter().zip(&o) {
++            info!("controller {h} offsets: grip {:?} lever {:?} m, aim {:?}", p.grip, p.grip_lever, p.aim);
++        }
+         o
+     })[hand as usize]
+ }
+ 
++/// Rotates `v` by the unit quaternion `q` (x, y, z, w).
++fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
++    let [qx, qy, qz, qw] = q;
++    // t = 2 * (q.xyz x v); v' = v + w * t + q.xyz x t
++    let t = [2.0 * (qy * v[2] - qz * v[1]), 2.0 * (qz * v[0] - qx * v[2]), 2.0 * (qx * v[1] - qy * v[0])];
++    [
++        v[0] + qw * t[0] + (qy * t[2] - qz * t[1]),
++        v[1] + qw * t[1] + (qz * t[0] - qx * t[2]),
++        v[2] + qw * t[2] + (qx * t[1] - qy * t[0]),
++    ]
++}
++
+ fn mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+     let [ax, ay, az, aw] = a;
+     let [bx, by, bz, bw] = b;
+-- 
+2.56.0
+

@@ -1,0 +1,215 @@
+From 38f07260b0cd90d9f7650a2f504a90f540ca5e1f Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:40:04 +0100
+Subject: [PATCH 2/3] t/constellation: reject optical solves far from the
+ device's prior
+
+Two controllers with mirror-image LED rings can be solved onto each
+other's LEDs when they overlap in view. Gate Camera::pushPose against
+the device's fused prior (CONSTELLATION_PRIOR_GATE_DEG=25, _CM=25),
+bypassed after CONSTELLATION_PRIOR_GATE_GAP_MS (500 ms) so occluded
+controllers can always re-acquire. On rejection, release the claimed
+blobs and return false so callers try fallback paths.
+---
+ .../constellation/t_constellation_tracker.cpp | 108 ++++++++++++++----
+ .../t_constellation_tracker_internal.hpp      |   3 +-
+ 2 files changed, 90 insertions(+), 21 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index fc14b08e5..30f5d8f81 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -35,6 +35,10 @@ namespace xrt::tracking::constellation {
+ 
+ DEBUG_GET_ONCE_LOG_OPTION(constellation_tracker_log, "CONSTELLATION_TRACKER_LOG", U_LOGGING_WARN)
+ DEBUG_GET_ONCE_OPTION(constellation_tracker_data_recorder_output, "CONSTELLATION_TRACKER_DATA_RECORDER_OUTPUT", "")
++// Prior gate for accepted solves (see prior_gate_accepts); 0 degrees disables it.
++DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_deg, "CONSTELLATION_PRIOR_GATE_DEG", 25)
++DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_cm, "CONSTELLATION_PRIOR_GATE_CM", 25)
++DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_gap_ms, "CONSTELLATION_PRIOR_GATE_GAP_MS", 500)
+ 
+ // Unconditionally present to allow warning that the feature is not enabled.
+ DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TRACKER_RERUN_ENABLE", false)
+@@ -444,14 +448,13 @@ Camera::tryDevicePose(Device *device,
+ 	}
+ 
+ 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
+-		this->pushPose(               //
++		return this->pushPose(        //
+ 		    sample,                   //
+ 		    device_state,             //
+ 		    device,                   //
+ 		    score,                    //
+ 		    Tcv_cam_device_candidate, //
+ 		    false);                   // was_optimized
+-		return true;
+ 	}
+ 
+ 	return false;
+@@ -557,15 +560,13 @@ Camera::tryDeviceBlobRecovery(Device *device,
+ 		CT_DEBUG(tracker, "Camera %p RANSAC-PnP recovered pose was good enough for device %d from %u blobs",
+ 		         (void *)this, device->id, sample.blob_count);
+ 
+-		this->pushPose(     //
+-		    sample,         //
+-		    device_state,   //
+-		    device,         //
+-		    score,          //
+-		    Tcv_cam_device, //
+-		    true);          // was_optimized
+-
+-		return true;
++		return this->pushPose( //
++		    sample,             //
++		    device_state,       //
++		    device,             //
++		    score,              //
++		    Tcv_cam_device,     //
++		    true);              // was_optimized
+ 	} else {
+ 		CT_DEBUG(tracker, "Camera %p RANSAC-PnP recovered pose for device %d from %u blobs was not good enough",
+ 		         (void *)this, device->id, sample.blob_count);
+@@ -749,12 +750,14 @@ Camera::processSampleSlow(CameraSample &sample)
+ 			    device->gravity_error_rad,                         //
+ 			    &score);                                           //
+ 			if (found_pose) {
+-				this->pushPose(sample,         //
+-				               device_state,   //
+-				               device,         //
+-				               score,          //
+-				               Tcv_cam_device, //
+-				               false);         // was_optimized
++				found_pose = this->pushPose(sample,         //
++				                            device_state,   //
++				                            device,         //
++				                            score,          //
++				                            Tcv_cam_device, //
++				                            false);         // was_optimized
++			}
++			if (found_pose) {
+ 
+ 				// We found a pose for this device in this sample
+ 				device_state.needs_slow_processing = false;
+@@ -951,7 +954,58 @@ Camera::processSampleFast(CameraSample &sample)
+ 	return need_slow_search;
+ }
+ 
+-void
++/*!
++ * Whether a solve agrees with the device's own fused prediction (IMU-driven orientation, predicted position).
++ *
++ * Two controllers whose LED rings are mirror images can be solved onto each other's LEDs when the rings overlap in
++ * the image (e.g. one hand turned to look at a watch, the other pointing at it). Every accept path ends in
++ * Camera::pushPose, and an accepted pose seeds the next frame's search and the blob labels, so one wrong solve keeps
++ * the device on the other ring. Rejecting solves far from the prior stops that. A device unseen for longer than the
++ * gap (or without a prior) is exempt, so it can always be re-acquired.
++ */
++static bool
++prior_gate_accepts(ConstellationTracker *tracker,
++                   const CameraSample &sample,
++                   const DeviceState &device_state,
++                   Device *device,
++                   const xrt_pose &Tcv_cam_device)
++{
++	const int64_t max_deg = debug_get_num_option_constellation_prior_gate_deg();
++	if (max_deg <= 0 || !device_state.Txr_world_device_prior.has_value() || !sample.Txr_world_cam.has_value()) {
++		return true;
++	}
++	{
++		std::unique_lock<os::Mutex> lock(device->data_lock);
++		const auto &last = device->locked_data.last_known_pose;
++		const int64_t gap_ns = debug_get_num_option_constellation_prior_gate_gap_ms() * U_TIME_1MS_IN_NS;
++		if (!last.has_value() || sample.timestamp_ns - last->timestamp_ns > gap_ns) {
++			return true;
++		}
++	}
++
++	xrt_pose Txr_cam_device;
++	xrt_pose Txr_world_device;
++	math_pose_convert_from_opencv(&Tcv_cam_device, &Txr_cam_device);
++	math_pose_transform(&sample.Txr_world_cam.value(), &Txr_cam_device, &Txr_world_device);
++	const xrt_pose &prior = device_state.Txr_world_device_prior.value();
++
++	const float dot = fabsf(math_quat_dot(&Txr_world_device.orientation, &prior.orientation));
++	const float angle_deg = 2.0f * acosf(fminf(1.0f, dot)) * (float)(180.0 / M_PI);
++	const float dist_cm = m_vec3_len(Txr_world_device.position - prior.position) * 100.0f;
++	if (angle_deg <= (float)max_deg && dist_cm <= (float)debug_get_num_option_constellation_prior_gate_cm()) {
++		return true;
++	}
++
++	static std::atomic<uint64_t> rejected{0};
++	const uint64_t n = ++rejected;
++	if (n <= 5 || (n & (n - 1)) == 0) {
++		CT_WARN(tracker, "Rejected solve #%" PRIu64 " for device %d: %.0f deg / %.0f cm from its prior", n,
++		        (int)device->id, angle_deg, dist_cm);
++	}
++	return false;
++}
++
++bool
+ Camera::pushPose(CameraSample &camera_sample,
+                  DeviceState &device_state,
+                  Device *device,
+@@ -1020,7 +1074,7 @@ Camera::pushPose(CameraSample &camera_sample,
+ 		// If after RANSAC and optimization no blobs remain, skip, so that we aren't putting an invalid pose
+ 		// into the fusion/latest field.
+ 		if (num_blobs_for_device(camera_sample, device->id) == 0) {
+-			return;
++			return false;
+ 		}
+ 
+ 		// We need to re-evaluate the pose after optimization, since the reprojection error may have changed.
+@@ -1035,6 +1089,18 @@ Camera::pushPose(CameraSample &camera_sample,
+ 		    NULL);                     //
+ 	}
+ 
++	if (!prior_gate_accepts(tracker, camera_sample, device_state, device, Tcv_cam_device)) {
++		// Leave the blobs free for the device they belong to.
++		for (uint32_t i = 0; i < camera_sample.blob_count; i++) {
++			t_blob &b = camera_sample.blobs[i];
++			if (b.matched_device_id == device->id) {
++				b.matched_device_led_id = XRT_CONSTELLATION_INVALID_LED_ID;
++				b.matched_device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
++			}
++		}
++		return false;
++	}
++
+ 	// Move to OpenXR space
+ 	xrt_pose Txr_cam_device;
+ 	math_pose_convert_from_opencv(&Tcv_cam_device, &Txr_cam_device);
+@@ -1046,7 +1112,8 @@ Camera::pushPose(CameraSample &camera_sample,
+ 	std::shared_ptr<CameraMosaic> mosaic = this->mosaic.lock();
+ 	U_ASSERT_WEAK_PTR_RET(mosaic,
+ 	                      "Camera mosaic was destroyed while processing a sample, this should never happen since "
+-	                      "the mosaic owns the camera");
++	                      "the mosaic owns the camera",
++	                      false);
+ 
+ 	float average_brightness = 0.0f;
+ 	uint32_t used_blobs = 0;
+@@ -1139,6 +1206,7 @@ Camera::pushPose(CameraSample &camera_sample,
+ 	}
+ 
+ 	CT_DEBUG(tracker, "Found pose for device %d", device->id);
++	return true;
+ }
+ 
+ /*
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker_internal.hpp b/src/xrt/tracking/constellation/t_constellation_tracker_internal.hpp
+index b9b56a307..e7c7764b3 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker_internal.hpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker_internal.hpp
+@@ -315,7 +315,8 @@ public: // Methods (t_constellation_tracker.cpp)
+ 	bool
+ 	processSampleFast(CameraSample &sample);
+ 
+-	void
++	//! Accepts the pose for the device; false if it was dropped (no blobs left, or rejected by the prior gate).
++	bool
+ 	pushPose(CameraSample &camera_sample,
+ 	         DeviceState &device_state,
+ 	         Device *device,
+-- 
+2.56.0
+

@@ -18,8 +18,8 @@ The upstream sources are not in this repository. The installer clones them at th
 Full list with details: [docs/FEATURES.md](docs/FEATURES.md).
 
 - **Display**: direct mode at 90 Hz (7680x3744), correct stereo (needs the NVIDIA patch below).
-- **Head tracking**: inside-out SLAM with Basalt (4 cameras), stable when worn.
-- **Controllers**: buttons, haptics and optical tracking (about 90 %, see Known issues); default grip/aim offset.
+- **Head tracking**: inside-out SLAM with Basalt (4 cameras), stable when worn; optional live 1-Euro still smoothing (`PIMAX_HMD_SMOOTHING`).
+- **Controllers**: buttons, haptics, optical tracking with 3D + 2D anti-merge protection, separate grip (+34° + lever) and aim (−48.4°) offsets, and live 1-Euro still smoothing (`PIMAX_CTRL_SMOOTHING`).
 - **Eye tracking**: gaze through `XR_EXT_eye_gaze_interaction`; in-headset calibration (`pimax-et-calibrate`,
   about 0.44° mean error after calibration); gaze test app.
 - **Foveated rendering**: gaze-steered quad views and `XR_VARJO_foveated_rendering` in Monado
@@ -32,7 +32,7 @@ Full list with details: [docs/FEATURES.md](docs/FEATURES.md).
 - **Headset speakers**: a WirePlumber rule maps the built-in audio correctly.
 - Device info: firmware version, serial number and self-test in a status file and in Envision.
 
-Not done: brightness, local dimming, controller battery level, headset reboot. SteamVR support is experimental
+Not done: local dimming, controller battery level (brightness and headset restart are built, untested in the headset; see [docs/FEATURES.md](docs/FEATURES.md)). SteamVR support is experimental
 (`scripts/steamvr-monado.sh`, eye-tracking component in Monado's SteamVR driver) and not covered here.
 OpenVR games can run through xrizer (not installed by the installer).
 
@@ -151,12 +151,9 @@ To check which variables a service really got, start it with `XRT_PRINT_OPTIONS=
 - **Head tracking can still run away** when the headset faces something closer than about 33 cm (a wall or a
   table), and in a dark room. Partly fixed (patches/basalt 0001); Basalt still does not reset itself, so restart
   the session. See [docs/ROADMAP.md](docs/ROADMAP.md).
-- **Controllers can snap back briefly in the first ~10 s** after the session starts, while the tracker settles.
-- **One controller can lose its rotation for a whole session** (open): it keeps tracking position but its
-  orientation stays fixed. Seen on the left controller in one session after the fixes, with the right one fine.
-  Not yet reproduced with a log; restarting the session may help.
-- **Controllers held close together** can merge; the beam can jump to the other controller (a fix is built,
-  untested).
+- **"Controller lost its rotation"** reports (open, not reproduced with data): in logged sessions both controllers'
+  tracked orientation followed every twist. In WayVR a grabbed window keeps facing you, which can look like a
+  frozen controller.
 - A controller can be lost on very fast shakes.
 - A killed `monado-service` leaves `$XDG_RUNTIME_DIR/monado_comp_ipc` behind; the next start fails with
   "Address already in use" until it is removed (`run-vr.sh` does this).
@@ -191,7 +188,7 @@ To check which variables a service really got, start it with `XRT_PRINT_OPTIONS=
 | `scripts/eyetracking/` | low-level eye tracker tools |
 | `config/` | session environment, WirePlumber audio rule, udev rules |
 | `tools/` | OpenXR test tools (`xrsizes`, `xrcalib`, `xrfovea`, `xrctrl`, ...) |
-| `docs/` | [FEATURES](docs/FEATURES.md), [ROADMAP](docs/ROADMAP.md), [LICENSING](docs/LICENSING.md) |
+| `docs/` | [FEATURES](docs/FEATURES.md), [TRACKING-CHANGES](docs/TRACKING-CHANGES.md), [ROADMAP](docs/ROADMAP.md), [LICENSING](docs/LICENSING.md) |
 | `sources.lock` | upstream repositories and pinned commits |
 
 ## Licences

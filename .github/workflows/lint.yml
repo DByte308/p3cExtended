@@ -1,0 +1,45 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: |
+          for f in scripts/*.sh scripts/pimax-* scripts/eyetracking/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        run: |
+          shellcheck -S error scripts/*.sh scripts/pimax-* scripts/eyetracking/*.sh
+
+      - name: Python syntax check
+        run: |
+          python3 -m py_compile scripts/eyetracking/*.py tools/*.py tools/*/*.py
+
+      - name: Patch numbering and format check
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          for d in ("patches/monado", "patches/envision", "patches/basalt", "patches/kernel", "patches/nvidia"):
+              patches = sorted(pathlib.Path(d).glob("*.patch"))
+              if not patches:
+                  sys.exit(f"no patches in {d}")
+              for idx, p in enumerate(patches, 1):
+                  prefix = f"{idx:04d}-"
+                  if not p.name.startswith(prefix):
+                      sys.exit(f"{p}: expected prefix {prefix}")
+                  text = p.read_text(errors="replace")
+                  has_git_diff = "diff --git " in text
+                  has_unified = "--- " in text and "+++ " in text and "@@ " in text
+                  if not (has_git_diff or has_unified):
+                      sys.exit(f"{p}: missing unified diff headers")
+          print("Patch hygiene OK")
+          PY

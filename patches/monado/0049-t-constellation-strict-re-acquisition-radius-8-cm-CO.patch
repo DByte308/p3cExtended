@@ -1,0 +1,41 @@
+From 723b28493a4b203dcd811adc3a90f8e057b16e9d Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:29:10 +0100
+Subject: [PATCH] t/constellation: strict re-acquisition radius 8 cm,
+ CONSTELLATION_REACQUIRE_STRICT_CM
+
+15 cm refused the right controller's own solves while it pointed at the left
+hand (11-15 cm apart); the mirrored-ring mis-solves landed within about 2 cm.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/tracking/constellation/t_constellation_tracker.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index 39d8e0bab..adfae6d7d 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -44,6 +44,10 @@ DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_gap_ms, "CONSTELLATION_PRIOR_
+ // with the device's own IMU-carried prediction; 0 disables the check. Needs the prior gate on (DEG > 0).
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_exclude_cm, "CONSTELLATION_REACQUIRE_EXCLUDE_CM", 6)
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_agree_deg, "CONSTELLATION_REACQUIRE_AGREE_DEG", 45)
++// Exclusion radius while the device's prior is untrusted (escape, and re-acquisition until the fusion has a prior).
++// 15 cm refused the right controller's own solves while it pointed at the left hand (2026-11-25, 11-15 cm apart);
++// mirrored-ring mis-solves landed within about 2 cm.
++DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_strict_cm, "CONSTELLATION_REACQUIRE_STRICT_CM", 8)
+ // Consecutive rejected solves that agree with each other (within the gate) after which the prior counts as lost and the
+ // device is re-acquired from them; 0 disables it.
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_escape, "CONSTELLATION_PRIOR_GATE_ESCAPE", 5)
+@@ -990,7 +994,7 @@ reacquire_lands_on_other_device(ConstellationTracker *tracker,
+ 	}
+ 	// The prior was just declared lost: its orientation cannot vouch for the solve, so use a wider radius instead.
+ 	if (prior_untrusted) {
+-		exclude_cm = std::max<int64_t>(exclude_cm, 15);
++		exclude_cm = std::max<int64_t>(exclude_cm, debug_get_num_option_constellation_reacquire_strict_cm());
+ 	}
+ 	// After a gap the predicted position is unreliable but the gyro-carried orientation is not: a solve that agrees
+ 	// with it is this device's own LEDs, even right next to the other hand (two-handed holds).
+-- 
+2.56.0
+

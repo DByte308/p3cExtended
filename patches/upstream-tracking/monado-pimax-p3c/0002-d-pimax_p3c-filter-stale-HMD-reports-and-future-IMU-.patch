@@ -1,0 +1,88 @@
+From 3bab9e590f864490c4b4bd07ef4c4accb55eeec5 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:40:04 +0100
+Subject: [PATCH 2/6] d/pimax_p3c: filter stale HMD reports and future IMU
+ samples
+
+The first HMD reports after start-up sit in the USB buffer (seen up to
+6 s old) and poison the shared skew tracker used for IMU, cameras, and
+controllers. Discard the first 300 ms, gate reports on device-vs-host
+clock consistency (within 100 ms), and drop IMU samples >20 ms in the
+future.
+---
+ .../pimax_p3c/src/device/session/status.rs    | 38 ++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index 54c6551cd..fa0bdd8fc 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -58,6 +58,34 @@ impl<R: OnReport, S: StatusStream<R> + Send + 'static> StatusSession<R, S> {
+     }
+ }
+ 
++/// Gate for the HMD's device clock before it reaches the shared skew tracker (which also times camera frames and
++/// controllers). Discards the first 300 ms (stale reports buffered in USB before start-up) and requires each report's
++/// device clock to advance within 100 ms of the host clock; an outlier becomes a one-step candidate before rebasing.
++fn hmd_timestamp_plausible(device_ns: i64) -> bool {
++    use std::sync::{Mutex, OnceLock};
++    static STATE: Mutex<(Option<(i64, i64)>, Option<(i64, i64)>)> = Mutex::new((None, None));
++    static FIRST: OnceLock<i64> = OnceLock::new();
++    let host = now_ns();
++    if host - *FIRST.get_or_init(|| host) < 300_000_000 {
++        return false;
++    }
++    let consistent = |(d, h): (i64, i64)| device_ns > d && ((device_ns - d) - (host - h)).abs() < 100_000_000;
++    let mut state = STATE.lock().unwrap();
++    let (last, candidate) = &mut *state;
++    if last.is_some_and(consistent) {
++        *last = Some((device_ns, host));
++        *candidate = None;
++        return true;
++    }
++    if candidate.is_some_and(consistent) {
++        *last = Some((device_ns, host));
++        *candidate = None;
++        return true;
++    }
++    *candidate = Some((device_ns, host));
++    false
++}
++
+ pub(super) trait OnReport: Sized {
+     fn on_status(self, tracking: &Tracking);
+ }
+@@ -65,6 +93,9 @@ pub(super) trait OnReport: Sized {
+ impl OnReport for HmdStatus {
+     fn on_status(self, tracking: &Tracking) {
+         let device_ns = self.imu[0].timestamp_us as i64 * 1000;
++        if !hmd_timestamp_plausible(device_ns) {
++            return;
++        }
+         let host_ns = tracking.clock.lock().unwrap().observe(device_ns, now_ns());
+         trace!("received HMD status: {device_ns} => {host_ns}");
+ 
+@@ -73,6 +104,9 @@ impl OnReport for HmdStatus {
+         {
+             for sample in self.imu {
+                 let timestamp_ns = host_ns + (sample.timestamp_us as i64 * 1000) - device_ns;
++                if timestamp_ns > now_ns() + 20_000_000 {
++                    continue;
++                }
+ 
+                 let accel_m_s2 =
+                     to_headset_frame_vec(sample.accel.map(|g| g as f64 * MATH_GRAVITY_M_S2).into());
+@@ -118,8 +152,8 @@ impl OnReport for ControllerStatus {
+                 let Some(sample_ns) = to_host(sample) else {
+                     continue;
+                 };
+-                // A zero offset would hand the fusion two samples at one instant.
+-                if sample_ns <= last_ns {
++                // A zero offset would hand the fusion two samples at one instant; a future one breaks ordering.
++                if sample_ns <= last_ns || sample_ns > now_ns() + 20_000_000 {
+                     continue;
+                 }
+                 last_ns = sample_ns;
+-- 
+2.56.0
+

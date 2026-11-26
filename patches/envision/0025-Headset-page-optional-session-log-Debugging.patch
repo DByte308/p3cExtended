@@ -1,0 +1,261 @@
+From 069fdbdcedc9c77835e2be2109b1840586e852c9 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:06:03 +0100
+Subject: [PATCH] Headset page: optional session log (Debugging)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Envision kept the XR service output only in its debug view until the next
+start, so a problem seen in a normal session left nothing to look at.
+Headset → Debugging → Keep session logs (off by default) saves each
+session's service output in ~/.cache/pimax-linux/sessions, keeping the
+newest 10.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/main.rs                          |  1 +
+ src/session_log.rs                   | 76 ++++++++++++++++++++++++++++
+ src/ui/app.rs                        | 25 +++++++--
+ src/ui/job_worker/internal_worker.rs | 21 +++++---
+ src/ui/pimax_pages.rs                |  9 ++++
+ 5 files changed, 123 insertions(+), 9 deletions(-)
+ create mode 100644 src/session_log.rs
+
+diff --git a/src/main.rs b/src/main.rs
+index 4e8ffee..88a4e88 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -52,6 +52,7 @@ pub mod paths;
+ pub mod plugins;
+ pub mod profile;
+ pub mod profiles;
++pub mod session_log;
+ pub mod steam_linux_runtime_injector;
+ pub mod termcolor;
+ pub mod ui;
+diff --git a/src/session_log.rs b/src/session_log.rs
+new file mode 100644
+index 0000000..1d6b2d3
+--- /dev/null
++++ b/src/session_log.rs
+@@ -0,0 +1,76 @@
++//! Keeps the XR service's output of every session in a file, so a problem seen in a normal session can be looked
++//! at afterwards (the debug view only holds it until the next start). One file per session in
++//! `~/.cache/pimax-linux/sessions/`, named by the start time; the newest `KEEP` are kept. Off by default, switched
++//! on in Headset → Debugging.
++
++use std::fs::{self, File};
++use std::io::{BufWriter, Write};
++use std::path::PathBuf;
++
++const KEEP: usize = 10;
++
++/// Setting (stored with the other headset settings) that turns the session log on; off while unset.
++pub const ENABLE_KEY: &str = "PIMAX_SESSION_LOG";
++
++/// On for any value that is not false-like, the same rule the switch uses to show it.
++pub fn enabled(env: &std::collections::HashMap<String, String>) -> bool {
++    env.get(ENABLE_KEY).is_some_and(|v| {
++        !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "f" | "off" | "no" | "n")
++    })
++}
++
++pub struct SessionLog {
++    out: BufWriter<File>,
++    pub path: PathBuf,
++}
++
++/// None without an absolute cache directory (never a path relative to wherever Envision was started).
++fn dir() -> Option<PathBuf> {
++    let cache = std::env::var_os("XDG_CACHE_HOME")
++        .filter(|v| !v.is_empty())
++        .map(PathBuf::from)
++        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(".cache")))?;
++    cache.is_absolute().then(|| cache.join("pimax-linux/sessions"))
++}
++
++impl SessionLog {
++    /// A new file for a session starting now, after removing the oldest ones. None if it cannot be created.
++    pub fn start() -> Option<Self> {
++        let dir = dir()?;
++        fs::create_dir_all(&dir).ok()?;
++        let mut old: Vec<PathBuf> = fs::read_dir(&dir)
++            .ok()?
++            .flatten()
++            .map(|e| e.path())
++            .filter(|p| p.extension().is_some_and(|x| x == "log"))
++            .collect();
++        old.sort();
++        while old.len() >= KEEP {
++            let _ = fs::remove_file(old.remove(0));
++        }
++        let name = relm4::gtk::glib::DateTime::now_local()
++            .and_then(|t| t.format("%Y-%m-%d_%H-%M-%S"))
++            .map(|s| s.to_string())
++            .unwrap_or_else(|_| "session".into());
++        // A restart within the same second gets its own file instead of truncating the one before.
++        for n in 0..100 {
++            let path = dir.join(if n == 0 { format!("{name}.log") } else { format!("{name}_{n}.log") });
++            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
++                Ok(f) => return Some(Self { out: BufWriter::new(f), path }),
++                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
++                Err(_) => return None,
++            }
++        }
++        None
++    }
++
++    pub fn append(&mut self, rows: &[String]) {
++        for r in rows {
++            let _ = self.out.write_all(r.as_bytes());
++            if !r.ends_with('\n') {
++                let _ = self.out.write_all(b"\n");
++            }
++        }
++        let _ = self.out.flush();
++    }
++}
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 594a53d..da0ae3c 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -78,6 +78,8 @@ pub struct App {
+ 
+     main_view: AsyncController<MainView>,
+     debug_view: AsyncController<DebugView>,
++    /// The running XR service's output file, see `session_log`.
++    session_log: Option<crate::session_log::SessionLog>,
+     shell: Shell,
+     about_dialog: adw::AboutDialog,
+     build_window: Controller<BuildWindow>,
+@@ -125,6 +127,8 @@ pub enum Msg {
+     /// Save the config if no newer edit happened since this generation was scheduled.
+     SaveConfigDebounced(u64),
+     OnServiceLog(Vec<String>),
++    /// Output of the XR service itself: shown like the rest, and kept in the session's log file.
++    OnXrServiceLog(Vec<String>),
+     OnServiceExit(i32),
+     /// Audio defaults switched for the session (from a background thread).
+     AudioSwitched(crate::audio_switch::Switched),
+@@ -287,7 +291,7 @@ impl App {
+             &self.config,
+             sender.input_sender(),
+             |msg| match msg {
+-                JobWorkerOut::Log(rows) => Msg::OnServiceLog(rows),
++                JobWorkerOut::Log(rows) => Msg::OnXrServiceLog(rows),
+                 JobWorkerOut::Exit(code) => Msg::OnServiceExit(code),
+             },
+             debug,
+@@ -301,6 +305,9 @@ impl App {
+         };
+         worker.start();
+         self.xrservice_worker = Some(worker);
++        self.session_log = crate::session_log::enabled(&self.config.global_preferences.env_vars)
++            .then(crate::session_log::SessionLog::start)
++            .flatten();
+         {
+             let env = prof.environment_with_fallback(&self.config.global_preferences);
+             let output = env.get("PIMAX_AUDIO_OUTPUT").cloned();
+@@ -484,6 +491,12 @@ impl AsyncComponent for App {
+                     self.config.save();
+                 }
+             }
++            Msg::OnXrServiceLog(rows) => {
++                if let Some(log) = self.session_log.as_mut() {
++                    log.append(&rows);
++                }
++                sender.input(Msg::OnServiceLog(rows));
++            }
+             Msg::OnServiceLog(rows) => {
+                 if !rows.is_empty() {
+                     self.debug_view
+@@ -516,11 +529,16 @@ impl AsyncComponent for App {
+                 self.libmonado = None;
+                 if code != 0 && code != 15 {
+                     // 15 is SIGTERM
+-                    sender.input(Msg::OnServiceLog(vec![format!(
++                    let line = format!(
+                         "{} exited with code {}",
+                         self.get_selected_profile().xrservice_type,
+                         code
+-                    )]));
++                    );
++                    // Into this session's file now: a restart below opens the next one.
++                    if let Some(log) = self.session_log.as_mut() {
++                        log.append(std::slice::from_ref(&line));
++                    }
++                    sender.input(Msg::OnServiceLog(vec![line]));
+                 }
+                 self.xrservice_worker = None;
+ 
+@@ -1431,6 +1449,7 @@ impl AsyncComponent for App {
+                     MainViewOutMsg::SetEnvVar(k, v) => Msg::SetGlobalEnvVar(k, v),
+                 }),
+             vkinfo,
++            session_log: None,
+             debug_view: DebugView::builder()
+                 .launch(DebugViewInit {
+                     profile: selected_profile,
+diff --git a/src/ui/job_worker/internal_worker.rs b/src/ui/job_worker/internal_worker.rs
+index 7c55e72..9279b2d 100644
+--- a/src/ui/job_worker/internal_worker.rs
++++ b/src/ui/job_worker/internal_worker.rs
+@@ -111,6 +111,21 @@ impl Worker for InternalJobWorker {
+                                 let stdout_logger = logger_thread!(stdout, stdout_sender);
+                                 let stderr_logger = logger_thread!(stderr, stderr_sender);
+                                 let status = cmd.wait().expect("Failed to wait for process");
++                                // Read the last lines (a crash message, say) before the exit is reported, so they
++                                // are not mixed into whatever starts next. A process left behind can keep the pipes
++                                // open, so wait at most 2 s and let the readers finish on their own after that.
++                                let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
++                                while !(stdout_logger.is_finished() && stderr_logger.is_finished())
++                                    && std::time::Instant::now() < until
++                                {
++                                    std::thread::sleep(std::time::Duration::from_millis(10));
++                                }
++                                if stdout_logger.is_finished() {
++                                    stdout_logger.join().expect("Failed to join stdout reader thread");
++                                }
++                                if stderr_logger.is_finished() {
++                                    stderr_logger.join().expect("Failed to join stderr reader thread");
++                                }
+                                 if !status.success() {
+                                     self.state.lock().unwrap().exit_status =
+                                         Some(status.code().unwrap_or_else(|| {
+@@ -118,12 +133,6 @@ impl Worker for InternalJobWorker {
+                                         }));
+                                     break;
+                                 }
+-                                stdout_logger
+-                                    .join()
+-                                    .expect("Failed to join stdout reader thread");
+-                                stderr_logger
+-                                    .join()
+-                                    .expect("Failed to join stderr reader thread");
+                             } else {
+                                 let msg = "Failed to run command".to_string();
+                                 sender
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 34592e6..709dcdb 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -508,6 +508,15 @@ impl SimpleComponent for HeadsetPage {
+         adv_group.add(&capture);
+         content.append(&adv_group);
+ 
++        let dbg = group("Debugging", Some("For tracking down problems; off by default."));
++        dbg.add(&ctx.bool_row(
++            crate::session_log::ENABLE_KEY,
++            "Keep session logs",
++            "Save the XR service output of each session in ~/.cache/pimax-linux/sessions (the newest 10 are kept). Takes effect at the next session start",
++            false,
++        ));
++        content.append(&dbg);
++
+         spawn_poll(sender.input_sender(), || HeadsetMsg::Poll);
+         ComponentParts {
+             model: Self { status: read_status() },
+-- 
+2.56.0
+

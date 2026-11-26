@@ -1,0 +1,85 @@
+From 62ab99a3587248cf25b0fe70d5bc6189e28d3646 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:40:05 +0100
+Subject: [PATCH 4/6] d/pimax_p3c: invert controller imu_to_device transform
+
+The controller calibration's imu_to_device maps IMU coordinates into the
+LED-model frame, while the tracker expects LEDs in the IMU frame. Invert
+it before transforming LED positions and normals.
+---
+ .../pimax_p3c/src/device/constellation/led_model.rs | 13 +++++++++----
+ .../pimax_p3c/src/device/constellation/slot/mod.rs  |  6 +++---
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/constellation/led_model.rs b/src/xrt/drivers/pimax_p3c/src/device/constellation/led_model.rs
+index 74be2d556..52a0251e8 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/constellation/led_model.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/constellation/led_model.rs
+@@ -2,7 +2,7 @@ use super::Hand;
+ use crate::config;
+ use serde::Deserialize;
+ use monado_sys::{t_constellation_tracker_led, xrt_pose, XRT_CONSTELLATION_MAX_LEDS_PER_DEVICE, xrt_matrix_4x4, xrt_vec3, t_constellation_led_id_it, t_constellation_tracker_led_model, t_constellation_tracker_led_model_match_parameters};
+-use monado_sys::math::pose_from_isometry;
++use monado_sys::math::{pose_from_isometry, pose_invert};
+ 
+ #[derive(Deserialize)]
+ struct LedModelFile {
+@@ -20,7 +20,8 @@ struct LedFile {
+ 
+ pub struct LedModel {
+     pub leds: Vec<t_constellation_tracker_led>,
+-    pub imu_to_device: xrt_pose,
++    /// Maps LED-model (device) coordinates into the controller IMU's frame.
++    pub device_to_imu: xrt_pose,
+ }
+ 
+ impl LedModel {
+@@ -43,7 +44,11 @@ impl LedModel {
+         }
+         // The file is row-major while `xrt_matrix_4x4` is column-major.
+         let column_major = std::array::from_fn(|i| file.imu_to_device[(i % 4) * 4 + i / 4]);
+-        let imu_to_device = pose_from_isometry(xrt_matrix_4x4 { v: column_major });
++        // `imu_to_device` maps IMU coordinates into the LED-model frame, as its name says. The tracker needs the
++        // LEDs in the IMU frame, so its inverse is used. Measured by comparing the gyro against the rotation of
++        // optical-only solves while the controllers were waved: used directly, the IMU reached the tracker rotated
++        // by about 176 deg.
++        let device_to_imu = pose_invert(&pose_from_isometry(xrt_matrix_4x4 { v: column_major }));
+         let visibility_angle = file.visibility_angle_deg.to_radians();
+ 
+         let leds = file
+@@ -78,7 +83,7 @@ impl LedModel {
+             .collect();
+         Ok(Self {
+             leds,
+-            imu_to_device,
++            device_to_imu,
+         })
+     }
+ 
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
+index 726c98597..97d713cad 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/constellation/slot/mod.rs
+@@ -40,7 +40,7 @@ impl Slot {
+         mut model: LedModel,
+     ) -> Option<Box<Self>> {
+         model_to_imu_frame(&mut model);
+-        let mut slot = Self::new(hand, tracker, model.imu_to_device);
++        let mut slot = Self::new(hand, tracker, model.device_to_imu);
+         let mut params = t_constellation_tracker_device_params {
+             led_model: model.as_tracker_model(),
+             imu_sink: ptr::null_mut(),
+@@ -72,8 +72,8 @@ impl Slot {
+ 
+ fn model_to_imu_frame(model: &mut LedModel) {
+     for led in &mut model.leds {
+-        led.position = pose_transform_point(&model.imu_to_device, &led.position);
+-        led.normal = quat_rotate_vec3(&model.imu_to_device.orientation, &led.normal);
++        led.position = pose_transform_point(&model.device_to_imu, &led.position);
++        led.normal = quat_rotate_vec3(&model.device_to_imu.orientation, &led.normal);
+     }
+ }
+ 
+-- 
+2.56.0
+

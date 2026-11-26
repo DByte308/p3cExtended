@@ -1,0 +1,59 @@
+From 1d317caddcb05ffd6d8cfa59c5567e4f38bef0cb Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:26:43 +0100
+Subject: [PATCH] Headset & Controllers pages: live 1-Euro still-smoothing
+ toggles
+
+Adds PIMAX_CTRL_SMOOTHING (Controllers -> Settings, default Gentle) and
+PIMAX_HMD_SMOOTHING (Headset -> Tracking, default Off) as live settings.
+---
+ src/ui/pimax_common.rs |  2 ++
+ src/ui/pimax_pages.rs  | 12 ++++++++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/src/ui/pimax_common.rs b/src/ui/pimax_common.rs
+index 27c70ef..2fa8483 100644
+--- a/src/ui/pimax_common.rs
++++ b/src/ui/pimax_common.rs
+@@ -35,6 +35,8 @@ pub const LIVE_KEYS: &[&str] =
+         "PIMAX_UPSCALE",
+         "PIMAX_VOLUME_KEYS",
+         "PIMAX_RESTART_AT",
++        "PIMAX_CTRL_SMOOTHING",
++        "PIMAX_HMD_SMOOTHING",
+     ];
+ 
+ pub fn live_settings_path() -> Option<std::path::PathBuf> {
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 709dcdb..89ad879 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -440,6 +440,12 @@ impl SimpleComponent for HeadsetPage {
+             "Headset cameras; the driver turns it off by default when a lighthouse faceplate is used",
+             true,
+         ));
++        trk.add(&ctx.choice_row(
++            "PIMAX_HMD_SMOOTHING",
++            "Headset still smoothing",
++            "1-Euro filter that calms micro-jitter while holding your head still (turns off automatically in motion). Applies immediately",
++            &[("Off (default)", None), ("Gentle", Some("gentle"))],
++        ));
+         content.append(&trk);
+ 
+         // Advanced
+@@ -671,6 +677,12 @@ impl SimpleComponent for ControllersPage {
+             50.0,
+             1.0,
+         ));
++        g.add(&ctx.choice_row(
++            "PIMAX_CTRL_SMOOTHING",
++            "Still smoothing",
++            "1-Euro filter that removes micro-jitter while holding the controllers still without adding lag in fast motion. Applies immediately",
++            &[("Gentle (default)", None), ("Strong", Some("strong")), ("Off", Some("off"))],
++        ));
+         g.add(&ctx.explicit_bool_row(
+             "PIMAX_CONSTELLATION",
+             "Controller tracking",
+-- 
+2.56.0
+

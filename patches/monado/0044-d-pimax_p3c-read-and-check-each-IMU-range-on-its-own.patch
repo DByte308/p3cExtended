@@ -1,0 +1,84 @@
+From 0452310336a79479b79709247273c2ee5806ff7c Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:11:51 +0100
+Subject: [PATCH] d/pimax_p3c: read and check each IMU range on its own
+
+The IMU ranges of the headset and both controllers were read once at
+start-up as a set: one failed query sent all three to the defaults, and a
+reply with an implausible range (a zero range gives inf/NaN samples, a tiny
+gyro range scales every rotation to almost nothing) was used as is for the
+whole session. Each device is now read on its own (the controllers only when
+there is a controller connection), a range below the smallest an IMU is made
+with (2 g, 125 deg/s) falls back to that device's default with a warning,
+and the values read are logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pimax_p3c/src/device/session/bringup.rs   | 42 ++++++++++++++-----
+ 1 file changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+index 411aad691..b9b7cb1a9 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/bringup.rs
+@@ -164,11 +164,12 @@ pub fn bring_up(interfaces: Interfaces, identity: &Identity) -> BringUp {
+         false
+     });
+ 
+-    let (hmd, controller_left, controller_right) =
+-        read_imu_config(&cmd).unwrap_or((HMD_FORMAT, CONTROLLER_FORMAT, CONTROLLER_FORMAT));
++    let hmd = read_imu_format(&cmd, PimaxSubDevice::Hmd, "headset", HMD_FORMAT);
+     hmd_status_stream.set_format(hmd);
+     if let Some(s) = controller_status_stream.as_mut() {
+-        s.set_format(controller_left, controller_right);
++        let left = read_imu_format(&cmd, PimaxSubDevice::ControllerLeft, "left controller", CONTROLLER_FORMAT);
++        let right = read_imu_format(&cmd, PimaxSubDevice::ControllerRight, "right controller", CONTROLLER_FORMAT);
++        s.set_format(left, right);
+     }
+ 
+     BringUp {
+@@ -187,13 +188,34 @@ pub fn bring_up(interfaces: Interfaces, identity: &Identity) -> BringUp {
+     }
+ }
+ 
+-fn read_imu_config(cmd: &CommandDevice) -> Option<(ImuFormat, ImuFormat, ImuFormat)> {
+-    let read = |device| cmd.query(&CmdReadImuConfig(device)).ok().map(Into::into);
+-    Some((
+-        read(PimaxSubDevice::Hmd)?,
+-        read(PimaxSubDevice::ControllerLeft)?,
+-        read(PimaxSubDevice::ControllerRight)?,
+-    ))
++/// Smallest measuring ranges IMUs are made with; a reply below them (zero, say) is not a real configuration.
++const MIN_ACCEL_LIMIT_G: u8 = 2;
++const MIN_GYRO_LIMIT_DPS: u16 = 125;
++
++/// The IMU scale of one device, each checked on its own: a failed query or an implausible range (a controller that
++/// is not reachable yet can answer with one; a zero range would turn every sample into inf/NaN, a tiny one would
++/// scale the gyro to nothing for the whole session) falls back to the known default for that device only.
++fn read_imu_format(cmd: &CommandDevice, device: PimaxSubDevice, name: &str, default: ImuFormat) -> ImuFormat {
++    match cmd.query(&CmdReadImuConfig(device)) {
++        Ok(c) if c.accel_limit_g >= MIN_ACCEL_LIMIT_G && c.gyro_limit_dps >= MIN_GYRO_LIMIT_DPS => {
++            info!(
++                "{name} IMU: \u{b1}{} g, \u{b1}{} deg/s, {} Hz",
++                c.accel_limit_g, c.gyro_limit_dps, c.sample_rate_hz
++            );
++            c.into()
++        }
++        Ok(c) => {
++            warn!(
++                "{name} IMU reported an implausible range (\u{b1}{} g, \u{b1}{} deg/s); using the default",
++                c.accel_limit_g, c.gyro_limit_dps
++            );
++            default
++        }
++        Err(e) => {
++            warn!("{name} IMU range could not be read ({e}); using the default");
++            default
++        }
++    }
+ }
+ 
+ impl Sessions {
+-- 
+2.56.0
+

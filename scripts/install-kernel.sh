@@ -6,11 +6,13 @@
 #         then: grubby --remove-kernel=/boot/vmlinuz-7.3.1-pimaxq ; dnf reinstall grub2-... not needed
 set -euo pipefail
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
-KREL=7.3.1-pimaxq
 # Usage: install-kernel.sh [kernel-tree]   default: <repo>/build/kernel/linux-7.3.1
 # (absolute path: it becomes the target of the /lib/modules/$KREL/build symlinks)
 TREE=$(readlink -f "${1:-$PIMAX_REPO/build/kernel/linux-7.3.1}")
 cd "$TREE"
+KREL=$(make -s kernelrelease EXTRAVERSION=-pimaxq)
+[ -n "$KREL" ] || { echo "could not determine kernelrelease in $TREE" >&2; exit 1; }
+echo "Installing kernel $KREL from $TREE"
 
 echo "== 1/4 modules_install =="
 make modules_install EXTRAVERSION=-pimaxq

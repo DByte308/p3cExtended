@@ -1,0 +1,44 @@
+From 70fcac93e5c41af40a06dc1bba1028d8211dc6e6 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:40:05 +0100
+Subject: [PATCH 6/6] d/pimax_p3c: drop placeholder and empty controller IMU
+ samples
+
+Drop the ~30 post-connect placeholder samples (~-4000 deg/s on all gyro
+axes) and periodic all-zero accelerometer samples before pushing to
+controller sensor fusion.
+---
+ src/xrt/drivers/pimax_p3c/src/device/session/status.rs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+index fa0bdd8fc..eb5f80227 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/status.rs
+@@ -86,6 +86,13 @@ fn hmd_timestamp_plausible(device_ns: i64) -> bool {
+     false
+ }
+ 
++/// A sample without a real measurement: post-connect placeholder gyro (~-4000 deg/s on all axes)
++/// or an empty all-zero accelerometer sample.
++fn is_placeholder_imu(sample: &ImuSample) -> bool {
++    let g = &sample.gyro;
++    (g[0] < -1000.0 && g[1] == g[0] && g[2] == g[0]) || sample.accel.iter().all(|&a| a == 0.0)
++}
++
+ pub(super) trait OnReport: Sized {
+     fn on_status(self, tracking: &Tracking);
+ }
+@@ -156,6 +163,9 @@ impl OnReport for ControllerStatus {
+                 if sample_ns <= last_ns || sample_ns > now_ns() + 20_000_000 {
+                     continue;
+                 }
++                if is_placeholder_imu(sample) {
++                    continue;
++                }
+                 last_ns = sample_ns;
+                 constellation.push_controller_imu(
+                     hand,
+-- 
+2.56.0
+

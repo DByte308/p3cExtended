@@ -11,12 +11,16 @@ DUR=${1:-120}
 MONADO_PREFIX=${MONADO_PREFIX:-}
 if [ -n "$MONADO_PREFIX" ]; then
     SERVICE="$MONADO_PREFIX/bin/monado-service"; CLIENT_LIB=$(pimax_libdir "$MONADO_PREFIX" libopenxr_monado.so) || { echo "no libopenxr_monado.so under $MONADO_PREFIX" >&2; exit 1; }
+    MANIFEST_SRC="$MONADO_PREFIX/share/openxr/1/openxr_monado.json"
+    [ -f "$MANIFEST_SRC" ] || MANIFEST_SRC="/usr/share/openxr/1/openxr_monado.json"
 else
     SERVICE="$PIMAX_PREFIX/bin/monado-service"
     CLIENT_LIB=$(pimax_libdir /usr libopenxr_monado.so) || { echo "no libopenxr_monado.so under /usr" >&2; exit 1; }
+    MANIFEST_SRC="/usr/share/openxr/1/openxr_monado.json"
 fi
 MAN="$HOME/.config/openxr/1/active_runtime.json"
-LOG=/tmp/vr-session.log
+mkdir -p "$PIMAX_CACHE"
+LOG="$PIMAX_CACHE/vr-session.log"
 
 export VIT_SYSTEM_LIBRARY_PATH="$(pimax_libdir "$PIMAX_PREFIX" libbasalt.so || echo "$PIMAX_PREFIX/lib")/libbasalt.so"
 # Envision General-tab equivalents (Envision src/config.rs get_env_vars)
@@ -34,16 +38,26 @@ export XR_RUNTIME_JSON="$MAN"
 export OXR_PARALLEL_VIEWS=1
 
 # 1. runtime manifest: real file, absolute lib path (Envision deletes it on session stop)
-python3 - "$MAN" "$CLIENT_LIB" <<'PY'
+python3 -I - "$MAN" "$CLIENT_LIB" "$MANIFEST_SRC" <<'PY'
 import json, pathlib, sys
 dst = pathlib.Path(sys.argv[1])
-src = json.loads(pathlib.Path('/usr/share/openxr/1/openxr_monado.json').read_text())
+src = json.loads(pathlib.Path(sys.argv[3]).read_text())
 src['runtime']['library_path'] = sys.argv[2] + '/libopenxr_monado.so'
 src['runtime']['MND_libmonado_path'] = sys.argv[2] + '/libmonado.so'
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.unlink(missing_ok=True)
 dst.write_text(json.dumps(src, indent=4) + "\n")
 PY
+
+OWN_SERVICE=0
+SUB=""
+cleanup() {
+    if [ "$OWN_SERVICE" = 1 ] && [ -n "$SUB" ]; then
+        echo "stopping monado-service"
+        pimax_stop_pid "$(pgrep -P "$SUB" -x monado-service || true)" "$(pgrep -P "$SUB" -x tail || true)"
+    fi
+}
+trap cleanup EXIT
 
 # 2. reuse a running service, else start one with a stdin that never closes
 if pgrep -x monado-service >/dev/null; then
@@ -63,9 +77,3 @@ fi
 echo "service: $(pgrep -x monado-service | head -1) | runtime: $MAN"
 echo "starting WayVR for ${DUR}s ..."
 timeout "$DUR" "$PIMAX_WAYVR" --openxr
-
-# 3. cleanup only what we started
-if [ "$OWN_SERVICE" = 1 ]; then
-    echo "stopping monado-service"
-    pimax_stop_pid "$(pgrep -P "$SUB" -x monado-service)" "$(pgrep -P "$SUB" -x tail)"
-fi

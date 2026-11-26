@@ -1,0 +1,143 @@
+From cadd5b6e8e3f4e8457ad63829143a2a792f2024b Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:22:25 +0100
+Subject: [PATCH 46/46] t/constellation: refuse a re-acquisition that lands on
+ another tracked device
+
+A device unseen for longer than the prior-gate gap is not gated against its
+prior, so a left controller re-acquired onto the right controller's mirror-image
+LED ring and both hands merged. Such a solve is now refused when it lies within
+CONSTELLATION_REACQUIRE_EXCLUDE_CM (6) of another tracked device's prediction,
+unless its orientation agrees with the device's own gyro-carried prediction
+within CONSTELLATION_REACQUIRE_AGREE_DEG (45).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../constellation/t_constellation_tracker.cpp | 89 ++++++++++++++++---
+ 1 file changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index 9a9e00bba..5cb1d8894 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -39,6 +39,10 @@ DEBUG_GET_ONCE_OPTION(constellation_tracker_data_recorder_output, "CONSTELLATION
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_deg, "CONSTELLATION_PRIOR_GATE_DEG", 25)
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_cm, "CONSTELLATION_PRIOR_GATE_CM", 25)
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_gap_ms, "CONSTELLATION_PRIOR_GATE_GAP_MS", 500)
++// Re-acquisition may not land this close to another device that is being tracked, unless its orientation agrees
++// with the device's own IMU-carried prediction; 0 disables the check. Needs the prior gate on (DEG > 0).
++DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_exclude_cm, "CONSTELLATION_REACQUIRE_EXCLUDE_CM", 6)
++DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_agree_deg, "CONSTELLATION_REACQUIRE_AGREE_DEG", 45)
+ 
+ // Unconditionally present to allow warning that the feature is not enabled.
+ DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TRACKER_RERUN_ENABLE", false)
+@@ -964,8 +968,69 @@ Camera::processSampleFast(CameraSample &sample)
+  * the image (e.g. one hand turned to look at a watch, the other pointing at it). Every accept path ends in
+  * Camera::pushPose, and an accepted pose seeds the next frame's search and the blob labels, so one wrong solve keeps
+  * the device on the other ring. Rejecting solves far from the prior stops that. A device unseen for longer than the
+- * gap (or without a prior) is exempt, so it can always be re-acquired.
++ * gap (or without a prior) is not gated against its prior, so it can always be re-acquired; such a re-acquisition
++ * is only refused when it lands on another device that is being tracked (see reacquire_lands_on_other_device).
+  */
++static bool
++reacquire_lands_on_other_device(ConstellationTracker *tracker,
++                                const CameraSample &sample,
++                                const DeviceState &device_state,
++                                const Device *device,
++                                const xrt_pose &Txr_world_device,
++                                int64_t gap_ns)
++{
++	const int64_t exclude_cm = debug_get_num_option_constellation_reacquire_exclude_cm();
++	if (exclude_cm <= 0) {
++		return false;
++	}
++	// After a gap the predicted position is unreliable but the gyro-carried orientation is not: a solve that agrees
++	// with it is this device's own LEDs, even right next to the other hand (two-handed holds).
++	if (device_state.Txr_world_device_prior.has_value()) {
++		const float dot =
++		    fabsf(math_quat_dot(&Txr_world_device.orientation, &device_state.Txr_world_device_prior->orientation));
++		const float angle_deg = 2.0f * acosf(fminf(1.0f, dot)) * (float)(180.0 / M_PI);
++		if (angle_deg <= (float)debug_get_num_option_constellation_reacquire_agree_deg()) {
++			return false;
++		}
++	}
++	// The caller holds tracker->device_lock (shared), which keeps tracker->devices stable.
++	for (const std::unique_ptr<Device> &other : tracker->devices) {
++		if (other.get() == device) {
++			continue;
++		}
++		std::optional<DeviceLastPose> other_last;
++		{
++			std::unique_lock<os::Mutex> lock(other->data_lock);
++			other_last = other->locked_data.last_known_pose;
++		}
++		if (!other_last.has_value() || sample.timestamp_ns - other_last->timestamp_ns > gap_ns) {
++			continue; // not tracked right now, so it has no claim on these LEDs
++		}
++		// Where the other device is now: its prediction for this sample, else its last optical pose.
++		xrt_vec3 other_pos = other_last->Txr_world_device.position;
++		for (uint32_t i = 0; i < sample.device_count; i++) {
++			const DeviceState &ds = sample.device_states[i];
++			if (ds.device_id == other->id && ds.Txr_world_device_prior.has_value()) {
++				other_pos = ds.Txr_world_device_prior->position;
++			}
++		}
++		const float dist_cm = m_vec3_len(Txr_world_device.position - other_pos) * 100.0f;
++		if (dist_cm > (float)exclude_cm) {
++			continue;
++		}
++		static std::atomic<uint64_t> refused[8];
++		const uint64_t n = ++refused[std::min<size_t>((size_t)device->id, 7)];
++		if (n <= 5 || (n & (n - 1)) == 0) {
++			CT_WARN(tracker,
++			        "Refused re-acquisition #%" PRIu64 " of device %d: %.0f cm from tracked device %d (limit %" PRIi64
++			        " cm)",
++			        n, (int)device->id, dist_cm, (int)other->id, exclude_cm);
++		}
++		return true;
++	}
++	return false;
++}
++
+ static bool
+ prior_gate_accepts(ConstellationTracker *tracker,
+                    const CameraSample &sample,
+@@ -974,22 +1039,26 @@ prior_gate_accepts(ConstellationTracker *tracker,
+                    const xrt_pose &Tcv_cam_device)
+ {
+ 	const int64_t max_deg = debug_get_num_option_constellation_prior_gate_deg();
+-	if (max_deg <= 0 || !device_state.Txr_world_device_prior.has_value() || !sample.Txr_world_cam.has_value()) {
++	if (max_deg <= 0 || !sample.Txr_world_cam.has_value()) {
+ 		return true;
+ 	}
+-	{
+-		std::unique_lock<os::Mutex> lock(device->data_lock);
+-		const auto &last = device->locked_data.last_known_pose;
+-		const int64_t gap_ns = debug_get_num_option_constellation_prior_gate_gap_ms() * U_TIME_1MS_IN_NS;
+-		if (!last.has_value() || sample.timestamp_ns - last->timestamp_ns > gap_ns) {
+-			return true;
+-		}
+-	}
+ 
+ 	xrt_pose Txr_cam_device;
+ 	xrt_pose Txr_world_device;
+ 	math_pose_convert_from_opencv(&Tcv_cam_device, &Txr_cam_device);
+ 	math_pose_transform(&sample.Txr_world_cam.value(), &Txr_cam_device, &Txr_world_device);
++
++	const int64_t gap_ns = debug_get_num_option_constellation_prior_gate_gap_ms() * U_TIME_1MS_IN_NS;
++	bool reacquire = !device_state.Txr_world_device_prior.has_value();
++	if (!reacquire) {
++		std::unique_lock<os::Mutex> lock(device->data_lock);
++		const auto &last = device->locked_data.last_known_pose;
++		reacquire = !last.has_value() || sample.timestamp_ns - last->timestamp_ns > gap_ns;
++	}
++	if (reacquire) {
++		return !reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, gap_ns);
++	}
++
+ 	const xrt_pose &prior = device_state.Txr_world_device_prior.value();
+ 
+ 	const float dot = fabsf(math_quat_dot(&Txr_world_device.orientation, &prior.orientation));
+-- 
+2.56.0
+

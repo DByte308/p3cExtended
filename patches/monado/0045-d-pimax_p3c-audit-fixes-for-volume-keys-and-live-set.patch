@@ -1,0 +1,79 @@
+From ff7f55d98ce649f3729a9aa8eaa2044e1943859f Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 08:40:00 +0100
+Subject: [PATCH] d/pimax_p3c: audit fixes for volume keys and live settings
+
+- Volume keys: skip pactl when queued volume-up and volume-down steps fold
+  to delta == 0; previously format!("{delta}%") passed "0%" (absolute mute)
+  to pactl set-sink-volume.
+- Live settings: only cache settings.json's mtime after a successful read
+  and parse so transient read errors are retried on the next check.
+- Live settings: keep process_started_ms() unshifted (for PIMAX_RESTART_AT)
+  and tighten started()'s mtime margin from 1 s to 100 ms so a quick
+  session restart does not pick up stale files from the previous session.
+---
+ .../pimax_p3c/src/device/session/volume_keys.rs    |  3 +++
+ src/xrt/drivers/pimax_p3c/src/live.rs              | 14 +++++++++-----
+ 2 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs b/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
+index 6c7d44a38..745a1d5b2 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/volume_keys.rs
+@@ -65,6 +65,9 @@ fn current_percent() -> Option<i32> {
+ }
+ 
+ fn change_volume(delta: i32) {
++    if delta == 0 {
++        return;
++    }
+     let Some(cur) = current_percent() else {
+         warn!("volume keys: pactl not available or no default output");
+         return;
+diff --git a/src/xrt/drivers/pimax_p3c/src/live.rs b/src/xrt/drivers/pimax_p3c/src/live.rs
+index 23d8202c5..81a688ec4 100644
+--- a/src/xrt/drivers/pimax_p3c/src/live.rs
++++ b/src/xrt/drivers/pimax_p3c/src/live.rs
+@@ -32,10 +32,14 @@ fn process_start() -> Option<SystemTime> {
+     SystemTime::now().checked_sub(Duration::from_secs_f64(age))
+ }
+ 
+-fn started() -> SystemTime {
++fn process_started() -> SystemTime {
+     static T: OnceLock<SystemTime> = OnceLock::new();
+-    // 1 s margin for the coarse tick resolution; the env of a process can't change after exec anyway.
+-    *T.get_or_init(|| process_start().map(|t| t - Duration::from_secs(1)).unwrap_or_else(SystemTime::now))
++    *T.get_or_init(|| process_start().unwrap_or_else(SystemTime::now))
++}
++
++fn started() -> SystemTime {
++    // 100 ms margin for the 10 ms /proc tick resolution; small enough not to pick up a prior session's file.
++    process_started().checked_sub(Duration::from_millis(100)).unwrap_or(SystemTime::UNIX_EPOCH)
+ }
+ 
+ /// Call once at driver start-up.
+@@ -60,11 +64,11 @@ fn refresh(st: &mut State) {
+     if mtime < started() || st.mtime == Some(mtime) {
+         return;
+     }
+-    st.mtime = Some(mtime);
+     let parsed: Option<HashMap<String, Option<String>>> =
+         std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok());
+     match parsed {
+         Some(map) => {
++            st.mtime = Some(mtime);
+             if map != st.map {
+                 info!("live settings: {map:?}");
+                 st.map = map;
+@@ -92,7 +96,7 @@ pub fn get_live_only(name: &str) -> Option<String> {
+ 
+ /// This process's start time in Unix milliseconds.
+ pub fn process_started_ms() -> u64 {
+-    started().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
++    process_started().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+ }
+ 
+ /// Current value of `name`: the live file if it has the key, else the environment.
+-- 
+2.56.0
+

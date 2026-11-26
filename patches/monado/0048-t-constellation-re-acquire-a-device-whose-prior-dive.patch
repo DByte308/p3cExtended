@@ -1,0 +1,205 @@
+From ec4dfc01ee22970c8ae172376aec73b3461d400f Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:39:53 +0100
+Subject: [PATCH] t/constellation: re-acquire a device whose prior diverged
+
+A diverged fusion prior (start-up) made the prior gate reject almost every
+solve of the left controller for a whole session; the few accepted stragglers
+kept the gap from expiring, so it flew on its IMU. When rejected solves agree
+with each other over CONSTELLATION_PRIOR_GATE_ESCAPE (5) distinct exposures
+spanning at least 100 ms, the solve is accepted and the device's fusion is
+reset (new SensorFusion::requestReset). Such an escape, and re-acquisition until
+the fusion has a prior again, refuse solves within 15 cm of another tracked
+device without the orientation exemption.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../constellation/optimizer/sensor_fusion.cpp |   7 ++
+ .../constellation/optimizer/sensor_fusion.hpp |   4 +
+ .../constellation/t_constellation_tracker.cpp | 100 +++++++++++++++++-
+ 3 files changed, 107 insertions(+), 4 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/optimizer/sensor_fusion.cpp b/src/xrt/tracking/constellation/optimizer/sensor_fusion.cpp
+index 406f97fa4..b6b680658 100644
+--- a/src/xrt/tracking/constellation/optimizer/sensor_fusion.cpp
++++ b/src/xrt/tracking/constellation/optimizer/sensor_fusion.cpp
+@@ -2769,6 +2769,13 @@ SensorFusion::~SensorFusion()
+ 	delete this->problem;
+ }
+ 
++void
++SensorFusion::requestReset()
++{
++	std::lock_guard<os::Mutex> lock{this->lock};
++	this->resetLocked();
++}
++
+ void
+ SensorFusion::addCamera(const CameraDescription &camera_description)
+ {
+diff --git a/src/xrt/tracking/constellation/optimizer/sensor_fusion.hpp b/src/xrt/tracking/constellation/optimizer/sensor_fusion.hpp
+index 1bafecc6c..6df5cbd39 100644
+--- a/src/xrt/tracking/constellation/optimizer/sensor_fusion.hpp
++++ b/src/xrt/tracking/constellation/optimizer/sensor_fusion.hpp
+@@ -667,6 +667,10 @@ public: // Methods
+ 	void
+ 	getTrackedPose(timepoint_ns requested_time_ns, xrt_space_relation &out_relation);
+ 
++	//! Drops the fusion state so the next camera sample starts it again (the tracker found its prediction lost).
++	void
++	requestReset();
++
+ 	/*!
+ 	 * Appends any camera samples into @p pending, before sorting pending by timestamp order.
+ 	 *
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index 5cb1d8894..39d8e0bab 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -25,6 +25,7 @@
+ #endif
+ 
+ #include <atomic>
++#include <mutex>
+ #include <algorithm>
+ #include <limits>
+ #include <string>
+@@ -43,6 +44,9 @@ DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_gap_ms, "CONSTELLATION_PRIOR_
+ // with the device's own IMU-carried prediction; 0 disables the check. Needs the prior gate on (DEG > 0).
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_exclude_cm, "CONSTELLATION_REACQUIRE_EXCLUDE_CM", 6)
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_agree_deg, "CONSTELLATION_REACQUIRE_AGREE_DEG", 45)
++// Consecutive rejected solves that agree with each other (within the gate) after which the prior counts as lost and the
++// device is re-acquired from them; 0 disables it.
++DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_escape, "CONSTELLATION_PRIOR_GATE_ESCAPE", 5)
+ 
+ // Unconditionally present to allow warning that the feature is not enabled.
+ DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TRACKER_RERUN_ENABLE", false)
+@@ -977,15 +981,20 @@ reacquire_lands_on_other_device(ConstellationTracker *tracker,
+                                 const DeviceState &device_state,
+                                 const Device *device,
+                                 const xrt_pose &Txr_world_device,
+-                                int64_t gap_ns)
++                                int64_t gap_ns,
++                                bool prior_untrusted)
+ {
+-	const int64_t exclude_cm = debug_get_num_option_constellation_reacquire_exclude_cm();
++	int64_t exclude_cm = debug_get_num_option_constellation_reacquire_exclude_cm();
+ 	if (exclude_cm <= 0) {
+ 		return false;
+ 	}
++	// The prior was just declared lost: its orientation cannot vouch for the solve, so use a wider radius instead.
++	if (prior_untrusted) {
++		exclude_cm = std::max<int64_t>(exclude_cm, 15);
++	}
+ 	// After a gap the predicted position is unreliable but the gyro-carried orientation is not: a solve that agrees
+ 	// with it is this device's own LEDs, even right next to the other hand (two-handed holds).
+-	if (device_state.Txr_world_device_prior.has_value()) {
++	if (!prior_untrusted && device_state.Txr_world_device_prior.has_value()) {
+ 		const float dot =
+ 		    fabsf(math_quat_dot(&Txr_world_device.orientation, &device_state.Txr_world_device_prior->orientation));
+ 		const float angle_deg = 2.0f * acosf(fminf(1.0f, dot)) * (float)(180.0 / M_PI);
+@@ -1055,9 +1064,16 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 		const auto &last = device->locked_data.last_known_pose;
+ 		reacquire = !last.has_value() || sample.timestamp_ns - last->timestamp_ns > gap_ns;
+ 	}
++	// Set when the escape below reset the fusion; until the fusion has a prior again, re-acquisition is as strict as
++	// the escape itself (wide radius, no orientation exemption).
++	static std::atomic<bool> prior_lost[8];
++	const size_t lost_slot = std::min<size_t>((size_t)device->id, 7);
+ 	if (reacquire) {
+-		return !reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, gap_ns);
++		const bool untrusted = prior_lost[lost_slot].load();
++		return !reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, gap_ns,
++		                                        untrusted);
+ 	}
++	prior_lost[lost_slot].store(false);
+ 
+ 	const xrt_pose &prior = device_state.Txr_world_device_prior.value();
+ 
+@@ -1070,7 +1086,83 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 	checked[slot]++;
+ 	const bool angle_ok = angle_deg <= (float)max_deg;
+ 	const bool dist_ok = dist_cm <= (float)debug_get_num_option_constellation_prior_gate_cm();
++	/*
++	 * Rejected solves that agree with each other over several camera exposures while disagreeing with the prior mean
++	 * the prior is what is wrong (the fusion diverged, e.g. at start-up). A few accepted stragglers keep the gap from
++	 * ever expiring, so without this the device stays locked out and flies on its IMU. On escape the fusion is reset,
++	 * so it restarts from the escaped solve instead of averaging it against the diverged window.
++	 *
++	 * One exposure is counted once: several solve attempts per sample (fast candidates, slow passes) and several
++	 * cameras of one exposure re-solve the same blobs and are not independent evidence.
++	 */
++	struct RejectStreak
++	{
++		uint32_t exposures;
++		int64_t first_ns;
++		int64_t last_ns;
++		xrt_pose Txr_world_device;
++	};
++	static std::mutex streak_mutex;
++	static RejectStreak streaks[8];
++	constexpr int64_t kSameExposureNs = 2 * U_TIME_1MS_IN_NS;
++	constexpr int64_t kMaxStepNs = 100 * U_TIME_1MS_IN_NS;
++	constexpr int64_t kMinSpanNs = 100 * U_TIME_1MS_IN_NS;
+ 	if (angle_ok && dist_ok) {
++		std::lock_guard<std::mutex> lock(streak_mutex);
++		streaks[slot].exposures = 0;
++		return true;
++	}
++	const int64_t escape = debug_get_num_option_constellation_prior_gate_escape();
++	bool escaped = false;
++	if (escape > 0) {
++		std::lock_guard<std::mutex> lock(streak_mutex);
++		RejectStreak &st = streaks[slot];
++		const int64_t dt = sample.timestamp_ns - st.last_ns;
++		if (st.exposures > 0 && std::abs(dt) <= kSameExposureNs) {
++			// Same exposure: neither counts nor breaks the streak.
++		} else {
++			bool consistent = false;
++			if (st.exposures > 0 && dt > 0 && dt <= kMaxStepNs) {
++				const float d = fabsf(math_quat_dot(&Txr_world_device.orientation, &st.Txr_world_device.orientation));
++				const float a = 2.0f * acosf(fminf(1.0f, d)) * (float)(180.0 / M_PI);
++				const float c = m_vec3_len(Txr_world_device.position - st.Txr_world_device.position) * 100.0f;
++				consistent =
++				    a <= (float)max_deg && c <= (float)debug_get_num_option_constellation_prior_gate_cm();
++			}
++			if (consistent) {
++				st.exposures++;
++				st.last_ns = sample.timestamp_ns;
++				st.Txr_world_device = Txr_world_device;
++			} else if (st.exposures == 0 || dt > 0) {
++				// Start a new streak; an older sample (slow thread) does not replace a newer one.
++				st.exposures = 1;
++				st.first_ns = sample.timestamp_ns;
++				st.last_ns = sample.timestamp_ns;
++				st.Txr_world_device = Txr_world_device;
++			}
++			if (st.exposures >= (uint64_t)escape && st.last_ns - st.first_ns >= kMinSpanNs) {
++				st.exposures = 0;
++				escaped = true;
++			}
++		}
++	}
++	if (escaped) {
++		if (reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, gap_ns, true)) {
++			rejected[slot]++;
++			return false;
++		}
++		static std::atomic<uint64_t> escapes[8];
++		const uint64_t e = ++escapes[slot];
++		if (e <= 5 || (e & (e - 1)) == 0) {
++			CT_WARN(tracker,
++			        "Prior of device %d lost (#%" PRIu64 "): %" PRIi64
++			        " exposures agree %.0f deg / %.0f cm away from it; resetting its fusion",
++			        (int)device->id, e, escape, angle_deg, dist_cm);
++		}
++		prior_lost[lost_slot].store(true);
++		if (device->sensor_fusion) {
++			device->sensor_fusion->requestReset();
++		}
+ 		return true;
+ 	}
+ 
+-- 
+2.56.0
+

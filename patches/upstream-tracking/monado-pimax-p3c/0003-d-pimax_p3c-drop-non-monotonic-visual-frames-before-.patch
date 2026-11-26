@@ -1,0 +1,72 @@
+From c948ffb08359399c0095540d9ab7715d9d9a75a1 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:40:05 +0100
+Subject: [PATCH 3/6] d/pimax_p3c: drop non-monotonic visual frames before SLAM
+
+A repeated or slightly reordered camera frame (device mid-exposure or
+mapped host timestamp not strictly newer than the previous frame) makes
+Basalt abort. Drop such frames before forwarding to SLAM.
+---
+ .../pimax_p3c/src/device/camera/mod.rs        | 25 +++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/camera/mod.rs b/src/xrt/drivers/pimax_p3c/src/device/camera/mod.rs
+index de347ffd7..ce46d7ab4 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/camera/mod.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/camera/mod.rs
+@@ -49,6 +49,8 @@ impl Cameras {
+             ir_sinks,
+             offset_ns,
+             ir_frames: 0,
++            last_visual: (i64::MIN, i64::MIN),
++            stale_visual: 0,
+             visual_exposure: VisualAutoExposure::new(),
+             ir_exposure: IrAutoExposure,
+         }));
+@@ -101,6 +103,10 @@ struct CameraSource {
+     ir_sinks: Vec<*mut xrt_frame_sink>,
+     offset_ns: i64,
+     ir_frames: u64,
++    /// Last visual frame sent to SLAM: device mid-exposure (us) and host time (ns). Basalt aborts on a frame that is
++    /// not newer than the previous one, so such a frame is dropped here.
++    last_visual: (i64, i64),
++    stale_visual: u64,
+     visual_exposure: VisualAutoExposure,
+     ir_exposure: IrAutoExposure,
+ }
+@@ -128,7 +134,7 @@ impl CameraSource {
+         if header.kind == Kind::Ir {
+             self.on_ir_frame(&header, &band);
+         } else {
+-            self.on_visual_frame(&header, &band);
++            self.on_visual_frame(&header, &band, timestamp_ns);
+         }
+         trace!("finished processing frame: {timestamp_ns}");
+     }
+@@ -141,7 +147,22 @@ impl CameraSource {
+         push_cams(band, &self.ir_sinks);
+     }
+ 
+-    fn on_visual_frame(&mut self, header: &FrameHeader, band: &FrameRef) {
++    fn on_visual_frame(&mut self, header: &FrameHeader, band: &FrameRef, timestamp_ns: i64) {
++        // A repeated or reordered frame (device time not newer), or one whose host time maps earlier than the last
++        // because the clock estimate moved between the two conversions, would make Basalt abort.
++        let device_us = header.mid_exposure_us(0) as i64;
++        let (last_us, last_ns) = self.last_visual;
++        if device_us <= last_us || timestamp_ns <= last_ns {
++            self.stale_visual += 1;
++            if self.stale_visual <= 5 || self.stale_visual.is_power_of_two() {
++                warn!(
++                    "dropping visual frame #{}: device {device_us} us (last {last_us}), host {timestamp_ns} ns (last {last_ns})",
++                    self.stale_visual
++                );
++            }
++            return;
++        }
++        self.last_visual = (device_us, timestamp_ns);
+         self.visual_exposure.update(&self.tracking, header, &band.cams(0, self.visual_sinks.len()));
+         trace!("pushing frame to SLAM tracker");
+         push_cams(band, &self.visual_sinks);
+-- 
+2.56.0
+

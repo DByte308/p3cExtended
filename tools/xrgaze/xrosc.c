@@ -53,7 +53,8 @@ int main(int argc, char **argv) {
     else if (argv[i][0] != '-') { if (pos == 0) host = argv[i]; else if (pos == 1) port = argv[i]; pos++; }
     else { fprintf(stderr, "usage: xrosc [host] [port] [--rate 60] [--fake] [--seconds N]\n"); return 2; }
   }
-  if (rate < 1) rate = 1;
+  if (!isfinite(rate) || rate < 1) rate = 1;
+  if (rate > 1000) rate = 1000;
   struct addrinfo hints = {.ai_socktype = SOCK_DGRAM}, *res;
   if (getaddrinfo(host, port, &hints, &res)) { fprintf(stderr, "cannot resolve %s:%s\n", host, port); return 1; }
   memcpy(&dst, res->ai_addr, res->ai_addrlen); dstlen = res->ai_addrlen;
@@ -128,6 +129,10 @@ int main(int argc, char **argv) {
       fflush(stdout); tick_w = valid_w = 0; sent_w0 = sent;
     }
     next.tv_nsec += period_ns; while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+    if (next.tv_sec < tl.tv_sec || (next.tv_sec == tl.tv_sec && next.tv_nsec < tl.tv_nsec)) {
+      next = tl;
+      next.tv_nsec += period_ns; while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+    }
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
   }
 done:

@@ -24,7 +24,7 @@ static XrInstance inst;
 
 static const float YAWS[] = {-25, -12, 0, 12, 25}, PITCHES[] = {15, 0, -15};
 #define NT 15
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_REALTIME, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static XrQuaternionf qmul(XrQuaternionf a, XrQuaternionf b) {
   return (XrQuaternionf){a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y, a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
                          a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w, a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z};
@@ -63,6 +63,9 @@ int main(int argc, char **argv) {
   int completed = 0; // all targets shown (calibrate mode)
   FILE *out = live ? NULL : fopen(argv[1], "w"); if (!live && !out) { perror(argv[1]); return 1; }
   double delay = !live && argc > 2 ? atof(argv[2]) : 8, hold = !live && argc > 3 ? atof(argv[3]) : 2.5, settle = 1.0;
+  if (delay < 0 || !isfinite(delay)) delay = 0;
+  if (hold <= settle || !isfinite(hold)) { fprintf(stderr, "hold_s must be > %.1f\n", settle); return 2; }
+  if (live && (live_s <= 0 || !isfinite(live_s))) live_s = 600;
   if (out) fprintf(out, "t,target,target_yaw_deg,target_pitch_deg,gaze_x,gaze_y,gaze_z\n");
 
   const char *exts[] = {"XR_KHR_vulkan_enable2", "XR_EXT_eye_gaze_interaction", "XR_KHR_convert_timespec_time"};
@@ -79,8 +82,13 @@ int main(int argc, char **argv) {
   XrVulkanInstanceCreateInfoKHR xvi = {XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR, 0, sys, 0, vkGetInstanceProcAddr, &vici};
   VkInstance vki; VkResult vr; CK(xrCreateVulkanInstanceKHR(inst, &xvi, &vki, &vr)); VK(vr);
   XrVulkanGraphicsDeviceGetInfoKHR gdi = {XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR, 0, sys, vki}; VkPhysicalDevice pd; CK(xrGetVulkanGraphicsDevice2KHR(inst, &gdi, &pd));
-  uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, NULL); VkQueueFamilyProperties qf[16]; if (nq > 16) nq = 16;
-  vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf); uint32_t qfi = 0; while (qfi < nq && !(qf[qfi].queueFlags & VK_QUEUE_GRAPHICS_BIT)) qfi++;
+  uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, NULL);
+  VkQueueFamilyProperties *qf = calloc(nq ? nq : 1, sizeof(*qf));
+  if (!qf) { fprintf(stderr, "out of memory\n"); return 1; }
+  vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
+  uint32_t qfi = 0; while (qfi < nq && !(qf[qfi].queueFlags & VK_QUEUE_GRAPHICS_BIT)) qfi++;
+  free(qf);
+  if (qfi >= nq) { fprintf(stderr, "no Vulkan graphics queue family found\n"); return 1; }
   float prio = 1; VkDeviceQueueCreateInfo dq = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, 0, 0, qfi, 1, &prio};
   VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, 0, 0, 1, &dq};
   XrVulkanDeviceCreateInfoKHR xvd = {XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR, 0, sys, 0, vkGetInstanceProcAddr, pd, &dci};
@@ -97,15 +105,26 @@ int main(int argc, char **argv) {
   XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO, &gb, 0, sys}; XrSession ses; CK(xrCreateSession(inst, &sci, &ses));
 
   // Dot swapchain: 32x32, cleared white every frame.
-  uint32_t nf = 0; CK(xrEnumerateSwapchainFormats(ses, 0, &nf, NULL)); int64_t fmts[64]; if (nf > 64) nf = 64; CK(xrEnumerateSwapchainFormats(ses, nf, &nf, fmts));
+  uint32_t nf = 0; CK(xrEnumerateSwapchainFormats(ses, 0, &nf, NULL));
+  if (nf == 0) { fprintf(stderr, "no swapchain formats offered by runtime\n"); return 1; }
+  int64_t *fmts = calloc(nf, sizeof(*fmts));
+  if (!fmts) { fprintf(stderr, "out of memory\n"); return 1; }
+  CK(xrEnumerateSwapchainFormats(ses, nf, &nf, fmts));
   int64_t fmt = fmts[0]; for (uint32_t i = 0; i < nf; i++) if (fmts[i] == VK_FORMAT_R8G8B8A8_SRGB || fmts[i] == VK_FORMAT_B8G8R8A8_SRGB) { fmt = fmts[i]; break; }
+  free(fmts);
   XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO, 0, 0, XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT, fmt, 1, 32, 32, 1, 1, 1};
   XrSwapchain sc; CK(xrCreateSwapchain(ses, &swci, &sc));
-  uint32_t ni = 0; CK(xrEnumerateSwapchainImages(sc, 0, &ni, NULL)); XrSwapchainImageVulkan2KHR imgs[8]; if (ni > 8) ni = 8;
+  uint32_t ni = 0; CK(xrEnumerateSwapchainImages(sc, 0, &ni, NULL));
+  if (ni == 0) { fprintf(stderr, "swapchain has 0 images\n"); return 1; }
+  XrSwapchainImageVulkan2KHR *imgs = calloc(ni, sizeof(*imgs));
+  if (!imgs) { fprintf(stderr, "out of memory\n"); return 1; }
   for (uint32_t i = 0; i < ni; i++) imgs[i] = (XrSwapchainImageVulkan2KHR){XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR};
   CK(xrEnumerateSwapchainImages(sc, ni, &ni, (XrSwapchainImageBaseHeader *)imgs));
-  XrSwapchain sc2; CK(xrCreateSwapchain(ses, &swci, &sc2)); XrSwapchainImageVulkan2KHR imgs2[8]; uint32_t ni2 = 0;
-  CK(xrEnumerateSwapchainImages(sc2, 0, &ni2, NULL)); if (ni2 > 8) ni2 = 8;
+  XrSwapchain sc2; CK(xrCreateSwapchain(ses, &swci, &sc2)); uint32_t ni2 = 0;
+  CK(xrEnumerateSwapchainImages(sc2, 0, &ni2, NULL));
+  if (ni2 == 0) { fprintf(stderr, "second swapchain has 0 images\n"); return 1; }
+  XrSwapchainImageVulkan2KHR *imgs2 = calloc(ni2, sizeof(*imgs2));
+  if (!imgs2) { fprintf(stderr, "out of memory\n"); return 1; }
   for (uint32_t i = 0; i < ni2; i++) imgs2[i] = (XrSwapchainImageVulkan2KHR){XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR};
   CK(xrEnumerateSwapchainImages(sc2, ni2, &ni2, (XrSwapchainImageBaseHeader *)imgs2));
 
@@ -177,6 +196,15 @@ int main(int argc, char **argv) {
   }
 done:
   if (out) fclose(out);
+  free(imgs);
+  free(imgs2);
+  if (running) xrEndSession(ses);
+  xrDestroySwapchain(sc2);
+  xrDestroySwapchain(sc);
+  xrDestroySpace(gs);
+  xrDestroySpace(view);
+  xrDestroySession(ses);
+  xrDestroyInstance(inst);
   if (live) { printf("frames %ld, gaze valid %ld\n", frames, rows[0]); return 0; }
   printf("frames %ld; valid gaze rows per target:", frames); for (int i = 0; i < NT; i++) printf(" %ld", rows[i]); printf("\n");
   // A run cut short (session ended) must not be fitted: the targets come row by row, so a partial run lacks pitch data.

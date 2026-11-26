@@ -12,10 +12,18 @@ Open work, roughly in priority order. Status of every feature: [FEATURES.md](FEA
   still rejects about half the solves while the fusion settles, and an accepted solve does not pull the fusion's
   prediction back quickly. Candidate: gate against the last accepted solve carried
   forward by the raw gyro.
-- **Controller orientation stuck for a whole session.** One recorded session after patches 0035–0042: the left
-  controller tracked position but did not rotate at all, the right one was fine. Envision does not keep the
-  service log, so there is no data yet. Next: a session with `PIMAX_LOG=debug` (per-controller IMU sample and
-  placeholder counters, per-device prior-gate rejections) while turning that controller.
+- **Controller orientation stuck for a whole session** (not reproduced with data). Reported on the left, then
+  on the right controller. Logged sessions on 2026-11-25 (patches 0043–0044 installed): IMU ranges read correctly on
+  both, no stall or frozen-gyro warnings, and the accepted-solve log (`CONSTELLATION_POSE_LOG`) shows both
+  controllers' orientation following every twist. A grabbed WayVR window keeps facing you, which may have been
+  read as a frozen controller. 0043–0044 are not shown to fix anything; they remain as guards.
+- **Grip pose orientation.** The −48.4° X offset (patch 0027) was checked only with the WayVR beam. In VRChat
+  (xrizer) it put the hands about 90° forward. 34° about X on both poses, Pimax's own value from
+  `driver_aapvr` (quaternion 0.29237, 0, 0, 0.95630), makes the VRChat hands right. Pimax also moves the origin by
+  (0, +20.2, −30.0) mm in the controller frame. Next: separate grip and aim offsets in the driver
+  (grip 34° plus that lever, aim checked again in WayVR), each tested before release.
+- **Controllers merge when close.** Pointing the right controller at the left hand made the right one drift and
+  join the left (2026-11-25, with the prior gate in place). Pose log of that run kept for analysis.
 - **Controllers held close together.** The left and right LED rings are mirror images, so blobs can be
   given to the wrong controller. Needs arbitration by fit quality instead of "nearest device first".
 - **Fast shakes** can lose a controller (the fast path is skipped above 5 m/s or 1 rev/s).

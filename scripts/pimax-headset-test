@@ -13,9 +13,18 @@ mkdir -p "$OUT"
 RUN="$PIMAX_RUNTIME_DIR"
 say() { echo ">> $*"; spd-say -w "$*" 2>/dev/null || true; }
 
-if ! lsusb | grep -qi '34a4:'; then
+has_pimax_usb() {
+    if command -v lsusb >/dev/null 2>&1; then
+        lsusb | grep -qi '34a4:'
+    else
+        grep -qi '^34a4$' /sys/bus/usb/devices/*/idVendor 2>/dev/null
+    fi
+}
+if ! has_pimax_usb; then
     echo "No Pimax headset on USB (vendor 34a4). Plug it in and power it on first."; exit 1
 fi
+XRSIZES="$PIMAX_PREFIX/bin/xrsizes"; [ -x "$XRSIZES" ] || XRSIZES=xrsizes
+XRCTRL="$PIMAX_PREFIX/bin/xrctrl";   [ -x "$XRCTRL" ]  || XRCTRL=xrctrl
 
 # Runtime manifest pointing at the client libs in /usr (same as run-vr.sh).
 MAN="$HOME/.config/openxr/1/active_runtime.json"
@@ -61,12 +70,12 @@ for h in L R; do
 done
 
 echo; echo "== 1. view sizes"
-xrsizes | tee "$OUT/xrsizes.txt"
+"$XRSIZES" | tee "$OUT/xrsizes.txt"
 
 echo; echo "== 2. controller frame"
 say "Controller test. Look around the room for a few seconds."
 T0=$(date +%s.%N)
-XRCTRL_CSV="$OUT/controllers.csv" xrctrl 32 > "$OUT/xrctrl.log" 2>&1 &
+XRCTRL_CSV="$OUT/controllers.csv" "$XRCTRL" 32 > "$OUT/xrctrl.log" 2>&1 &
 CTRL=$!
 sleep 10
 say "Now point both controllers straight ahead, like laser pointers, thumbs up. Hold still."
@@ -78,7 +87,9 @@ wait "$CTRL"
 tail -1 "$OUT/xrctrl.log"
 
 echo
+T_FROM=$(python3 -I -c "import sys; print(float(sys.argv[1]) - float(sys.argv[2]))" "$T1" "$T0")
+T_TO=$(python3 -I -c "import sys; print(float(sys.argv[1]) - float(sys.argv[2]))" "$T2" "$T0")
 python3 -I "$PIMAX_REPO/tools/xrgaze/ctrl_frame.py" "$OUT/controllers.csv" "${UNDO[@]}" \
-    --from "$(echo "$T1 - $T0" | bc)" --to "$(echo "$T2 - $T0" | bc)" --json "$OUT/result.json" \
+    --from "$T_FROM" --to "$T_TO" --json "$OUT/result.json" \
     | tee "$OUT/result.txt"
 echo; echo "All results: $OUT"

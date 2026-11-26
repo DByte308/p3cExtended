@@ -1,0 +1,79 @@
+From cb9e843ee39b55f831c1cdf680c189b26133c5ca Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:03:29 +0100
+Subject: [PATCH] t/constellation: faster prior escape during the first 5 s of
+ startup
+
+While a device's sensor fusion is still settling right after startup, an
+unconverged prior can reject valid solves for 2-3 s before the steady-state
+5-exposure escape fires. During the first CONSTELLATION_PRIOR_GATE_STARTUP_S
+(default 5 s) since a device's first solve, trigger escape after 2 agreeing
+exposures (>=30 ms apart, up to 250 ms step) while keeping both the 3D and 2D
+re-acquisition guards active.
+---
+ .../constellation/t_constellation_tracker.cpp | 20 ++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index 20ede8702..68b9617e9 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -54,6 +54,9 @@ DEBUG_GET_ONCE_NUM_OPTION(constellation_reacquire_strict_cm, "CONSTELLATION_REAC
+ // Consecutive rejected solves that agree with each other (within the gate) after which the prior counts as lost and the
+ // device is re-acquired from them; 0 disables it.
+ DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_escape, "CONSTELLATION_PRIOR_GATE_ESCAPE", 5)
++// Seconds after a device's first optical solve during which fusion is still settling and escape triggers after
++// 2 agreeing exposures (~40 ms) instead of waiting for the steady-state streak; 0 disables.
++DEBUG_GET_ONCE_NUM_OPTION(constellation_prior_gate_startup_s, "CONSTELLATION_PRIOR_GATE_STARTUP_S", 5)
+ 
+ // Unconditionally present to allow warning that the feature is not enabled.
+ DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TRACKER_RERUN_ENABLE", false)
+@@ -1125,7 +1128,13 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 	// Set when the escape below reset the fusion; until the fusion has a prior again, re-acquisition is as strict as
+ 	// the escape itself (wide radius, no orientation exemption).
+ 	static std::atomic<bool> prior_lost[8];
++	static std::atomic<int64_t> first_seen_ns[8];
+ 	const size_t lost_slot = std::min<size_t>((size_t)device->id, 7);
++	int64_t seen0 = first_seen_ns[lost_slot].load(std::memory_order_relaxed);
++	if (seen0 == 0) {
++		first_seen_ns[lost_slot].compare_exchange_strong(seen0, sample.timestamp_ns, std::memory_order_relaxed);
++		seen0 = first_seen_ns[lost_slot].load(std::memory_order_relaxed);
++	}
+ 	if (reacquire) {
+ 		const bool untrusted = prior_lost[lost_slot].load();
+ 		return !reacquire_lands_on_other_device(tracker, sample, device_state, device, Txr_world_device, cam_model,
+@@ -1170,7 +1179,12 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 		streaks[slot].exposures = 0;
+ 		return true;
+ 	}
+-	const int64_t escape = debug_get_num_option_constellation_prior_gate_escape();
++	const int64_t startup_ns = debug_get_num_option_constellation_prior_gate_startup_s() * U_TIME_1S_IN_NS;
++	const bool in_startup = startup_ns > 0 && (sample.timestamp_ns - seen0) < startup_ns;
++	const int64_t escape_cfg = debug_get_num_option_constellation_prior_gate_escape();
++	const int64_t escape = (escape_cfg > 0 && in_startup) ? std::min<int64_t>(escape_cfg, 2) : escape_cfg;
++	const int64_t max_step_ns = in_startup ? 250 * U_TIME_1MS_IN_NS : kMaxStepNs;
++	const int64_t min_span_ns = in_startup ? 30 * U_TIME_1MS_IN_NS : kMinSpanNs;
+ 	bool escaped = false;
+ 	if (escape > 0) {
+ 		std::lock_guard<std::mutex> lock(streak_mutex);
+@@ -1180,7 +1194,7 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 			// Same exposure: neither counts nor breaks the streak.
+ 		} else {
+ 			bool consistent = false;
+-			if (st.exposures > 0 && dt > 0 && dt <= kMaxStepNs) {
++			if (st.exposures > 0 && dt > 0 && dt <= max_step_ns) {
+ 				const float d = fabsf(math_quat_dot(&Txr_world_device.orientation, &st.Txr_world_device.orientation));
+ 				const float a = 2.0f * acosf(fminf(1.0f, d)) * (float)(180.0 / M_PI);
+ 				const float c = m_vec3_len(Txr_world_device.position - st.Txr_world_device.position) * 100.0f;
+@@ -1198,7 +1212,7 @@ prior_gate_accepts(ConstellationTracker *tracker,
+ 				st.last_ns = sample.timestamp_ns;
+ 				st.Txr_world_device = Txr_world_device;
+ 			}
+-			if (st.exposures >= (uint64_t)escape && st.last_ns - st.first_ns >= kMinSpanNs) {
++			if (st.exposures >= (uint64_t)escape && st.last_ns - st.first_ns >= min_span_ns) {
+ 				st.exposures = 0;
+ 				escaped = true;
+ 			}
+-- 
+2.56.0
+
