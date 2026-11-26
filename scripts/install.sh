@@ -122,7 +122,7 @@ need() {
                      || compgen -G "$d/${name,,}/${name,,}-config.cmake" >/dev/null || continue
                  ok=1; break
              done ;;
-        so)  grep -q "[[:space:]]$name[. ]" <<<"$LDCACHE" || ok=0 ;;
+        so)  grep -q "[[:space:]]${name}[. ]" <<<"$LDCACHE" || ok=0 ;;
         libclang) # Debian/Ubuntu keep the unversioned libclang.so only under /usr/lib/llvm-N/lib
              grep -qE "[[:space:]]libclang(-[0-9.]+)?\.so" <<<"$LDCACHE" || compgen -G "/usr/lib/llvm-*/lib/libclang.so*" >/dev/null || ok=0 ;;
         clanginc) [ -n "$(pimax_clang_include)" ] || ok=0 ;;
