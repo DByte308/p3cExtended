@@ -1,0 +1,414 @@
+From 4f6072b30db0043cd7860631fb03a396c50812eb Mon Sep 17 00:00:00 2001
+From: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Date: Thu, 12 Nov 2026 15:40:40 -0800
+Subject: [PATCH 56/63] a/math: Add relation history function to get
+ exact/nearest relations
+
+Signed-off-by: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/monado/monado/-/merge_requests/3104>
+---
+ src/xrt/auxiliary/math/m_relation_history.cpp |  37 ++++
+ src/xrt/auxiliary/math/m_relation_history.h   |  43 +++++
+ src/xrt/auxiliary/math/m_relation_history.hpp |  95 ++++++++++
+ tests/tests_relation_history.cpp              | 173 ++++++++++++++++++
+ 4 files changed, 348 insertions(+)
+
+diff --git a/src/xrt/auxiliary/math/m_relation_history.cpp b/src/xrt/auxiliary/math/m_relation_history.cpp
+index 0ee3ed47e..1bc7ffd39 100644
+--- a/src/xrt/auxiliary/math/m_relation_history.cpp
++++ b/src/xrt/auxiliary/math/m_relation_history.cpp
+@@ -125,6 +125,43 @@ try {
+ }
+ G_CATCH_GUARDS_WITH_RETURN(false)
+ 
++bool
++m_relation_history_get_exact(const m_relation_history *mrh, int64_t at_timestamp_ns, xrt_space_relation *out_relation)
++try {
++	auto rh = from_mrh(mrh);
++
++	auto entry = rh->getExact(at_timestamp_ns);
++	if (!entry.has_value()) {
++		return false;
++	}
++
++	*out_relation = entry->relation;
++
++	return true;
++}
++G_CATCH_GUARDS_WITH_RETURN(false)
++
++bool
++m_relation_history_get_nearest(const m_relation_history *mrh,
++                               int64_t at_timestamp_ns,
++                               int64_t max_slop_ns,
++                               int64_t *out_time_ns,
++                               xrt_space_relation *out_relation)
++try {
++	auto rh = from_mrh(mrh);
++
++	auto entry = rh->getNearest(at_timestamp_ns, max_slop_ns);
++	if (!entry.has_value()) {
++		return false;
++	}
++
++	*out_relation = entry->relation;
++	*out_time_ns = entry->timestamp;
++
++	return true;
++}
++G_CATCH_GUARDS_WITH_RETURN(false)
++
+ uint32_t
+ m_relation_history_get_size(const m_relation_history *mrh)
+ try {
+diff --git a/src/xrt/auxiliary/math/m_relation_history.h b/src/xrt/auxiliary/math/m_relation_history.h
+index 12ac153d6..e05d0bd1e 100644
+--- a/src/xrt/auxiliary/math/m_relation_history.h
++++ b/src/xrt/auxiliary/math/m_relation_history.h
+@@ -120,6 +120,49 @@ m_relation_history_get_latest(const struct m_relation_history *rh,
+                               int64_t *out_time_ns,
+                               struct xrt_space_relation *out_relation);
+ 
++/*!
++ * Get the relation stored at exactly the given timestamp, if any.
++ *
++ * Unlike @ref m_relation_history_get, this never interpolates or extrapolates, and fails if there is no entry with
++ * precisely this timestamp.
++ *
++ * @param rh self
++ * @param at_timestamp_ns The exact timestamp to look up
++ * @param[out] out_relation Populated with the stored relation, if found
++ *
++ * @return false if there is no entry at that timestamp.
++ *
++ * @public @memberof m_relation_history
++ */
++bool
++m_relation_history_get_exact(const struct m_relation_history *rh,
++                             int64_t at_timestamp_ns,
++                             struct xrt_space_relation *out_relation);
++
++/*!
++ * Get the stored relation nearest to the given timestamp, if one is within @p max_slop_ns of it.
++ *
++ * Like @ref m_relation_history_get_exact, this never interpolates or extrapolates, but accepts entries that are up
++ * to @p max_slop_ns away (inclusive) from the requested timestamp. If two entries are equally close, the older one
++ * is returned.
++ *
++ * @param rh self
++ * @param at_timestamp_ns The timestamp to look up
++ * @param max_slop_ns Maximum allowed distance between @p at_timestamp_ns and the found entry, must be >= 0
++ * @param[out] out_time_ns Populated with the found entry's timestamp, if found
++ * @param[out] out_relation Populated with the stored relation, if found
++ *
++ * @return false if there is no entry within @p max_slop_ns of the timestamp.
++ *
++ * @public @memberof m_relation_history
++ */
++bool
++m_relation_history_get_nearest(const struct m_relation_history *rh,
++                               int64_t at_timestamp_ns,
++                               int64_t max_slop_ns,
++                               int64_t *out_time_ns,
++                               struct xrt_space_relation *out_relation);
++
+ /*!
+  * Returns the number of items in the history.
+  *
+diff --git a/src/xrt/auxiliary/math/m_relation_history.hpp b/src/xrt/auxiliary/math/m_relation_history.hpp
+index 31b023c91..4fa6fb287 100644
+--- a/src/xrt/auxiliary/math/m_relation_history.hpp
++++ b/src/xrt/auxiliary/math/m_relation_history.hpp
+@@ -288,6 +288,77 @@ public: // Methods (thread-unsafe)
+ 		return M_RELATION_HISTORY_RESULT_INTERPOLATED;
+ 	}
+ 
++	/*!
++	 * Gets an exact entry, if it exists.
++	 *
++	 * Call with @ref mutex held.
++	 */
++	std::optional<T>
++	getExactLocked(timepoint_ns timestamp_ns) const
++	{
++		if (this->impl.empty()) {
++			return std::nullopt;
++		}
++
++		const auto b = this->impl.begin();
++		const auto e = this->impl.end();
++
++		const auto it = std::lower_bound(
++		    b, e, timestamp_ns, [](const T &rhe, int64_t timestamp) { return rhe.timestamp < timestamp; });
++
++		if (it == e || it->timestamp != timestamp_ns) {
++			return std::nullopt;
++		}
++
++		return *it;
++	}
++
++	/*!
++	 * Gets the stored entry nearest to the given timestamp, if one exists within @p max_slop_ns of it.
++	 *
++	 * Never interpolates or extrapolates, the returned entry is exactly as stored (check its timestamp to see
++	 * how far off it is). If two entries are equally close, the older one is returned.
++	 *
++	 * Call with @ref mutex held.
++	 */
++	std::optional<T>
++	getNearestLocked(timepoint_ns timestamp_ns, time_duration_ns max_slop_ns) const
++	{
++		if (this->impl.empty() || max_slop_ns < 0) {
++			return std::nullopt;
++		}
++
++		const auto b = this->impl.begin();
++		const auto e = this->impl.end();
++
++		// First element not less than our timestamp, the nearest is either it or its predecessor.
++		const auto it = std::lower_bound(
++		    b, e, timestamp_ns, [](const T &rhe, int64_t timestamp) { return rhe.timestamp < timestamp; });
++
++		std::optional<T> best = std::nullopt;
++		time_duration_ns best_diff = max_slop_ns;
++
++		if (it != b) {
++			const auto &before = *(it - 1);
++			time_duration_ns diff = timestamp_ns - before.timestamp;
++			if (diff <= best_diff) {
++				best = before;
++				best_diff = diff;
++			}
++		}
++
++		if (it != e) {
++			const auto &after = *it;
++			time_duration_ns diff = after.timestamp - timestamp_ns;
++			// Strictly less, so ties go to the older entry.
++			if (diff < best_diff || (!best.has_value() && diff <= best_diff)) {
++				best = after;
++			}
++		}
++
++		return best;
++	}
++
+ public: // Methods (thread-safe)
+ 	/*!
+ 	 * @copydoc pushOrUpdateLocked
+@@ -367,6 +438,30 @@ public: // Methods (thread-safe)
+ 		std::unique_lock<os::Mutex> lock(this->mutex);
+ 		return this->getLocked(timestamp_ns, out_entry);
+ 	}
++
++	/*!
++	 * @copydoc getExactLocked
++	 *
++	 * Thread safe, holds @ref mutex.
++	 */
++	std::optional<T>
++	getExact(timepoint_ns timestamp_ns) const
++	{
++		std::unique_lock<os::Mutex> lock(this->mutex);
++		return this->getExactLocked(timestamp_ns);
++	}
++
++	/*!
++	 * @copydoc getNearestLocked
++	 *
++	 * Thread safe, holds @ref mutex.
++	 */
++	std::optional<T>
++	getNearest(timepoint_ns timestamp_ns, time_duration_ns max_slop_ns) const
++	{
++		std::unique_lock<os::Mutex> lock(this->mutex);
++		return this->getNearestLocked(timestamp_ns, max_slop_ns);
++	}
+ };
+ 
+ using RelationHistory = RelationHistoryBase<RelationHistoryEntry>;
+diff --git a/tests/tests_relation_history.cpp b/tests/tests_relation_history.cpp
+index 70b658776..3d202d3ae 100644
+--- a/tests/tests_relation_history.cpp
++++ b/tests/tests_relation_history.cpp
+@@ -362,3 +362,176 @@ TEST_CASE("m_relation_history is a bounded ring buffer")
+ 	CHECK(m_relation_history_get(h.rh, kCount * 1000, &out) == M_RELATION_HISTORY_RESULT_EXACT);
+ 	CHECK(m_relation_history_get(h.rh, 1000, &out) == M_RELATION_HISTORY_RESULT_REVERSE_PREDICTED);
+ }
++
++TEST_CASE("m_relation_history get_exact")
++{
++	History h;
++	xrt_space_relation out = XRT_SPACE_RELATION_ZERO;
++
++	// Empty history has nothing.
++	CHECK_FALSE(m_relation_history_get_exact(h.rh, U_TIME_1S_IN_NS, &out));
++
++	for (int64_t i = 1; i <= 3; i++) {
++		xrt_space_relation rel = make_relation((float)i);
++		REQUIRE(m_relation_history_push(h.rh, &rel, i * U_TIME_1S_IN_NS));
++	}
++
++	SECTION("hits return the stored relation, including the first and last")
++	{
++		for (int64_t i = 1; i <= 3; i++) {
++			out = XRT_SPACE_RELATION_ZERO;
++			REQUIRE(m_relation_history_get_exact(h.rh, i * U_TIME_1S_IN_NS, &out));
++			CHECK(out.pose.position.x == Approx((float)i));
++			CHECK(out.relation_flags == kPoseFlags);
++		}
++	}
++
++	SECTION("misses fail and leave the output untouched, never returning a neighbouring entry")
++	{
++		out = make_relation(-1.0f);
++
++		CHECK_FALSE(m_relation_history_get_exact(h.rh, 0, &out));
++		CHECK_FALSE(m_relation_history_get_exact(h.rh, 1 * U_TIME_1S_IN_NS - 1, &out));
++		CHECK_FALSE(m_relation_history_get_exact(h.rh, 1 * U_TIME_1S_IN_NS + 1, &out));
++		CHECK_FALSE(m_relation_history_get_exact(h.rh, 2 * U_TIME_1S_IN_NS + U_TIME_1S_IN_NS / 2, &out));
++		CHECK_FALSE(m_relation_history_get_exact(h.rh, 3 * U_TIME_1S_IN_NS + 1, &out));
++		CHECK_FALSE(m_relation_history_get_exact(h.rh, 10 * U_TIME_1S_IN_NS, &out));
++
++		CHECK(out.pose.position.x == Approx(-1.0f));
++	}
++
++	SECTION("sees updates to an existing entry")
++	{
++		xrt_space_relation updated = make_relation(20.0f);
++		REQUIRE(m_relation_history_push_or_update(h.rh, &updated, 2 * U_TIME_1S_IN_NS));
++
++		REQUIRE(m_relation_history_get_exact(h.rh, 2 * U_TIME_1S_IN_NS, &out));
++		CHECK(out.pose.position.x == Approx(20.0f));
++	}
++
++	SECTION("does not find entries after clear")
++	{
++		m_relation_history_clear(h.rh);
++		CHECK_FALSE(m_relation_history_get_exact(h.rh, 2 * U_TIME_1S_IN_NS, &out));
++	}
++}
++
++TEST_CASE("m_relation_history get_exact after the ring buffer wraps")
++{
++	History h;
++	xrt_space_relation out = XRT_SPACE_RELATION_ZERO;
++
++	constexpr int64_t kCount = 10000;
++	for (int64_t i = 1; i <= kCount; i++) {
++		xrt_space_relation rel = make_relation((float)i);
++		REQUIRE(m_relation_history_push(h.rh, &rel, i * 1000));
++	}
++
++	// Newest is kept, oldest was dropped.
++	REQUIRE(m_relation_history_get_exact(h.rh, kCount * 1000, &out));
++	CHECK(out.pose.position.x == Approx((float)kCount));
++
++	CHECK_FALSE(m_relation_history_get_exact(h.rh, 1000, &out));
++}
++
++TEST_CASE("m_relation_history get_nearest")
++{
++	History h;
++	xrt_space_relation out = XRT_SPACE_RELATION_ZERO;
++	int64_t out_ts = 0;
++
++	constexpr int64_t kSlop = U_TIME_1MS_IN_NS;
++
++	// Empty history has nothing.
++	CHECK_FALSE(m_relation_history_get_nearest(h.rh, U_TIME_1S_IN_NS, kSlop, &out_ts, &out));
++
++	for (int64_t i = 1; i <= 3; i++) {
++		xrt_space_relation rel = make_relation((float)i);
++		REQUIRE(m_relation_history_push(h.rh, &rel, i * U_TIME_1S_IN_NS));
++	}
++
++	SECTION("exact hits return the stored relation, even with zero slop")
++	{
++		for (int64_t i = 1; i <= 3; i++) {
++			out = XRT_SPACE_RELATION_ZERO;
++			REQUIRE(m_relation_history_get_nearest(h.rh, i * U_TIME_1S_IN_NS, 0, &out_ts, &out));
++			CHECK(out_ts == i * U_TIME_1S_IN_NS);
++			CHECK(out.pose.position.x == Approx((float)i));
++			CHECK(out.relation_flags == kPoseFlags);
++		}
++	}
++
++	SECTION("near misses within slop return the neighbouring entry unmodified")
++	{
++		// Just after an entry.
++		REQUIRE(m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS + 10, kSlop, &out_ts, &out));
++		CHECK(out_ts == 2 * U_TIME_1S_IN_NS);
++		CHECK(out.pose.position.x == Approx(2.0f));
++
++		// Just before an entry.
++		REQUIRE(m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS - 10, kSlop, &out_ts, &out));
++		CHECK(out_ts == 2 * U_TIME_1S_IN_NS);
++		CHECK(out.pose.position.x == Approx(2.0f));
++
++		// Before the front and after the back.
++		REQUIRE(m_relation_history_get_nearest(h.rh, 1 * U_TIME_1S_IN_NS - 10, kSlop, &out_ts, &out));
++		CHECK(out_ts == 1 * U_TIME_1S_IN_NS);
++		REQUIRE(m_relation_history_get_nearest(h.rh, 3 * U_TIME_1S_IN_NS + 10, kSlop, &out_ts, &out));
++		CHECK(out_ts == 3 * U_TIME_1S_IN_NS);
++	}
++
++	SECTION("slop bound is inclusive")
++	{
++		REQUIRE(m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS + kSlop, kSlop, &out_ts, &out));
++		CHECK(out_ts == 2 * U_TIME_1S_IN_NS);
++		REQUIRE(m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS - kSlop, kSlop, &out_ts, &out));
++		CHECK(out_ts == 2 * U_TIME_1S_IN_NS);
++	}
++
++	SECTION("picks the closer of the two neighbours")
++	{
++		constexpr int64_t kBigSlop = U_TIME_1S_IN_NS;
++
++		REQUIRE(m_relation_history_get_nearest(h.rh, 1 * U_TIME_1S_IN_NS + U_TIME_1S_IN_NS / 4, kBigSlop,
++		                                       &out_ts, &out));
++		CHECK(out_ts == 1 * U_TIME_1S_IN_NS);
++
++		REQUIRE(m_relation_history_get_nearest(h.rh, 1 * U_TIME_1S_IN_NS + 3 * U_TIME_1S_IN_NS / 4, kBigSlop,
++		                                       &out_ts, &out));
++		CHECK(out_ts == 2 * U_TIME_1S_IN_NS);
++
++		// Ties go to the older entry.
++		REQUIRE(m_relation_history_get_nearest(h.rh, 1 * U_TIME_1S_IN_NS + U_TIME_1S_IN_NS / 2, kBigSlop,
++		                                       &out_ts, &out));
++		CHECK(out_ts == 1 * U_TIME_1S_IN_NS);
++	}
++
++	SECTION("misses outside slop fail and leave the outputs untouched")
++	{
++		out = make_relation(-1.0f);
++		out_ts = -1;
++
++		CHECK_FALSE(m_relation_history_get_nearest(h.rh, 0, kSlop, &out_ts, &out));
++		CHECK_FALSE(
++		    m_relation_history_get_nearest(h.rh, 1 * U_TIME_1S_IN_NS - kSlop - 1, kSlop, &out_ts, &out));
++		CHECK_FALSE(
++		    m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS + kSlop + 1, kSlop, &out_ts, &out));
++		CHECK_FALSE(m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS + U_TIME_1S_IN_NS / 2, kSlop,
++		                                           &out_ts, &out));
++		CHECK_FALSE(
++		    m_relation_history_get_nearest(h.rh, 3 * U_TIME_1S_IN_NS + kSlop + 1, kSlop, &out_ts, &out));
++		CHECK_FALSE(m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS + 1, 0, &out_ts, &out));
++
++		// Negative slop never matches, even exactly.
++		CHECK_FALSE(m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS, -1, &out_ts, &out));
++
++		CHECK(out.pose.position.x == Approx(-1.0f));
++		CHECK(out_ts == -1);
++	}
++
++	SECTION("does not find entries after clear")
++	{
++		m_relation_history_clear(h.rh);
++		CHECK_FALSE(m_relation_history_get_nearest(h.rh, 2 * U_TIME_1S_IN_NS, kSlop, &out_ts, &out));
++	}
++}
+-- 
+2.56.0
+

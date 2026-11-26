@@ -1,0 +1,46 @@
+From 7b2c881813f098e8ff7f4f434bcdf1923dc29482 Mon Sep 17 00:00:00 2001
+From: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Date: Wed, 18 Nov 2026 19:00:48 -0800
+Subject: [PATCH 61/63] t/constellation: Allow prior matches with less LED
+ correspondences
+
+Signed-off-by: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/monado/monado/-/merge_requests/3117>
+---
+ .../constellation/t_constellation_tracker.cpp | 20 ++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index 9360c9cd0..c1e083606 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -942,7 +942,25 @@ Camera::processSampleFast(CameraSample &sample)
+ 			}
+ 		}
+ 
+-		// if we have a valid prior pose, try to use it for fast matching
++		/*
++		 * if we have a valid prior pose, try to use it for fast matching, allowing down to 3 LEDs, but with
++		 * tight reprojection error checking against prior
++		 */
++		if (Tcv_cam_device_predicted.has_value() &&       //
++		    this->tryDevicePose(device,                   //
++		                        sample,                   //
++		                        device_state,             //
++		                        false,                    // need_matching_ids
++		                        Tcv_cam_device_predicted, //
++		                        Tcv_cam_device_predicted.value().pose)) {
++			CT_DEBUG(tracker, "Fast processing for device %d succeeded with predicted pose", device->id);
++			continue; // try the next device, we found a pose!
++		}
++
++		/*
++		 * if we have a valid prior pose, try to use it for fast matching, requiring more LEDs, but with looser
++		 * reprojection error checking against the prior
++		 */
+ 		if (Tcv_cam_device_predicted.has_value() && //
+ 		    this->tryDevicePose(device,             //
+ 		                        sample,             //
+-- 
+2.56.0
+

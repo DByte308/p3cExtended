@@ -1,0 +1,402 @@
+From 7f3476dff576f67e41cec6e52832429e1d19312c Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:12:17 +0100
+Subject: [PATCH 3/3] optical flow: fix multi-camera essential matrices, match
+ non-cam0 stereo pairs, and prune dead patches
+
+---
+ .../frame_to_frame_optical_flow.h             |  97 +++++++++-------
+ include/basalt/optical_flow/optical_flow.h    |  21 +++-
+ .../basalt/optical_flow/patch_optical_flow.h  | 109 ++++++++++++------
+ 3 files changed, 142 insertions(+), 85 deletions(-)
+
+diff --git a/include/basalt/optical_flow/frame_to_frame_optical_flow.h b/include/basalt/optical_flow/frame_to_frame_optical_flow.h
+index 01e72d1..2cbc92b 100644
+--- a/include/basalt/optical_flow/frame_to_frame_optical_flow.h
++++ b/include/basalt/optical_flow/frame_to_frame_optical_flow.h
+@@ -77,6 +77,7 @@ class FrameToFrameOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+   using OpticalFlowTyped<Scalar, Pattern>::getNumCams;
+   using OpticalFlowTyped<Scalar, Pattern>::calib;
+   using OpticalFlowTyped<Scalar, Pattern>::E;
++  using OpticalFlowTyped<Scalar, Pattern>::E_pair;
+ 
+   using OpticalFlowBase::config;
+   using OpticalFlowBase::depth_guess;
+@@ -609,21 +610,24 @@ class FrameToFrameOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+     return new_kpts;
+   }
+ 
+-  Masks cam0OverlapCellsMasksForCam(size_t cam_id) const {
++  Masks camOverlapCellsMasksForCam(size_t cam_id, size_t ref_cam) const {
+     int x_first = x_start + c / 2;
+     int y_first = y_start + c / 2;
+ 
+     int x_last = x_stop + c / 2;
+     int y_last = y_stop + c / 2;
+ 
++    int ref_w = transforms->input_images->img_data.at(ref_cam).img->w;
++    int ref_h = transforms->input_images->img_data.at(ref_cam).img->h;
++
+     Masks masks;
+     for (int y = y_first; y <= y_last; y += c) {
+       for (int x = x_first; x <= x_last; x += c) {
+         Vector2 ci_uv{x, y};
+-        Vector2 c0_uv;
++        Vector2 cref_uv;
+         Scalar _;
+-        bool projected = calib.projectBetweenCams(ci_uv, depth_guess, c0_uv, _, cam_id, 0);
+-        bool in_bounds = c0_uv.x() >= 0 && c0_uv.x() < w && c0_uv.y() >= 0 && c0_uv.y() < h;
++        bool projected = calib.projectBetweenCams(ci_uv, depth_guess, cref_uv, _, cam_id, ref_cam);
++        bool in_bounds = cref_uv.x() >= 0 && cref_uv.x() < ref_w && cref_uv.y() >= 0 && cref_uv.y() < ref_h;
+         bool valid = projected && in_bounds;
+         if (valid) {
+           Rect cell_mask(x - c / 2, y - c / 2, c, c);
+@@ -635,69 +639,78 @@ class FrameToFrameOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+   }
+ 
+   void addPoints() {
+-    Masks& ms0 = transforms->input_images->masks.at(0);
+-    Keypoints kpts0 = addPointsForCamera(0);
++    const size_t n_cams = getNumCams();
++    std::vector<Keypoints> newly_added(n_cams);
++    newly_added[0] = addPointsForCamera(0);
+     transforms->input_images->addTime("frontend_detection_cam0_ended");
+-    if (config.optical_flow_recall_enable) kpts0.insert(recalls[0].begin(), recalls[0].end());
++    if (config.optical_flow_recall_enable) newly_added[0].insert(recalls[0].begin(), recalls[0].end());
+ 
+-    for (size_t i = 1; i < getNumCams(); i++) {
++    for (size_t i = 1; i < n_cams; i++) {
+       Masks& ms = transforms->input_images->masks.at(i);
+       Keypoints& mgs = transforms->matching_guesses.at(i);
+-
+-      // Match features on areas that overlap with cam0 using optical flow
+-      auto& pyr0 = pyramid->at(0);
+       auto& pyri = pyramid->at(i);
+-      Keypoints kpts;
+-      SE3 T_c0_ci = calib.T_i_c[0].inverse() * calib.T_i_c[i];
+-      trackPoints(pyr0, pyri, kpts0, kpts, mgs, ms0, ms, T_c0_ci, 0, i);
+-      addKeypoints(i, kpts);
+-    }
+-    transforms->input_images->addTime("frontend_matching_ended");
+ 
+-    for (size_t i = 1; i < getNumCams(); i++) {
+-      Masks& ms = transforms->input_images->masks.at(i);
++      // Match newly detected features from every earlier camera k < i (enables non-cam0 stereo pairs while still)
++      for (size_t k = 0; k < i; k++) {
++        if (newly_added[k].empty()) continue;
++        Masks& msk = transforms->input_images->masks.at(k);
++        auto& pyrk = pyramid->at(k);
++        Keypoints kpts;
++        Keypoints dummy_mgs;
++        SE3 T_ck_ci = calib.T_i_c[k].inverse() * calib.T_i_c[i];
++        trackPoints(pyrk, pyri, newly_added[k], kpts, (k == 0) ? mgs : dummy_mgs, msk, ms, T_ck_ci, k, i);
++        addKeypoints(i, kpts);
++      }
+ 
+-      // Update masks and detect features on area not overlapping with cam0
++      // Update masks and detect features on area not overlapping with any earlier camera
+       if (!config.optical_flow_detection_nonoverlap) continue;
+-      ms += cam0OverlapCellsMasksForCam(i);
+-      Keypoints kpts_no = addPointsForCamera(i);
++      for (size_t k = 0; k < i; k++) {
++        ms += camOverlapCellsMasksForCam(i, k);
++      }
++      newly_added[i] = addPointsForCamera(i);
+     }
++    transforms->input_images->addTime("frontend_matching_ended");
+     transforms->input_images->addTime("frontend_detection_cami_ended");
+   }
+ 
+   void filterPointsForCam(int cam_id) {
+     std::set<KeypointId> kp_to_remove;
+ 
+-    std::vector<KeypointId> kpids;
+-    Eigen::aligned_vector<Eigen::Vector2f> proj0, proj1;
++    for (int ref_cam = 0; ref_cam < cam_id; ref_cam++) {
++      std::vector<KeypointId> kpids;
++      Eigen::aligned_vector<Eigen::Vector2f> proj_ref, proj_cur;
+ 
+-    for (const auto& [kpid, affine] : transforms->keypoints.at(cam_id)) {
+-      auto it = transforms->keypoints.at(0).find(kpid);
++      for (const auto& [kpid, affine] : transforms->keypoints.at(cam_id)) {
++        if (kp_to_remove.count(kpid)) continue;
++        auto it = transforms->keypoints.at(ref_cam).find(kpid);
+ 
+-      if (it != transforms->keypoints.at(0).end()) {
+-        proj0.emplace_back(it->second.translation());
+-        proj1.emplace_back(affine.translation());
+-        kpids.emplace_back(kpid);
++        if (it != transforms->keypoints.at(ref_cam).end()) {
++          proj_ref.emplace_back(it->second.translation());
++          proj_cur.emplace_back(affine.translation());
++          kpids.emplace_back(kpid);
++        }
+       }
+-    }
+ 
+-    Eigen::aligned_vector<Eigen::Vector4f> p3d0, p3d1;
+-    std::vector<bool> p3d0_success, p3d1_success;
++      if (kpids.empty()) continue;
++
++      Eigen::aligned_vector<Eigen::Vector4f> p3d_ref, p3d_cur;
++      std::vector<bool> p3d_ref_success, p3d_cur_success;
+ 
+-    calib.intrinsics[0].unproject(proj0, p3d0, p3d0_success);
+-    calib.intrinsics[cam_id].unproject(proj1, p3d1, p3d1_success);
++      calib.intrinsics[ref_cam].unproject(proj_ref, p3d_ref, p3d_ref_success);
++      calib.intrinsics[cam_id].unproject(proj_cur, p3d_cur, p3d_cur_success);
+ 
+-    for (size_t i = 0; i < p3d0_success.size(); i++) {
+-      if (p3d0_success[i] && p3d1_success[i]) {
+-        const double epipolar_error = std::abs(p3d0[i].transpose() * E[cam_id] * p3d1[i]);
++      for (size_t i = 0; i < p3d_ref_success.size(); i++) {
++        if (p3d_ref_success[i] && p3d_cur_success[i]) {
++          const double epipolar_error = std::abs(p3d_ref[i].transpose() * E_pair[ref_cam][cam_id] * p3d_cur[i]);
+ 
+-        if (epipolar_error > config.optical_flow_epipolar_error) { kp_to_remove.emplace(kpids[i]); }
+-      } else {
+-        kp_to_remove.emplace(kpids[i]);
++          if (epipolar_error > config.optical_flow_epipolar_error) { kp_to_remove.emplace(kpids[i]); }
++        } else {
++          kp_to_remove.emplace(kpids[i]);
++        }
+       }
+     }
+ 
+-    for (int id : kp_to_remove) removeKeypoint(cam_id, id);
++    for (KeypointId id : kp_to_remove) removeKeypoint(cam_id, id);
+   }
+ 
+   void filterPoints() {
+diff --git a/include/basalt/optical_flow/optical_flow.h b/include/basalt/optical_flow/optical_flow.h
+index c4510cb..bfe8374 100644
+--- a/include/basalt/optical_flow/optical_flow.h
++++ b/include/basalt/optical_flow/optical_flow.h
+@@ -204,12 +204,20 @@ class OpticalFlowTyped : public OpticalFlowBase {
+       : OpticalFlowBase(conf), calib(cal.template cast<Scalar>()) {
+     patch_coord = PatchT::pattern2.template cast<float>();
+ 
+-    E.resize(getNumCams());
+-    for (size_t i = 0; i < getNumCams(); i++) {
+-      Eigen::Matrix4d Ed;
+-      SE3 T_i_j = calib.T_i_c[0].inverse() * calib.T_i_c[1];
+-      computeEssential(T_i_j.template cast<double>(), Ed);
+-      E[i] = Ed.cast<Scalar>();
++    const size_t n_cams = getNumCams();
++    E.resize(n_cams, Matrix4::Zero());
++    E_pair.assign(n_cams, std::vector<Matrix4>(n_cams, Matrix4::Zero()));
++    for (size_t i = 0; i < n_cams; i++) {
++      for (size_t j = 0; j < n_cams; j++) {
++        if (i == j) continue;
++        Eigen::Matrix4d Ed;
++        SE3 T_i_j = calib.T_i_c[i].inverse() * calib.T_i_c[j];
++        computeEssential(T_i_j.template cast<double>(), Ed);
++        E_pair[i][j] = Ed.cast<Scalar>();
++      }
++      if (i > 0) {
++        E[i] = E_pair[0][i];
++      }
+     }
+   }
+ 
+@@ -219,6 +227,7 @@ class OpticalFlowTyped : public OpticalFlowBase {
+ 
+   const Calibration<Scalar> calib;
+   std::vector<Matrix4> E;  // Essential matrix w.r.t. cam 0
++  std::vector<std::vector<Matrix4>> E_pair;  // Pairwise essential matrices E_pair[i][j] for cam i -> cam j
+ };
+ 
+ class OpticalFlowFactory {
+diff --git a/include/basalt/optical_flow/patch_optical_flow.h b/include/basalt/optical_flow/patch_optical_flow.h
+index 6e02640..3909e40 100644
+--- a/include/basalt/optical_flow/patch_optical_flow.h
++++ b/include/basalt/optical_flow/patch_optical_flow.h
+@@ -71,6 +71,7 @@ class PatchOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+   using OpticalFlowTyped<Scalar, Pattern>::getNumCams;
+   using OpticalFlowTyped<Scalar, Pattern>::calib;
+   using OpticalFlowTyped<Scalar, Pattern>::E;
++  using OpticalFlowTyped<Scalar, Pattern>::E_pair;
+ 
+   using OpticalFlowBase::config;
+   using OpticalFlowBase::depth_guess;
+@@ -207,6 +208,7 @@ class PatchOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+ 
+       addPoints();
+       filterPoints();
++      pruneDeadPatches();
+       transforms->input_images->addTime("frontend_filter_ended");
+     } else {
+       t_ns = curr_t_ns;
+@@ -248,6 +250,7 @@ class PatchOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+ 
+       addPoints();
+       filterPoints();
++      pruneDeadPatches();
+       transforms->input_images->addTime("frontend_filter_ended");
+     }
+ 
+@@ -443,11 +446,13 @@ class PatchOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+     return new_kpts;
+   }
+ 
+-  Masks cam0OverlapCellsMasksForCam(size_t cam_id) {
++  Masks camOverlapCellsMasksForCam(size_t cam_id, size_t ref_cam) {
+     int C = config.optical_flow_detection_grid_size;  // cell size
+ 
+     int w = transforms->input_images->img_data.at(cam_id).img->w;
+     int h = transforms->input_images->img_data.at(cam_id).img->h;
++    int ref_w = transforms->input_images->img_data.at(ref_cam).img->w;
++    int ref_h = transforms->input_images->img_data.at(ref_cam).img->h;
+ 
+     int x_start = (w % C) / 2;
+     int y_start = (h % C) / 2;
+@@ -465,10 +470,10 @@ class PatchOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+     for (int y = y_first; y <= y_last; y += C) {
+       for (int x = x_first; x <= x_last; x += C) {
+         Vector2 ci_uv{x, y};
+-        Vector2 c0_uv;
++        Vector2 cref_uv;
+         Scalar _;
+-        bool projected = calib.projectBetweenCams(ci_uv, depth_guess, c0_uv, _, cam_id, 0);
+-        bool in_bounds = c0_uv.x() >= 0 && c0_uv.x() < w && c0_uv.y() >= 0 && c0_uv.y() < h;
++        bool projected = calib.projectBetweenCams(ci_uv, depth_guess, cref_uv, _, cam_id, ref_cam);
++        bool in_bounds = cref_uv.x() >= 0 && cref_uv.x() < ref_w && cref_uv.y() >= 0 && cref_uv.y() < ref_h;
+         bool valid = projected && in_bounds;
+         if (valid) {
+           Rect cell_mask(x - C / 2, y - C / 2, C, C);
+@@ -480,26 +485,34 @@ class PatchOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+   }
+ 
+   void addPoints() {
+-    Masks& ms0 = transforms->input_images->masks.at(0);
+-    Keypoints kpts0 = addPointsForCamera(0);
++    const size_t n_cams = getNumCams();
++    std::vector<Keypoints> newly_added(n_cams);
++    newly_added[0] = addPointsForCamera(0);
+     transforms->input_images->addTime("frontend_detection_cam0_ended");
+ 
+-    for (size_t i = 1; i < getNumCams(); i++) {
++    for (size_t i = 1; i < n_cams; i++) {
+       Masks& ms = transforms->input_images->masks.at(i);
+       Keypoints& mgs = transforms->matching_guesses.at(i);
+-
+-      // Match features on areas that overlap with cam0 using optical flow
+-      auto& pyr0 = pyramid->at(0);
+       auto& pyri = pyramid->at(i);
+-      Keypoints kpts;
+-      SE3 T_c0_ci = calib.T_i_c[0].inverse() * calib.T_i_c[i];
+-      trackPoints(pyr0, pyri, kpts0, kpts, mgs, ms0, ms, T_c0_ci, 0, i);
+-      transforms->keypoints.at(i).insert(kpts.begin(), kpts.end());
+ 
+-      // Update masks and detect features on area not overlapping with cam0
++      // Match newly detected features from every earlier camera k < i (enables non-cam0 stereo pairs while still)
++      for (size_t k = 0; k < i; k++) {
++        if (newly_added[k].empty()) continue;
++        Masks& msk = transforms->input_images->masks.at(k);
++        auto& pyrk = pyramid->at(k);
++        Keypoints kpts;
++        Keypoints dummy_mgs;
++        SE3 T_ck_ci = calib.T_i_c[k].inverse() * calib.T_i_c[i];
++        trackPoints(pyrk, pyri, newly_added[k], kpts, (k == 0) ? mgs : dummy_mgs, msk, ms, T_ck_ci, k, i);
++        transforms->keypoints.at(i).insert(kpts.begin(), kpts.end());
++      }
++
++      // Update masks and detect features on area not overlapping with any earlier camera
+       if (!config.optical_flow_detection_nonoverlap) continue;
+-      ms += cam0OverlapCellsMasksForCam(i);
+-      Keypoints kpts_no = addPointsForCamera(i);
++      for (size_t k = 0; k < i; k++) {
++        ms += camOverlapCellsMasksForCam(i, k);
++      }
++      newly_added[i] = addPointsForCamera(i);
+     }
+     transforms->input_images->addTime("frontend_matching_ended");
+     transforms->input_images->addTime("frontend_detection_cami_ended");
+@@ -508,42 +521,64 @@ class PatchOpticalFlow final : public OpticalFlowTyped<Scalar, Pattern> {
+   void filterPointsForCam(int cam_id) {
+     std::set<KeypointId> kp_to_remove;
+ 
+-    std::vector<KeypointId> kpids;
+-    Eigen::aligned_vector<Eigen::Vector2f> proj0, proj1;
++    for (int ref_cam = 0; ref_cam < cam_id; ref_cam++) {
++      std::vector<KeypointId> kpids;
++      Eigen::aligned_vector<Eigen::Vector2f> proj_ref, proj_cur;
+ 
+-    for (const auto& [kpid, affine] : transforms->keypoints.at(cam_id)) {
+-      auto it = transforms->keypoints.at(0).find(kpid);
++      for (const auto& [kpid, affine] : transforms->keypoints.at(cam_id)) {
++        if (kp_to_remove.count(kpid)) continue;
++        auto it = transforms->keypoints.at(ref_cam).find(kpid);
+ 
+-      if (it != transforms->keypoints.at(0).end()) {
+-        proj0.emplace_back(it->second.translation());
+-        proj1.emplace_back(affine.translation());
+-        kpids.emplace_back(kpid);
++        if (it != transforms->keypoints.at(ref_cam).end()) {
++          proj_ref.emplace_back(it->second.translation());
++          proj_cur.emplace_back(affine.translation());
++          kpids.emplace_back(kpid);
++        }
+       }
+-    }
+ 
+-    Eigen::aligned_vector<Eigen::Vector4f> p3d0, p3d1;
+-    std::vector<bool> p3d0_success, p3d1_success;
++      if (kpids.empty()) continue;
+ 
+-    calib.intrinsics[0].unproject(proj0, p3d0, p3d0_success);
+-    calib.intrinsics[cam_id].unproject(proj1, p3d1, p3d1_success);
++      Eigen::aligned_vector<Eigen::Vector4f> p3d_ref, p3d_cur;
++      std::vector<bool> p3d_ref_success, p3d_cur_success;
+ 
+-    for (size_t i = 0; i < p3d0_success.size(); i++) {
+-      if (p3d0_success[i] && p3d1_success[i]) {
+-        const double epipolar_error = std::abs(p3d0[i].transpose() * E[cam_id] * p3d1[i]);
++      calib.intrinsics[ref_cam].unproject(proj_ref, p3d_ref, p3d_ref_success);
++      calib.intrinsics[cam_id].unproject(proj_cur, p3d_cur, p3d_cur_success);
+ 
+-        if (epipolar_error > config.optical_flow_epipolar_error) { kp_to_remove.emplace(kpids[i]); }
+-      } else {
+-        kp_to_remove.emplace(kpids[i]);
++      for (size_t i = 0; i < p3d_ref_success.size(); i++) {
++        if (p3d_ref_success[i] && p3d_cur_success[i]) {
++          const double epipolar_error = std::abs(p3d_ref[i].transpose() * E_pair[ref_cam][cam_id] * p3d_cur[i]);
++
++          if (epipolar_error > config.optical_flow_epipolar_error) { kp_to_remove.emplace(kpids[i]); }
++        } else {
++          kp_to_remove.emplace(kpids[i]);
++        }
+       }
+     }
+ 
+-    for (int id : kp_to_remove) { transforms->keypoints.at(cam_id).erase(id); }
++    for (KeypointId id : kp_to_remove) { transforms->keypoints.at(cam_id).erase(id); }
+   }
+ 
+   void filterPoints() {
+     for (size_t i = 1; i < getNumCams(); i++) { filterPointsForCam(i); }
+   }
+ 
++  void pruneDeadPatches() {
++    for (auto it = patches.begin(); it != patches.end();) {
++      bool alive = false;
++      for (const auto& cam_kps : transforms->keypoints) {
++        if (cam_kps.count(it->first) > 0) {
++          alive = true;
++          break;
++        }
++      }
++      if (!alive) {
++        it = patches.erase(it);
++      } else {
++        ++it;
++      }
++    }
++  }
++
+   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  private:
+   Eigen::aligned_unordered_map<KeypointId, Eigen::aligned_vector<PatchT>> patches;
+-- 
+2.56.0
+

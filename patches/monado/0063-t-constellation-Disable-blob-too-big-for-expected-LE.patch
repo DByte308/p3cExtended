@@ -1,0 +1,45 @@
+From 3a40fcfab99e13d5d774629d2972f78ecb379292 Mon Sep 17 00:00:00 2001
+From: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Date: Thu, 9 Jul 2026 19:11:13 -0700
+Subject: [PATCH 63/63] t/constellation: Disable "blob too big for expected LED
+ pixel size" check
+
+This check fails at high distance due to lens blur, there's possibly
+something smart that can be done like some non-linear curve or clamp,
+but I don't see any issues that come with *disabling* this check, so at
+least for now let's just disable it since it's a huge problem on
+Realsense IR cameras where it has a lower focal length and so the issue
+comes up much sooner with distance.
+
+Signed-off-by: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/monado/monado/-/merge_requests/3122>
+---
+ src/xrt/tracking/constellation/pose_metrics.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/pose_metrics.c b/src/xrt/tracking/constellation/pose_metrics.c
+index 2d427fd09..0b1fc426c 100644
+--- a/src/xrt/tracking/constellation/pose_metrics.c
++++ b/src/xrt/tracking/constellation/pose_metrics.c
+@@ -61,12 +61,16 @@ find_best_matching_led(struct pose_metrics_visible_led_info *led_points,
+ 		double sqerror = dx * dx + dy * dy;
+ 
+ 		// If the blob is much larger than the LED in either dimension, don't match.
+-		// @note: We're technically comparing distorted size to undistorted size, but that's a fine enough
+-		// approximation.
++		//! @note We're technically comparing distorted size to undistorted size, but that's a fine enough
++		//        approximation.
++		//! @todo This check causes issues on realsense due to lens blur at high distance,
++		//        so let's disable it for now until we have a better metric for "blob too big".
++#if 0
+ 		if (blob->size.x > led_info->led_radius_px_undistorted * 4 ||
+ 		    blob->size.y > led_info->led_radius_px_undistorted * 4) {
+ 			continue;
+ 		}
++#endif
+ 
+ 		// Check if the LED falls within the bounding box is closer to the camera (smaller Z),
+ 		// or is at least ed_radius closer to the blob center
+-- 
+2.56.0
+

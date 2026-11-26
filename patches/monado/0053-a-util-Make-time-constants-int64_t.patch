@@ -1,0 +1,61 @@
+From 01aba1265e412f5880be7a8ce3bc158b7f486b2a Mon Sep 17 00:00:00 2001
+From: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Date: Wed, 11 Nov 2026 17:19:45 -0800
+Subject: [PATCH 53/63] a/util: Make time constants int64_t
+
+This prevents roundover bugs when trying to specify >2.4s periods. This is something we warn by default in Monado but it's likely behaviour we want to specify by default given U_TIME_1MS_IN_NS is intended to be for `timepoint_ns`.
+
+Signed-off-by: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/monado/monado/-/merge_requests/3099>
+---
+ src/xrt/auxiliary/util/u_time.h                             | 6 +++---
+ src/xrt/tracking/constellation/led_sync/pssense_gray_code.h | 3 +--
+ 2 files changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/auxiliary/util/u_time.h b/src/xrt/auxiliary/util/u_time.h
+index 5d03d546d..6524fc1d5 100644
+--- a/src/xrt/auxiliary/util/u_time.h
++++ b/src/xrt/auxiliary/util/u_time.h
+@@ -36,7 +36,7 @@ extern "C" {
+ #endif
+ 
+ //! Helper define to make code more readable.
+-#define U_1_000_000_000 (1000 * 1000 * 1000)
++#define U_1_000_000_000 (1000LL * 1000 * 1000)
+ 
+ /*!
+  * The number of nanoseconds in a second.
+@@ -51,14 +51,14 @@ extern "C" {
+  *
+  * @see timepoint_ns
+  */
+-#define U_TIME_1MS_IN_NS (1000 * 1000)
++#define U_TIME_1MS_IN_NS (1000LL * 1000)
+ 
+ /*!
+  * The number of nanoseconds in a microsecond.
+  *
+  * @see timepoint_ns
+  */
+-#define U_TIME_1US_IN_NS 1000
++#define U_TIME_1US_IN_NS 1000LL
+ 
+ /*!
+  * The number of nanoseconds in half a millisecond.
+diff --git a/src/xrt/tracking/constellation/led_sync/pssense_gray_code.h b/src/xrt/tracking/constellation/led_sync/pssense_gray_code.h
+index 8555ecd9f..e51172110 100644
+--- a/src/xrt/tracking/constellation/led_sync/pssense_gray_code.h
++++ b/src/xrt/tracking/constellation/led_sync/pssense_gray_code.h
+@@ -788,8 +788,7 @@ handle_optimize_brightness_curve(struct t_led_sync_refinement *refinement)
+ 	timepoint_ns now_ns = os_monotonic_get_ns();
+ 	time_duration_ns since_measurement_ns = now_ns - refinement->delta_sync.last_measurement_ns;
+ 	if (since_measurement_ns > BG_NO_MEASUREMENT_TIMEOUT_NS) {
+-		LOG_DEBUG(refinement, "No BG measurement for %" PRId64 "ms, resyncing",
+-		          since_measurement_ns / U_TIME_1MS_IN_NS);
++		LOG_DEBUG(refinement, "No BG measurement for %fms, resyncing", time_ns_to_ms_f(since_measurement_ns));
+ 		set_phase_locked(refinement, T_LED_SYNC_PHASE_FIND_INITIAL_OFFSET);
+ 		return;
+ 	}
+-- 
+2.56.0
+

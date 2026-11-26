@@ -1,0 +1,428 @@
+From 230cd52c56ae5e93b67d1432c6b908673ab78ff4 Mon Sep 17 00:00:00 2001
+From: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Date: Wed, 18 Nov 2026 19:45:15 -0800
+Subject: [PATCH 62/63] t/constellation: Allow closer devices to consume blobs
+ of farther devices
+
+Signed-off-by: Beyley Cardellio <ep1cm1n10n123@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/monado/monado/-/merge_requests/3117>
+---
+ .../constellation_debug_scribble.cpp          |  11 +-
+ .../constellation/correspondence_search.c     |  29 ++++-
+ .../constellation/correspondence_search.h     |   1 +
+ src/xrt/tracking/constellation/pose_metrics.c |  64 +++++++++--
+ src/xrt/tracking/constellation/pose_metrics.h |   3 +
+ .../constellation/t_constellation_tracker.cpp | 100 +++++++++++++-----
+ .../t_constellation_tracker_internal.hpp      |   1 +
+ 7 files changed, 168 insertions(+), 41 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/constellation_debug_scribble.cpp b/src/xrt/tracking/constellation/constellation_debug_scribble.cpp
+index dbc942b32..15a4d58c5 100644
+--- a/src/xrt/tracking/constellation/constellation_debug_scribble.cpp
++++ b/src/xrt/tracking/constellation/constellation_debug_scribble.cpp
+@@ -48,8 +48,15 @@ scribble_led_model(xrt_frame *frame,
+ 	};
+ 
+ 	pose_metrics_blob_match_info visible_info = {};
+-	pose_metrics_match_pose_to_blobs(&Tcv_cam_model, sample.blobs, sample.blob_count, led_model, device_id,
+-	                                 &camera.model, &visible_info);
++	pose_metrics_match_pose_to_blobs( //
++	    &Tcv_cam_model,               //
++	    sample.blobs,                 //
++	    sample.blob_count,            //
++	    led_model,                    //
++	    device_id,                    //
++	    nullptr,                      //
++	    &camera.model,                //
++	    &visible_info);               //
+ 
+ 	xrt_vec2 projected_model_origin_point;
+ 	if (t_camera_models_project(&camera.model.calib_true, Tcv_cam_model.position.x, Tcv_cam_model.position.y,
+diff --git a/src/xrt/tracking/constellation/correspondence_search.c b/src/xrt/tracking/constellation/correspondence_search.c
+index 6c35a75e1..7f082c227 100644
+--- a/src/xrt/tracking/constellation/correspondence_search.c
++++ b/src/xrt/tracking/constellation/correspondence_search.c
+@@ -211,12 +211,31 @@ correspondence_search_project_pose(struct correspondence_search *cs,
+ 	// Check how many LEDs have matching blobs in this pose, if there's enough we have a good match
+ 	// @todo: It would be better to be able to pass a list of undistorted blob points
+ 	if (mi->search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
+-		success = pose_metrics_evaluate_pose_with_prior(
+-		    &score, pose, false, &mi->pose_prior, mi->pos_error_thresh, mi->rot_error_thresh, cs->blobs,
+-		    cs->num_points, leds, model->device_id, cs->calib, NULL);
++		success = pose_metrics_evaluate_pose_with_prior( //
++		    &score,                                      //
++		    pose,                                        //
++		    false,                                       //
++		    &mi->pose_prior,                             //
++		    mi->pos_error_thresh,                        //
++		    mi->rot_error_thresh,                        //
++		    cs->blobs,                                   //
++		    cs->num_points,                              //
++		    leds,                                        //
++		    model->device_id,                            //
++		    cs->device_ids_by_distance,                  //
++		    cs->calib,                                   //
++		    NULL);                                       //
+ 	} else {
+-		success = pose_metrics_evaluate_pose(&score, pose, cs->blobs, cs->num_points, leds, model->device_id,
+-		                                     cs->calib, NULL);
++		success = pose_metrics_evaluate_pose( //
++		    &score,                           //
++		    pose,                             //
++		    cs->blobs,                        //
++		    cs->num_points,                   //
++		    leds,                             //
++		    model->device_id,                 //
++		    cs->device_ids_by_distance,       //
++		    cs->calib,                        //
++		    NULL);                            //
+ 	}
+ 
+ 	// Evaluating pose failed
+diff --git a/src/xrt/tracking/constellation/correspondence_search.h b/src/xrt/tracking/constellation/correspondence_search.h
+index e60388c41..2832f513d 100644
+--- a/src/xrt/tracking/constellation/correspondence_search.h
++++ b/src/xrt/tracking/constellation/correspondence_search.h
+@@ -98,6 +98,7 @@ struct correspondence_search
+ 	int num_points;
+ 	struct cs_image_point *points;
+ 	struct t_blob *blobs; /* Original blobs structs [num_points] */
++	t_constellation_device_id_t device_ids_by_distance[XRT_CONSTELLATION_MAX_DEVICES];
+ 
+ 	unsigned int num_trials;
+ 	unsigned int num_pose_checks;
+diff --git a/src/xrt/tracking/constellation/pose_metrics.c b/src/xrt/tracking/constellation/pose_metrics.c
+index 65ead0f50..2d427fd09 100644
+--- a/src/xrt/tracking/constellation/pose_metrics.c
++++ b/src/xrt/tracking/constellation/pose_metrics.c
+@@ -289,6 +289,23 @@ get_visible_leds_bounds(struct pose_metrics_visible_led_info *visible_led_points
+ 	return true;
+ }
+ 
++static uint32_t
++get_distance_priority(t_constellation_device_id_t device_id,
++                      t_constellation_device_id_t device_ids_by_distance[XRT_CONSTELLATION_MAX_DEVICES])
++{
++	if (device_ids_by_distance == NULL) {
++		return UINT32_MAX;
++	}
++
++	for (uint32_t i = 0; i < XRT_CONSTELLATION_MAX_DEVICES; i++) {
++		if (device_id == device_ids_by_distance[i]) {
++			return i;
++		}
++	}
++
++	return UINT32_MAX;
++}
++
+ /*
+  * Exported functions.
+  */
+@@ -299,6 +316,7 @@ pose_metrics_match_pose_to_blobs(const struct xrt_pose *pose,
+                                  int num_blobs,
+                                  struct t_constellation_tracker_led_model *led_model,
+                                  t_constellation_device_id_t device_id,
++                                 t_constellation_device_id_t device_ids_by_distance[XRT_CONSTELLATION_MAX_DEVICES],
+                                  struct camera_model *calib,
+                                  struct pose_metrics_blob_match_info *match_info)
+ {
+@@ -318,6 +336,8 @@ pose_metrics_match_pose_to_blobs(const struct xrt_pose *pose,
+ 		return false;
+ 	}
+ 
++	uint32_t distance_priority = get_distance_priority(device_id, device_ids_by_distance);
++
+ 	const struct pose_rect *bounds = &match_info->bounds;
+ 	LOG_SPEW("Bounding box for pose is %f,%f -> %f,%f", bounds->left, bounds->top, bounds->right, bounds->bottom);
+ 
+@@ -328,17 +348,23 @@ pose_metrics_match_pose_to_blobs(const struct xrt_pose *pose,
+ 		struct t_blob *b = &blobs[i];
+ 		t_constellation_device_id_t led_object_id = b->matched_device_id;
+ 
+-		// Skip blobs which already have an ID not belonging to this device
+-		if (led_object_id != XRT_CONSTELLATION_INVALID_DEVICE_ID && led_object_id != device_id) {
+-			continue;
+-		}
+-
+ 		// Ignore blobs that are outside the pose bounding box
+ 		if (b->center_undistorted.x < bounds->left || b->center_undistorted.y < bounds->top ||
+ 		    b->center_undistorted.x > bounds->right || b->center_undistorted.y > bounds->bottom) {
+ 			continue;
+ 		}
+ 
++		// Skip blobs which already have an ID not belonging to this device
++		if (led_object_id != XRT_CONSTELLATION_INVALID_DEVICE_ID && led_object_id != device_id) {
++			uint32_t led_object_distance_priority =
++			    get_distance_priority(led_object_id, device_ids_by_distance);
++
++			// If the LED's current object is closer than this new object, skip this LED
++			if (led_object_distance_priority <= distance_priority) {
++				continue;
++			}
++		}
++
+ 		double sqerror = 0.f;
+ 		int match_led_index = find_best_matching_led(match_info->visible_leds,     //
+ 		                                             match_info->num_visible_leds, //
+@@ -386,11 +412,24 @@ pose_metrics_evaluate_pose(struct pose_metrics *score,
+                            int num_blobs,
+                            struct t_constellation_tracker_led_model *led_model,
+                            t_constellation_device_id_t device_id,
++                           t_constellation_device_id_t device_ids_by_distance[XRT_CONSTELLATION_MAX_DEVICES],
+                            struct camera_model *calib,
+                            struct pose_rect *out_bounds)
+ {
+-	return pose_metrics_evaluate_pose_with_prior(score, pose, false, NULL, NULL, NULL, blobs, num_blobs, led_model,
+-	                                             device_id, calib, out_bounds);
++	return pose_metrics_evaluate_pose_with_prior( //
++	    score,                                    //
++	    pose,                                     //
++	    false,                                    //
++	    NULL,                                     //
++	    NULL,                                     //
++	    NULL,                                     //
++	    blobs,                                    //
++	    num_blobs,                                //
++	    led_model,                                //
++	    device_id,                                //
++	    device_ids_by_distance,                   //
++	    calib,                                    //
++	    out_bounds);                              //
+ }
+ 
+ bool
+@@ -404,6 +443,7 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
+                                       int num_blobs,
+                                       struct t_constellation_tracker_led_model *led_model,
+                                       t_constellation_device_id_t device_id,
++                                      t_constellation_device_id_t device_ids_by_distance[XRT_CONSTELLATION_MAX_DEVICES],
+                                       struct camera_model *calib,
+                                       struct pose_rect *out_bounds)
+ {
+@@ -415,7 +455,15 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
+ 	 */
+ 	struct pose_metrics_blob_match_info blob_match_info = {0};
+ 
+-	if (!pose_metrics_match_pose_to_blobs(pose, blobs, num_blobs, led_model, device_id, calib, &blob_match_info)) {
++	if (!pose_metrics_match_pose_to_blobs( //
++	        pose,                          //
++	        blobs,                         //
++	        num_blobs,                     //
++	        led_model,                     //
++	        device_id,                     //
++	        device_ids_by_distance,        //
++	        calib,                         //
++	        &blob_match_info)) {
+ 		return false;
+ 	}
+ 
+diff --git a/src/xrt/tracking/constellation/pose_metrics.h b/src/xrt/tracking/constellation/pose_metrics.h
+index 985921e94..a78569e34 100644
+--- a/src/xrt/tracking/constellation/pose_metrics.h
++++ b/src/xrt/tracking/constellation/pose_metrics.h
+@@ -122,6 +122,7 @@ pose_metrics_match_pose_to_blobs(const struct xrt_pose *pose,
+                                  int num_blobs,
+                                  struct t_constellation_tracker_led_model *led_model,
+                                  t_constellation_device_id_t device_id,
++                                 t_constellation_device_id_t device_ids_by_distance[XRT_CONSTELLATION_MAX_DEVICES],
+                                  struct camera_model *calib,
+                                  struct pose_metrics_blob_match_info *match_info);
+ 
+@@ -132,6 +133,7 @@ pose_metrics_evaluate_pose(struct pose_metrics *score,
+                            int num_blobs,
+                            struct t_constellation_tracker_led_model *leds_model,
+                            t_constellation_device_id_t device_id,
++                           t_constellation_device_id_t device_ids_by_distance[XRT_CONSTELLATION_MAX_DEVICES],
+                            struct camera_model *calib,
+                            struct pose_rect *out_bounds);
+ 
+@@ -147,6 +149,7 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
+                                       int num_blobs,
+                                       struct t_constellation_tracker_led_model *led_model,
+                                       t_constellation_device_id_t device_id,
++                                      t_constellation_device_id_t device_ids_by_distance[XRT_CONSTELLATION_MAX_DEVICES],
+                                       struct camera_model *calib,
+                                       struct pose_rect *out_bounds);
+ 
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker.cpp b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+index c1e083606..d38532aa1 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker.cpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker.cpp
+@@ -450,18 +450,20 @@ Camera::tryDevicePose(Device *device,
+ 		    sample.blob_count,                           //
+ 		    &device->params.led_model,                   //
+ 		    device->id,                                  //
++		    sample.device_ids_by_distance.data(),        //
+ 		    &this->model,                                //
+ 		    NULL);                                       //
+ 	} else {
+-		success = pose_metrics_evaluate_pose( //
+-		    &score,                           //
+-		    &Tcv_cam_device_candidate,        //
+-		    sample.blobs,                     //
+-		    sample.blob_count,                //
+-		    &device->params.led_model,        //
+-		    device->id,                       //
+-		    &this->model,                     //
+-		    NULL);                            //
++		success = pose_metrics_evaluate_pose(     //
++		    &score,                               //
++		    &Tcv_cam_device_candidate,            //
++		    sample.blobs,                         //
++		    sample.blob_count,                    //
++		    &device->params.led_model,            //
++		    device->id,                           //
++		    sample.device_ids_by_distance.data(), //
++		    &this->model,                         //
++		    NULL);                                //
+ 	}
+ 
+ 	// The actual call itself failed.
+@@ -559,11 +561,20 @@ Camera::tryDeviceBlobRecovery(Device *device,
+ 		    sample.blob_count,                           //
+ 		    &device->params.led_model,                   //
+ 		    device->id,                                  //
++		    sample.device_ids_by_distance.data(),        //
+ 		    &this->model,                                //
+ 		    NULL);
+ 	} else {
+-		success = pose_metrics_evaluate_pose(&score, &Tcv_cam_device, sample.blobs, sample.blob_count,
+-		                                     &device->params.led_model, device->id, &this->model, NULL);
++		success = pose_metrics_evaluate_pose(     //
++		    &score,                               //
++		    &Tcv_cam_device,                      //
++		    sample.blobs,                         //
++		    sample.blob_count,                    //
++		    &device->params.led_model,            //
++		    device->id,                           //
++		    sample.device_ids_by_distance.data(), //
++		    &this->model,                         //
++		    NULL);                                //
+ 	}
+ 
+ 	// If the evaluate failed entirely, this isn't a success.
+@@ -681,6 +692,11 @@ Camera::processSampleSlow(CameraSample &sample)
+ 	CT_TRACE(tracker, "Starting slow processing for camera %p with %u blobs", (void *)this, sample.blob_count);
+ 
+ 	correspondence_search_set_blobs(data.cs, sample.blobs, sample.blob_count);
++	// Copy in the device IDs by distance
++	std::memcpy(                                  //
++	    data.cs->device_ids_by_distance,          //
++	    sample.device_ids_by_distance.data(),     //
++	    sizeof(data.cs->device_ids_by_distance)); //
+ 
+ 	std::shared_ptr<CameraMosaic> mosaic = this->mosaic.lock();
+ 	U_ASSERT_WEAK_PTR_RET(mosaic,
+@@ -917,6 +933,24 @@ Camera::processSampleFast(CameraSample &sample)
+ 	std::array<Device *, XRT_CONSTELLATION_MAX_DEVICES> devices{};
+ 	const uint32_t device_count = collect_devices_nearest_first(tracker, sample, devices);
+ 
++	{
++		uint32_t written_device_ids = 0;
++		for (uint32_t i = 0; i < device_count; i++) {
++			const auto device = devices[i];
++			const auto device_state = sample.getDeviceState(device->id).value();
++
++			// Only write the ID if the device has a pose in camera space.
++			if (device_state->Tcv_cam_device_predicted.has_value() &&
++			    device_state->Tcv_cam_device_predicted->relation_flags &
++			        XRT_SPACE_RELATION_POSITION_VALID_BIT) {
++				sample.device_ids_by_distance[written_device_ids++] = device->id;
++			}
++		}
++		for (uint32_t i = written_device_ids; i < XRT_CONSTELLATION_MAX_DEVICES; i++) {
++			sample.device_ids_by_distance[i] = XRT_CONSTELLATION_INVALID_DEVICE_ID;
++		}
++	}
++
+ 	bool need_slow_search = false;
+ 	for (uint32_t device_iter = 0; device_iter < device_count; device_iter++) {
+ 		Device *device = devices[device_iter];
+@@ -1145,7 +1179,7 @@ reacquire_lands_on_other_device(ConstellationTracker *tracker,
+ 			math_pose_convert_from_opencv(&Txr_cam_other, &Tcv_cam_other);
+ 			pose_metrics_blob_match_info other_match;
+ 			if (pose_metrics_match_pose_to_blobs(&Tcv_cam_other, claimed, (int)n_claimed, &other->params.led_model,
+-			                                     other->id, cam_model, &other_match)) {
++			                                     other->id, NULL, cam_model, &other_match)) {
+ 				constexpr float kMarginPx = 15.0f;
+ 				uint32_t in_bounds = 0;
+ 				for (uint32_t i = 0; i < n_claimed; i++) {
+@@ -1340,8 +1374,15 @@ Camera::pushPose(CameraSample &camera_sample,
+ 
+ 	// Match visible blobs to the pose we found
+ 	pose_metrics_blob_match_info blob_match_info;
+-	pose_metrics_match_pose_to_blobs(&Tcv_cam_device_initial, camera_sample.blobs, camera_sample.blob_count,
+-	                                 &device->params.led_model, device->id, &this->model, &blob_match_info);
++	pose_metrics_match_pose_to_blobs(                //
++	    &Tcv_cam_device_initial,                     //
++	    camera_sample.blobs,                         //
++	    camera_sample.blob_count,                    //
++	    &device->params.led_model,                   //
++	    device->id,                                  //
++	    camera_sample.device_ids_by_distance.data(), //
++	    &this->model,                                //
++	    &blob_match_info);                           //
+ 
+ 	// Mark all the new blobs using the match info
+ 	camera_sample.markMatchingBlobs(tracker, device->params.led_model, device->id, blob_match_info);
+@@ -1381,9 +1422,15 @@ Camera::pushPose(CameraSample &camera_sample,
+ 			         Tcv_cam_device.position.z);
+ 
+ 			// Now that we've optimized the pose, we gotta update the match info
+-			pose_metrics_match_pose_to_blobs(&Tcv_cam_device, camera_sample.blobs, camera_sample.blob_count,
+-			                                 &device->params.led_model, device->id, &this->model,
+-			                                 &blob_match_info);
++			pose_metrics_match_pose_to_blobs(                //
++			    &Tcv_cam_device,                             //
++			    camera_sample.blobs,                         //
++			    camera_sample.blob_count,                    //
++			    &device->params.led_model,                   //
++			    device->id,                                  //
++			    camera_sample.device_ids_by_distance.data(), //
++			    &this->model,                                //
++			    &blob_match_info);                           //
+ 
+ 			// Unmark any other blobs
+ 			camera_sample.markMatchingBlobs(tracker, device->params.led_model, device->id, blob_match_info);
+@@ -1396,15 +1443,16 @@ Camera::pushPose(CameraSample &camera_sample,
+ 		}
+ 
+ 		// We need to re-evaluate the pose after optimization, since the reprojection error may have changed.
+-		pose_metrics_evaluate_pose(    //
+-		    &score,                    //
+-		    &Tcv_cam_device,           //
+-		    camera_sample.blobs,       //
+-		    camera_sample.blob_count,  //
+-		    &device->params.led_model, //
+-		    device->id,                //
+-		    &this->model,              //
+-		    NULL);                     //
++		pose_metrics_evaluate_pose(                      //
++		    &score,                                      //
++		    &Tcv_cam_device,                             //
++		    camera_sample.blobs,                         //
++		    camera_sample.blob_count,                    //
++		    &device->params.led_model,                   //
++		    device->id,                                  //
++		    camera_sample.device_ids_by_distance.data(), //
++		    &this->model,                                //
++		    NULL);                                       //
+ 	}
+ 
+ 	if (!prior_gate_accepts(tracker, camera_sample, device_state, device, Tcv_cam_device, &this->model)) {
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracker_internal.hpp b/src/xrt/tracking/constellation/t_constellation_tracker_internal.hpp
+index c4e132b94..4bde9207b 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracker_internal.hpp
++++ b/src/xrt/tracking/constellation/t_constellation_tracker_internal.hpp
+@@ -139,6 +139,7 @@ public: // Fields
+ 	//! The covariance of @ref Txr_world_cam, if the tracking origin reports one, otherwise the pose is exact.
+ 	std::optional<xrt_pose_covariance> Txr_world_cam_covariance{std::nullopt};
+ 
++	std::array<t_constellation_device_id_t, XRT_CONSTELLATION_MAX_DEVICES> device_ids_by_distance{};
+ 	std::array<DeviceState, XRT_CONSTELLATION_MAX_DEVICES> device_states{};
+ 	uint32_t device_count{};
+ 
+-- 
+2.56.0
+

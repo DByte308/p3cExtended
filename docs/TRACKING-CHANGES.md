@@ -15,6 +15,8 @@ This page documents the specific changes in this repository that **actually impr
 | Clean patch | Component | What it fixes |
 |---|---|---|
 | [`basalt/0001`](../patches/upstream-tracking/basalt/0001-optical-flow-take-a-new-keypoint-s-patch-from-its-ow.patch) | Basalt optical flow | Side cameras sampled tracking patches from `cam0` instead of their own image (3-line fix) |
+| [`basalt/0002`](../patches/upstream-tracking/basalt/0002-vio-raise-near-depth-triangulation-cap-from-0.33-m-t.patch) | Basalt VIO/VO | Raises near-depth triangulation cap from 0.33 m (`inv_dist < 3.0`) to 0.125 m (`< 8.0`) |
+| [`basalt/0003`](../patches/upstream-tracking/basalt/0003-optical-flow-fix-multi-camera-essential-matrices-mat.patch) | Basalt optical flow | Fixes hardcoded `cam1` essential matrix bug for cams 2+, matches non-`cam0` stereo pairs while still, prunes dead patches |
 | [`monado-constellation/0001`](../patches/upstream-tracking/monado-constellation/0001-t-constellation-hold-position-after-0.5-s-without-an.patch) | Monado `t_constellation` | Caps IMU position dead-reckoning at 0.5 s so occluded controllers stop flying away |
 | [`monado-constellation/0002`](../patches/upstream-tracking/monado-constellation/0002-t-constellation-reject-optical-solves-far-from-the-d.patch) | Monado `t_constellation` | Gates optical solves against the fused prior to stop cross-controller jumps |
 | [`monado-constellation/0003`](../patches/upstream-tracking/monado-constellation/0003-t-constellation-keep-a-device-s-known-model-to-IMU-r.patch) | Monado `t_constellation` | Adds `imu_extrinsics_known` to keep known model→IMU rotation constant in Ceres fusion |
@@ -103,7 +105,7 @@ This page documents the specific changes in this repository that **actually impr
 
 ---
 
-## Additional controller tracking & smoothing patches (`patches/monado/0046–0052`, `patches/envision/0027`)
+## Additional tracking, upstream constellation & Head SLAM patches (`patches/monado/0046–0066`, `patches/basalt/0002–0003`, `patches/envision/0027`)
 
 These improvements are merged into `main` on top of the core series above:
 
@@ -112,6 +114,14 @@ These improvements are merged into `main` on top of the core series above:
 * **2D cross-projection blob ownership check ([`monado/0050`](../patches/monado/0050-t-constellation-reject-re-acquisition-whose-blobs-be.patch)):** Generic `t_constellation` fix (`CONSTELLATION_REACQUIRE_2D_BLOB_CHECK=1`). Projects each other actively tracked device's LED model into the current camera via `pose_metrics_match_pose_to_blobs` and refuses re-acquisition if ≥ 3 claimed blobs match its LEDs or ≥ half fall inside its 2D LED bounds (+15 px margin). Eliminated `cam 3` mirror-image false solves that landed ~10–17 cm off the other controller (`11–14` per session → `0`).
 * **Fast startup prior escape ([`monado/0051`](../patches/monado/0051-t-constellation-faster-prior-escape-during-startup.patch)):** During the first `5 s` of a device's lifetime (`CONSTELLATION_PRIOR_GATE_STARTUP_S`), triggers prior escape after 2 agreeing exposures (≥ 30 ms) while keeping 3D + 2D anti-merge guards active — eliminating the 2–3 s startup lock-in delay.
 * **Adaptive 1-Euro still smoothing for controllers & HMD ([`monado/0052`](../patches/monado/0052-d-pimax_p3c-1-Euro-still-smoothing-for-controllers-a.patch), [`envision/0027`](../patches/envision/0027-Headset-Controllers-live-1-Euro-still-smoothing-rows.patch)):** Clean-room 1-Euro filter (position + SLERP quaternion, timestamp-deduplicated across grip/aim queries, auto-reset across >250 ms gaps) that calms micro-jitter when held still without adding lag in motion. Controlled via live settings `PIMAX_CTRL_SMOOTHING` (`gentle` default / `strong` / `off`) and `PIMAX_HMD_SMOOTHING` (`off` default / `gentle`).
+* **Upstream Monado constellation improvements ([`monado/0053–0063`](../patches/monado/)):** Ported upstream MRs `!3099`, `!3104`, `!3117`, and `!3122` (`int64_t` time constants, C++ `RelationHistory` + keyframe history, priors without required LED IDs, immediate shallow search when seen last frame, 3-LED tight prior matches, closer-device blob priority, and disabling the oversized-blob rejection for close-up LEDs).
+* **Head SLAM overhaul ([`basalt/0002`](../patches/basalt/0002-vio-raise-near-depth-triangulation-cap-from-0.33-m-t.patch), [`basalt/0003`](../patches/basalt/0003-optical-flow-fix-multi-camera-essential-matrices-mat.patch), [`monado/0064`](../patches/monado/0064-d-pimax_p3c-pass-multi-thread-num-threads-and-option.patch), [`monado/0065`](../patches/monado/0065-a-tracking-add-SLAM-runaway-divergence-watchdog-with.patch)):**
+  * Raises Basalt's near-depth cap from `0.33 m` to `0.125 m` so close desks/walls keep visual anchors.
+  * Fixes an upstream Basalt bug where `E[i]` was hardcoded to `cam1` for all cameras (causing side-camera stereo matches to fail epipolar checks), adds pairwise stereo matching across all earlier cameras `k < i` while stationary, and prunes dead patches in `PatchOpticalFlow`.
+  * Passes `num-threads = 4` (configurable via `PIMAX_BASALT_THREADS`) to Basalt instead of defaulting to 1 single TBB thread.
+  * Adds an anchor-preserving SLAM runaway divergence watchdog (`SLAM_RUNAWAY_WATCHDOG=1`) in `t_tracker_slam.cpp` that resets Basalt on jumps/runaway/still-IMU drift while preserving world position and Z-yaw.
+* **In-gate anti-steal, blob-label restoration, fast-shake limits & metrics ([`monado/0066`](../patches/monado/0066-t-constellation-block-in-gate-hand-snap-steals-resto.patch), [`tools/tracking-metrics.py`](../tools/tracking-metrics.py)):**
+  * Blocks in-gate mirror-ring steals when hands are within 25 cm, restores other-device blob labels on rejected poses (including RANSAC drops), and raises fast-path blob-recovery limits (`CONSTELLATION_FAST_SHAKE_M_S=12`, `CONSTELLATION_FAST_SHAKE_RAD_S=18`) for fast wrist swings.
 
 ---
 
@@ -119,4 +129,4 @@ These improvements are merged into `main` on top of the core series above:
 
 * **Diagnostics & guards (kept only in `patches/monado/`):** `0015` (EuRoC SLAM recorder), `0016` / `0019` / `0030` / `0037` (pose/prior-gate diagnostic logging), `0044` (per-device IMU range sanity check).
 * **Still open (see [ROADMAP.md](ROADMAP.md)):**
-  * **Head SLAM:** Basalt still drops landmarks closer than 0.33 m (`inv_dist < 3`) and lacks a runaway detector/reset (`vit_tracker_reset`) when facing a close wall or table.
+  * **Controllers:** Covariance-scaled prior gating (upstream `!3105`/`!3113` once upstream gates with it) and controller battery level protocol decoding.

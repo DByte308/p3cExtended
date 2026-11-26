@@ -1,0 +1,64 @@
+From 85a50ac7c30c78fc3e41c504cb9f2c4124542158 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:14:33 +0100
+Subject: [PATCH 64/65] d/pimax_p3c: pass multi-thread num-threads and optional
+ optical flow mode to Basalt
+
+---
+ .../pimax_p3c/src/device/slam/basalt.rs       | 33 +++++++++++++++++--
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs b/src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs
+index 9809e59ad..01e1c3dc5 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/slam/basalt.rs
+@@ -22,8 +22,31 @@ impl ConfigFiles {
+         let vio_path = files.dir.join("vio_config.json");
+         let unified_path = files.dir.join("basalt.toml");
+         fs::write(&calib_path, serde_json::to_string_pretty(&calib_json)?)?;
+-        fs::write(&vio_path, VIO_CONFIG)?;
+-        fs::write(&unified_path, format!("cam-calib = {calib_path:?}\nconfig-path = {vio_path:?}\n"))?;
++        let vio_config = match std::env::var("PIMAX_BASALT_OPTICAL_FLOW") {
++            Ok(mode) if mode == "frame_to_frame" || mode == "patch" => {
++                match serde_json::from_str::<Value>(VIO_CONFIG) {
++                    Ok(mut v) => {
++                        if let Some(obj) = v.get_mut("value0").and_then(Value::as_object_mut) {
++                            obj.insert("config.optical_flow_type".into(), Value::String(mode));
++                        }
++                        serde_json::to_string_pretty(&v).unwrap_or_else(|_| VIO_CONFIG.to_string())
++                    }
++                    Err(_) => VIO_CONFIG.to_string(),
++                }
++            }
++            _ => VIO_CONFIG.to_string(),
++        };
++        fs::write(&vio_path, &vio_config)?;
++        // Basalt defaults num-threads to 1 if omitted, starving 4-camera pyramid + optical flow + VIO.
++        let threads: u32 = std::env::var("PIMAX_BASALT_THREADS")
++            .ok()
++            .and_then(|s| s.parse().ok())
++            .unwrap_or(4)
++            .min(16);
++        fs::write(
++            &unified_path,
++            format!("cam-calib = {calib_path:?}\nconfig-path = {vio_path:?}\nnum-threads = {threads}\n"),
++        )?;
+ 
+         // PIMAX_BASALT_SAVE=<dir>: keep a copy of the generated Basalt config (for replaying EuRoC recordings).
+         if let Some(save) = std::env::var_os("PIMAX_BASALT_SAVE") {
+@@ -33,7 +56,11 @@ impl ConfigFiles {
+             let _ = fs::copy(&vio_path, save.join("vio_config.json"));
+             let _ = fs::write(
+                 save.join("basalt.toml"),
+-                format!("cam-calib = {:?}\nconfig-path = {:?}\n", save.join("calibration.json"), save.join("vio_config.json")),
++                format!(
++                    "cam-calib = {:?}\nconfig-path = {:?}\nnum-threads = {threads}\n",
++                    save.join("calibration.json"),
++                    save.join("vio_config.json"),
++                ),
+             );
+         }
+         files.unified = CString::new(unified_path.into_os_string().into_encoded_bytes()).map_err(io::Error::other)?;
+-- 
+2.56.0
+

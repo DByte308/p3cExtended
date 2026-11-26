@@ -1,0 +1,379 @@
+From f1b0a319312f4452c705e5fec8e1031a7fd03b58 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:14:33 +0100
+Subject: [PATCH] a/tracking: add SLAM runaway divergence watchdog with
+ anchor-preserving reset
+
+---
+ src/xrt/auxiliary/tracking/t_tracker_slam.cpp | 287 +++++++++++++++++-
+ 1 file changed, 280 insertions(+), 7 deletions(-)
+
+diff --git a/src/xrt/auxiliary/tracking/t_tracker_slam.cpp b/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
+index 3a25ce71f..d60322d0e 100644
+--- a/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
++++ b/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
+@@ -41,6 +41,7 @@
+ #include <opencv2/core/version.hpp>
+ 
+ #include <array>
++#include <cmath>
+ #include <deque>
+ #include <filesystem>
+ #include <fstream>
+@@ -99,6 +100,7 @@ DEBUG_GET_ONCE_OPTION(slam_csv_path, "SLAM_CSV_PATH", "evaluation/")
+ DEBUG_GET_ONCE_BOOL_OPTION(slam_timing_stat, "SLAM_TIMING_STAT", true)
+ DEBUG_GET_ONCE_BOOL_OPTION(slam_features_stat, "SLAM_FEATURES_STAT", true)
+ DEBUG_GET_ONCE_NUM_OPTION(slam_cam_count, "SLAM_CAM_COUNT", 2)
++DEBUG_GET_ONCE_BOOL_OPTION(slam_runaway_watchdog, "SLAM_RUNAWAY_WATCHDOG", true)
+ 
+ //! Namespace for the interface to the external SLAM tracking system
+ namespace xrt::auxiliary::tracking::slam {
+@@ -309,6 +311,27 @@ struct TrackerSlam
+ 	t_slam_prediction_type pred_type;
+ 	u_var_combo pred_combo;         //!< UI combo box to select @ref pred_type
+ 	RelationHistory slam_rels{};    //!< A history of relations produced purely from external SLAM tracker data
++	Mutex flush_mutex{};            //!< Serializes @ref flush_poses and protects @ref watchdog
++
++	//! Runaway divergence watchdog and world-anchor state across SLAM resets
++	struct
++	{
++		bool enabled = true;
++		xrt_quat anchor_yaw = XRT_QUAT_IDENTITY;
++		xrt_vec3 anchor_pos = XRT_VEC3_ZERO;
++		bool has_good_pose = false;
++		xrt_pose last_good_world_pose = XRT_POSE_IDENTITY;
++		xrt_vec3 last_good_raw_pos = XRT_VEC3_ZERO;
++		timepoint_ns last_good_ts = 0;
++		bool awaiting_reset = false;
++		timepoint_ns reset_requested_ns = 0;
++		timepoint_ns last_reset_ns = 0;
++		int high_vel_streak = 0;
++		bool still_active = false;
++		timepoint_ns still_start_ns = 0;
++		xrt_vec3 still_start_pos = XRT_VEC3_ZERO;
++		uint64_t reset_count = 0;
++	} watchdog;
+ 
+ 	//! Covariances of the SLAM poses, see @ref xrt_tracked_slam::get_pose_covariance
+ 	struct
+@@ -789,10 +812,130 @@ cov_push(TrackerSlam &t, const vit_pose_t *pose, timepoint_ns ts)
+ 	}
+ }
+ 
++static bool
++vec3_is_finite(const xrt_vec3 &v)
++{
++	return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
++}
++
++static bool
++quat_is_finite(const xrt_quat &q)
++{
++	return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) && std::isfinite(q.w);
++}
++
++//! Compute a pure Z-up yaw + translation offset so that @p raw_pose maps onto @p target_world_pose
++//! while preserving @p raw_pose's gravity-aligned roll and pitch.
++static void
++watchdog_reanchor(TrackerSlam &t, const xrt_pose &raw_pose)
++{
++	auto &wd = t.watchdog;
++	if (!wd.has_good_pose) {
++		return;
++	}
++
++	xrt_quat raw_inv = raw_pose.orientation;
++	math_quat_invert(&raw_inv, &raw_inv);
++	xrt_quat q_delta;
++	math_quat_rotate(&wd.last_good_world_pose.orientation, &raw_inv, &q_delta);
++
++	// Swing-twist around +Z (Basalt world up): pure yaw preserves gravity alignment.
++	const float z_norm = std::sqrt(q_delta.z * q_delta.z + q_delta.w * q_delta.w);
++	if (z_norm > 1e-4f) {
++		wd.anchor_yaw = {0.0f, 0.0f, q_delta.z / z_norm, q_delta.w / z_norm};
++	} else {
++		wd.anchor_yaw = XRT_QUAT_IDENTITY;
++	}
++
++	xrt_vec3 rotated_raw_pos;
++	math_quat_rotate_vec3(&wd.anchor_yaw, &raw_pose.position, &rotated_raw_pos);
++	wd.anchor_pos = wd.last_good_world_pose.position - rotated_raw_pos;
++}
++
++//! Check whether raw IMU samples over the last ~150 ms indicate the headset is stationary.
++static bool
++watchdog_imu_is_still(TrackerSlam &t, timepoint_ns nts)
++{
++	constexpr time_duration_ns kWindowNs = 150 * U_TIME_1MS_IN_NS;
++	constexpr float kMaxGyroRadS = 0.08f;
++	constexpr float kMaxAccelDevMS2 = 0.45f;
++	constexpr int kMinSamples = 10;
++
++	os_mutex_lock(&t.lock_ff);
++	const size_t n_gyro = m_ff_vec3_f32_get_num(t.gyro_ff);
++	const size_t n_accel = m_ff_vec3_f32_get_num(t.accel_ff);
++	int gyro_count = 0;
++	int accel_count = 0;
++	bool still = true;
++
++	for (size_t i = 0; i < n_gyro; i++) {
++		xrt_vec3 g{};
++		uint64_t ts = 0;
++		if (!m_ff_vec3_f32_get(t.gyro_ff, i, &g, &ts) || ts == 0) {
++			break;
++		}
++		if ((int64_t)ts > nts) {
++			continue;
++		}
++		if (nts - (int64_t)ts > kWindowNs) {
++			break;
++		}
++		gyro_count++;
++		if (m_vec3_len(g) > kMaxGyroRadS) {
++			still = false;
++			break;
++		}
++	}
++
++	if (still) {
++		for (size_t i = 0; i < n_accel; i++) {
++			xrt_vec3 a{};
++			uint64_t ts = 0;
++			if (!m_ff_vec3_f32_get(t.accel_ff, i, &a, &ts) || ts == 0) {
++				break;
++			}
++			if ((int64_t)ts > nts) {
++				continue;
++			}
++			if (nts - (int64_t)ts > kWindowNs) {
++				break;
++			}
++			accel_count++;
++			if (std::fabs(m_vec3_len(a) - (float)MATH_GRAVITY_M_S2) > kMaxAccelDevMS2) {
++				still = false;
++				break;
++			}
++		}
++	}
++	os_mutex_unlock(&t.lock_ff);
++
++	return still && gyro_count >= kMinSamples && accel_count >= kMinSamples;
++}
++
++static void
++watchdog_request_reset(TrackerSlam &t, timepoint_ns nts, const char *reason)
++{
++	auto &wd = t.watchdog;
++	wd.reset_count++;
++	wd.high_vel_streak = 0;
++	wd.still_active = false;
++
++	SLAM_WARN("SLAM runaway detected (%s) — requesting reset #%" PRIu64 " while preserving world anchor", reason,
++	          wd.reset_count);
++	vit_result_t vres = t.vit.tracker_reset(t.tracker);
++	if (vres != VIT_SUCCESS) {
++		SLAM_ERROR("Watchdog failed to reset VIT tracker (%d)", vres);
++		return;
++	}
++	wd.awaiting_reset = true;
++	wd.reset_requested_ns = nts;
++}
++
+ //! Dequeue all tracked poses from the SLAM system and update prediction data with them.
+ static bool
+ flush_poses(TrackerSlam &t)
+ {
++	unique_lock flush_lock(t.flush_mutex);
+ 
+ 	vit_pose_t *pose = NULL;
+ 	vit_result_t vres = t.vit.tracker_pop_pose(t.tracker, &pose);
+@@ -811,14 +954,126 @@ flush_poses(TrackerSlam &t)
+ 		vres = t.vit.pose_get_data(pose, &data);
+ 		if (vres != VIT_SUCCESS) {
+ 			SLAM_ERROR("Failed to get pose data from VIT tracker");
++			t.vit.pose_destroy(pose);
+ 			return false;
+ 		}
+ 
+ 		int64_t nts = data.timestamp;
+ 
+-		xrt_vec3 npos{data.px, data.py, data.pz};
+-		xrt_quat nrot{data.ox, data.oy, data.oz, data.ow};
+-		xrt_vec3 nvel{data.vx, data.vy, data.vz};
++		xrt_vec3 raw_pos{data.px, data.py, data.pz};
++		xrt_quat raw_rot{data.ox, data.oy, data.oz, data.ow};
++		xrt_vec3 raw_vel{data.vx, data.vy, data.vz};
++
++		auto &wd = t.watchdog;
++		constexpr time_duration_ns kResetRetryNs = 2 * U_TIME_1S_IN_NS;
++		const bool pose_finite = vec3_is_finite(raw_pos) && quat_is_finite(raw_rot) && vec3_is_finite(raw_vel) &&
++		                         m_vec3_len(raw_pos) <= 50.0f && m_vec3_len(raw_vel) <= 25.0f;
++
++		if (!pose_finite) {
++			if (wd.enabled && (!wd.awaiting_reset || (nts - wd.reset_requested_ns) > kResetRetryNs)) {
++				watchdog_request_reset(t, nts, "non-finite or out-of-bounds pose");
++			}
++			t.vit.pose_destroy(pose);
++			continue;
++		}
++
++		math_quat_normalize(&raw_rot);
++		const xrt_pose raw_pose{raw_rot, raw_pos};
++		bool reanchored = false;
++
++		// Wait for Basalt to actually restart after a requested reset, then re-anchor smoothly.
++		if (wd.awaiting_reset) {
++			const bool near_origin = m_vec3_len(raw_pos) < 0.05f && m_vec3_len(raw_vel) < 0.5f;
++			const bool timed_out =
++			    (nts - wd.reset_requested_ns) > (500 * U_TIME_1MS_IN_NS) && m_vec3_len(raw_vel) < 2.0f;
++			if (!near_origin && !timed_out) {
++				if (wd.enabled && (nts - wd.reset_requested_ns) > kResetRetryNs) {
++					watchdog_request_reset(t, nts, "reset retry timeout");
++				}
++				t.vit.pose_destroy(pose);
++				continue;
++			}
++
++			watchdog_reanchor(t, raw_pose);
++			reanchored = true;
++			wd.awaiting_reset = false;
++			wd.last_reset_ns = nts;
++			wd.high_vel_streak = 0;
++			wd.still_active = false;
++			SLAM_INFO("SLAM re-anchored after reset #%" PRIu64 " at pos=[%.2f, %.2f, %.2f]", wd.reset_count,
++			          wd.last_good_world_pose.position.x, wd.last_good_world_pose.position.y,
++			          wd.last_good_world_pose.position.z);
++		} else if (wd.enabled && wd.has_good_pose && m_vec3_len(wd.last_good_raw_pos) > 0.25f &&
++		           m_vec3_len(raw_pos) < 0.02f && m_vec3_len(raw_vel) < 0.3f) {
++			// Basalt auto-reset on an internal solver failure; preserve world anchor seamlessly.
++			watchdog_reanchor(t, raw_pose);
++			reanchored = true;
++			wd.last_reset_ns = nts;
++			wd.high_vel_streak = 0;
++			wd.still_active = false;
++			SLAM_WARN("Detected spontaneous SLAM reset; preserved world anchor at pos=[%.2f, %.2f, %.2f]",
++			          wd.last_good_world_pose.position.x, wd.last_good_world_pose.position.y,
++			          wd.last_good_world_pose.position.z);
++		}
++
++		// Apply world-anchor offset (pure Z-yaw + translation)
++		xrt_vec3 npos;
++		math_quat_rotate_vec3(&wd.anchor_yaw, &raw_pos, &npos);
++		npos += wd.anchor_pos;
++		xrt_quat nrot;
++		math_quat_rotate(&wd.anchor_yaw, &raw_rot, &nrot);
++		math_quat_normalize(&nrot);
++		xrt_vec3 nvel;
++		math_quat_rotate_vec3(&wd.anchor_yaw, &raw_vel, &nvel);
++
++		// Runaway divergence checks (with a brief 300 ms grace period after resets)
++		if (wd.enabled && wd.has_good_pose && (nts - wd.last_reset_ns) > (300 * U_TIME_1MS_IN_NS)) {
++			const double dt_good = time_ns_to_s(nts - wd.last_good_ts);
++			const float jump_m = m_vec3_len(npos - wd.last_good_world_pose.position);
++			const float speed_m_s = m_vec3_len(nvel);
++			const char *runaway_reason = nullptr;
++
++			if (dt_good > 0.001 && dt_good < 0.5 && (jump_m > 0.50f || (jump_m / (float)dt_good) > 8.0f)) {
++				runaway_reason = "pose jump >0.5 m or implied speed >8 m/s";
++			} else if (speed_m_s > 10.0f) {
++				runaway_reason = "velocity >10 m/s";
++			} else if (speed_m_s > 4.0f) {
++				if (++wd.high_vel_streak >= 3) {
++					runaway_reason = "sustained velocity >4 m/s";
++				}
++			} else {
++				wd.high_vel_streak = 0;
++			}
++
++			if (runaway_reason == nullptr) {
++				if (watchdog_imu_is_still(t, nts)) {
++					if (!wd.still_active) {
++						wd.still_active = true;
++						wd.still_start_ns = nts;
++						wd.still_start_pos = npos;
++					} else if ((nts - wd.still_start_ns) >= (400 * U_TIME_1MS_IN_NS)) {
++						const float drift_m = m_vec3_len(npos - wd.still_start_pos);
++						const double still_s = time_ns_to_s(nts - wd.still_start_ns);
++						if (drift_m > 0.20f || (still_s > 0.0 && (drift_m / (float)still_s) > 0.35f)) {
++							runaway_reason = "position drift while IMU stationary";
++						}
++					}
++				} else {
++					wd.still_active = false;
++				}
++			}
++
++			if (runaway_reason != nullptr) {
++				watchdog_request_reset(t, nts, runaway_reason);
++				t.vit.pose_destroy(pose);
++				continue;
++			}
++		}
++
++		wd.has_good_pose = true;
++		wd.last_good_world_pose = {nrot, npos};
++		wd.last_good_raw_pos = raw_pos;
++		wd.last_good_ts = nts;
+ 
+ 		// Last relation
+ 		auto latest = t.slam_rels.getLatest().value_or(math::RelationHistoryEntry{});
+@@ -827,17 +1082,28 @@ flush_poses(TrackerSlam &t)
+ 		double dt = time_ns_to_s(nts - latest.timestamp);
+ 
+ 		SLAM_TRACE("Dequeued SLAM pose ts=%ld p=[%f,%f,%f] r=[%f,%f,%f,%f]", //
+-		           nts, data.px, data.py, data.pz, data.ox, data.oy, data.oz, data.ow);
++		           nts, npos.x, npos.y, npos.z, nrot.x, nrot.y, nrot.z, nrot.w);
+ 
+ 		// Compute new relation based on new pose and velocities since last pose
+ 		xrt_space_relation rel{};
+ 		rel.relation_flags = XRT_SPACE_RELATION_BITMASK_ALL;
+ 		rel.pose = {nrot, npos};
+ 		rel.linear_velocity = nvel;
+-		math_quat_finite_difference(&lrot, &nrot, dt, &rel.angular_velocity);
++		if (!reanchored && dt > 1e-6 && latest.timestamp > 0) {
++			math_quat_finite_difference(&lrot, &nrot, dt, &rel.angular_velocity);
++		} else {
++			rel.angular_velocity = XRT_VEC3_ZERO;
++		}
+ 
+-		// Push to relationship history unless we are debugging prediction
+-		if (t.dbg_pred_counter % t.dbg_pred_every == 0) {
++		// Push to relationship history unless we are debugging prediction (always push on re-anchor)
++		if (reanchored) {
++			t.slam_rels.clear();
++			t.slam_rels.pushOrUpdate({rel, nts}, false);
++			if (t.cov.enabled) {
++				unique_lock cov_lock(t.cov.mutex);
++				t.cov.history.clear();
++			}
++		} else if (t.dbg_pred_counter % t.dbg_pred_every == 0) {
+ 			t.slam_rels.pushOrUpdate({rel, nts}, false);
+ 		}
+ 		t.dbg_pred_counter = (t.dbg_pred_counter + 1) % t.dbg_pred_every;
+@@ -1033,9 +1299,15 @@ setup_ui(TrackerSlam &t)
+ 	u_var_button_cb reset_state_cb = [](void *t_ptr) {
+ 		TrackerSlam &t = *(TrackerSlam *)t_ptr;
+ 
++		unique_lock flush_lock(t.flush_mutex);
+ 		vit_result_t vres = t.vit.tracker_reset(t.tracker);
+ 		if (vres != VIT_SUCCESS) {
+ 			SLAM_WARN("Failed to reset VIT tracker");
++			return;
++		}
++		if (t.watchdog.enabled) {
++			t.watchdog.awaiting_reset = true;
++			t.watchdog.reset_requested_ns = os_monotonic_get_ns();
+ 		}
+ 	};
+ 	t.reset_state_btn.cb = reset_state_cb;
+@@ -1539,6 +1811,7 @@ t_slam_create(struct xrt_frame_context *xfctx,
+ 	TrackerSlam &t = *t_ptr;
+ 
+ 	t.log_level = log_level;
++	t.watchdog.enabled = debug_get_bool_option_slam_runaway_watchdog();
+ 
+ 	SLAM_INFO("Loading VIT system library from VIT_SYSTEM_LIBRARY_PATH='%s'", config->vit_system_library_path);
+ 
+-- 
+2.56.0
+

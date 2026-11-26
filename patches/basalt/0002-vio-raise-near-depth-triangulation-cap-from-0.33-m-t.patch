@@ -1,0 +1,40 @@
+From 131caf20d7c7eaeb5a641661f37bb44400f9dfff Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:12:17 +0100
+Subject: [PATCH 2/3] vio: raise near-depth triangulation cap from 0.33 m to
+ 0.125 m
+
+---
+ src/vi_estimator/sqrt_keypoint_vio.cpp | 2 +-
+ src/vi_estimator/sqrt_keypoint_vo.cpp  | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/vi_estimator/sqrt_keypoint_vio.cpp b/src/vi_estimator/sqrt_keypoint_vio.cpp
+index f8c3924..cfea914 100644
+--- a/src/vi_estimator/sqrt_keypoint_vio.cpp
++++ b/src/vi_estimator/sqrt_keypoint_vio.cpp
+@@ -531,7 +531,7 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(const OpticalFlowResult::Ptr& op
+ 
+           Vec4 p0_triangulated = triangulate(p0_3d.template head<3>(), p1_3d.template head<3>(), T_0_1);
+ 
+-          if (p0_triangulated.array().isFinite().all() && p0_triangulated[3] > 0 && p0_triangulated[3] < 3.0) {
++          if (p0_triangulated.array().isFinite().all() && p0_triangulated[3] > 0 && p0_triangulated[3] < 8.0) {
+             Landmark<Scalar> lm_pos;
+             lm_pos.host_kf_id = tcidl;
+             lm_pos.direction = StereographicParam<Scalar>::project(p0_triangulated);
+diff --git a/src/vi_estimator/sqrt_keypoint_vo.cpp b/src/vi_estimator/sqrt_keypoint_vo.cpp
+index 4253b58..4e30798 100644
+--- a/src/vi_estimator/sqrt_keypoint_vo.cpp
++++ b/src/vi_estimator/sqrt_keypoint_vo.cpp
+@@ -444,7 +444,7 @@ bool SqrtKeypointVoEstimator<Scalar_>::measure(const OpticalFlowResult::Ptr& opt
+ 
+           Vec4 p0_triangulated = triangulate(p0_3d.template head<3>(), p1_3d.template head<3>(), T_0_1);
+ 
+-          if (p0_triangulated.array().isFinite().all() && p0_triangulated[3] > 0 && p0_triangulated[3] < Scalar(3.0)) {
++          if (p0_triangulated.array().isFinite().all() && p0_triangulated[3] > 0 && p0_triangulated[3] < Scalar(8.0)) {
+             Landmark<Scalar> lm_pos;
+             lm_pos.host_kf_id = tcidl;
+             lm_pos.direction = StereographicParam<Scalar>::project(p0_triangulated);
+-- 
+2.56.0
+
