@@ -29,7 +29,7 @@ Full list with details: [docs/FEATURES.md](docs/FEATURES.md).
   (status, dead zone), Devices & Apps, Logs. Some settings apply live, the rest on the next start.
   Audio switching needs `pactl` (Fedora: pulseaudio-utils, Arch: libpulse, Debian/Ubuntu: pulseaudio-utils), which
   works with PulseAudio and with PipeWire (pipewire-pulse).
-- **Headset speakers**: a WirePlumber rule maps the built-in audio correctly.
+- **Headset speakers**: a WirePlumber rule (`config/51-pimax-crystal-audio.conf`) enables `pro-audio` on the Crystal Super (`34a4:0040`, exposing `Pimax Crystal Super DMAS Speakers` on ALSA device 1) and disables UCM on `3654:5678`. Note: the headset's true sound options only appear and play while the XR service (Envision / Monado) is running and the headset is awake.
 - Device info: firmware version, serial number and self-test in a status file and in Envision.
 
 Not done: local dimming, controller battery level (brightness and headset restart are built, untested in the headset; see [docs/FEATURES.md](docs/FEATURES.md)). SteamVR support is experimental
