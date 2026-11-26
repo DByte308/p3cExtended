@@ -1,0 +1,140 @@
+From 368ca431853a896372dadd7a77394a41a52d572f Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:38:22 +0100
+Subject: [PATCH] System profile: search user-local and existing Envision
+ profile dirs for xrizer/OpenComposite/VapoR
+
+When using the System Monado profile, ovr_comp_runtime_dir() previously
+only checked 6 system paths (/opt, /usr/lib*, /home/linuxbrew) and fell
+back to a nonexistent /opt/xrizer, breaking Steam OpenVR games for users
+who installed xrizer under ~/.local or already built it in an Envision
+development profile.
+
+Also check /usr/local/lib*, /usr/share, ~/.local/{opt,share,lib64,lib},
+and previously built Envision profiles in ~/.local/share/envision/<uuid>/.
+---
+ src/profile.rs | 85 +++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 73 insertions(+), 12 deletions(-)
+
+diff --git a/src/profile.rs b/src/profile.rs
+index 5d0d07b..c32342f 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -891,41 +891,102 @@ impl Profile {
+     }
+ 
+     pub fn ovr_comp_runtime_dir(&self) -> PathBuf {
+-        const CANDIDATE_DIRS_OPENCOMPOSITE: [&str; 6] = [
++        const CANDIDATE_DIRS_OPENCOMPOSITE: &[&str] = &[
+             "/opt/opencomposite",
+             "/usr/lib64/opencomposite/runtime",
+             "/usr/lib/opencomposite/runtime",
+             "/usr/lib64/opencomposite",
+             "/usr/lib/opencomposite",
++            "/usr/local/lib64/opencomposite",
++            "/usr/local/lib/opencomposite",
++            "/usr/share/opencomposite",
+             "/home/linuxbrew/.linuxbrew/opt/opencomposite",
+         ];
+-        const CANDIDATE_DIRS_XRIZER: [&str; 6] = [
++        const CANDIDATE_DIRS_XRIZER: &[&str] = &[
+             "/opt/xrizer",
+             "/usr/lib64/xrizer/runtime",
+             "/usr/lib/xrizer/runtime",
+             "/usr/lib64/xrizer",
+             "/usr/lib/xrizer",
++            "/usr/local/lib64/xrizer",
++            "/usr/local/lib/xrizer",
++            "/usr/share/xrizer",
+             "/home/linuxbrew/.linuxbrew/opt/xrizer",
+         ];
+-        const CANDIDATE_DIRS_VAPOR: [&str; 6] = [
++        const CANDIDATE_DIRS_VAPOR: &[&str] = &[
+             "/opt/vapor",
+             "/usr/lib64/vapor/runtime",
+             "/usr/lib/vapor/runtime",
+             "/usr/lib64/vapor",
+             "/usr/lib/vapor",
++            "/usr/local/lib64/vapor",
++            "/usr/local/lib/vapor",
++            "/usr/share/vapor",
+             "/home/linuxbrew/.linuxbrew/opt/vapor",
+         ];
+         if self.is_system_profile {
+-            let candidates = match self.ovr_comp.mod_type {
+-                OvrCompatibilityModuleType::Opencomposite => CANDIDATE_DIRS_OPENCOMPOSITE,
+-                OvrCompatibilityModuleType::Xrizer => CANDIDATE_DIRS_XRIZER,
+-                OvrCompatibilityModuleType::Vapor => CANDIDATE_DIRS_VAPOR,
++            let has_vrclient = |p: &Path| p.join("bin/linux64/vrclient.so").is_file();
++            let (candidates, slug, built_subpaths): (&[&str], &str, &[&str]) =
++                match self.ovr_comp.mod_type {
++                    OvrCompatibilityModuleType::Opencomposite => (
++                        CANDIDATE_DIRS_OPENCOMPOSITE,
++                        "opencomposite",
++                        &["OpenComposite/build", "opencomposite/build"],
++                    ),
++                    OvrCompatibilityModuleType::Xrizer => (
++                        CANDIDATE_DIRS_XRIZER,
++                        "xrizer",
++                        &["xrizer/target/release"],
++                    ),
++                    OvrCompatibilityModuleType::Vapor => (
++                        CANDIDATE_DIRS_VAPOR,
++                        "vapor",
++                        &["VapoR/build/install_pfx/lib/VapoR"],
++                    ),
++                };
++            // 1. Standard system paths
++            if let Some(dir) = candidates.iter().map(Path::new).find(|p| has_vrclient(p)) {
++                return dir.to_path_buf();
++            }
++            // 2. Common user-local install locations (~/.local/{opt,share,lib64,lib}/<slug>)
++            if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from) {
++                for sub in ["opt", "share", "lib64", "lib"] {
++                    let p = home.join(".local").join(sub).join(slug);
++                    if has_vrclient(&p) {
++                        return p;
++                    }
++                    let rt = p.join("runtime");
++                    if has_vrclient(&rt) {
++                        return rt;
++                    }
++                }
++            }
++            // 3. Previously built Envision dev profiles in ~/.local/share/envision/
++            let data_dir = get_data_dir();
++            let shared_rel = match self.ovr_comp.mod_type {
++                OvrCompatibilityModuleType::Opencomposite => "ovr_comp/build",
++                OvrCompatibilityModuleType::Xrizer => "ovr_comp/target/release",
++                OvrCompatibilityModuleType::Vapor => "ovr_comp/build/install_pfx/lib/VapoR",
+             };
+-            candidates
+-                .iter()
+-                .find(|c| Path::new(c).join("bin/linux64/vrclient.so").is_file())
+-                .unwrap_or(candidates.first().unwrap())
+-                .into()
++            let shared = data_dir.join(shared_rel);
++            if has_vrclient(&shared) {
++                return shared;
++            }
++            if let Ok(entries) = std::fs::read_dir(&data_dir) {
++                let mut found: Vec<PathBuf> = entries
++                    .flatten()
++                    .flat_map(|e| {
++                        let base = e.path();
++                        built_subpaths.iter().map(move |sub| base.join(sub))
++                    })
++                    .filter(|p| has_vrclient(p))
++                    .collect();
++                found.sort();
++                if let Some(p) = found.into_iter().next() {
++                    return p;
++                }
++            }
++            PathBuf::from(candidates[0])
+         } else {
+             self.ovr_comp.built_runtime_dir()
+         }
+-- 
+2.56.0
+
