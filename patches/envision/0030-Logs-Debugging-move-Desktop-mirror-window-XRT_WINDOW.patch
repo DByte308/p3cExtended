@@ -1,0 +1,136 @@
+From c4f920a84af640bdc53be37077d74769a8014ca9 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:52:51 +0100
+Subject: [PATCH] Logs & Debugging: move Desktop mirror window
+ (XRT_WINDOW_PEEK) here with compositor warning
+
+XRT_WINDOW_PEEK forces Monado off the default compute compositor onto
+the graphics compositor, which can break games/overlays (especially on
+AMD RADV). Move it out of Headset -> Display into Logs & Debugging next
+to Capture headset view with a clear warning in its subtitle.
+---
+ src/ui/app.rs         |  3 +++
+ src/ui/debug_view.rs  | 37 +++++++++++++++++++++++++++++++++++++
+ src/ui/pimax_pages.rs |  6 ------
+ 3 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 7a1beb1..7a9d25e 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -1489,6 +1489,9 @@ impl AsyncComponent for App {
+                         .global_preferences
+                         .env_vars
+                         .contains_key("XRT_MIRROR_DUMP"),
++                    window_peek: super::debug_view::parse_window_peek(
++                        &config.global_preferences.env_vars,
++                    ),
+                 })
+                 .forward(sender.input_sender(), |message| match message {
+                     DebugViewOutMsg::StartWithDebug => Msg::StartWithDebug,
+diff --git a/src/ui/debug_view.rs b/src/ui/debug_view.rs
+index 02786b1..fd49282 100644
+--- a/src/ui/debug_view.rs
++++ b/src/ui/debug_view.rs
+@@ -64,6 +64,7 @@ pub enum DebugViewMsg {
+     ProfilesEnabledChanged(bool),
+     SessionLogToggled(bool),
+     MirrorDumpToggled(bool),
++    WindowPeekChanged(u32),
+     ReloadEnv(std::collections::HashMap<String, String>),
+ }
+ 
+@@ -86,6 +87,7 @@ pub struct DebugView {
+     dev_mode: bool,
+     session_log_enabled: bool,
+     mirror_dump_enabled: bool,
++    window_peek: u32,
+     #[tracker::do_not_track]
+     dropdown: Option<gtk::DropDown>,
+     #[tracker::do_not_track]
+@@ -119,6 +121,15 @@ pub struct DebugViewInit {
+     pub dev_mode: bool,
+     pub session_log_enabled: bool,
+     pub mirror_dump_enabled: bool,
++    pub window_peek: u32,
++}
++
++pub fn parse_window_peek(env: &std::collections::HashMap<String, String>) -> u32 {
++    match env.get("XRT_WINDOW_PEEK").map(|s| s.trim().to_ascii_lowercase()).as_deref() {
++        Some("left") => 1,
++        Some("both") => 2,
++        _ => 0,
++    }
+ }
+ 
+ impl DebugView {
+@@ -277,6 +288,17 @@ impl AsyncComponent for DebugView {
+                             sender.input(Self::Input::MirrorDumpToggled(row.is_active()));
+                         },
+                     },
++                    adw::ComboRow {
++                        set_title: "Desktop mirror window",
++                        set_subtitle: "Shows the headset view in a desktop window (switches compositor; may break some games/overlays)",
++                        set_subtitle_lines: 0,
++                        set_model: Some(&gtk::StringList::new(&["Off", "Left eye", "Both eyes"])),
++                        #[track = "model.changed(Self::window_peek())"]
++                        set_selected: model.window_peek,
++                        connect_selected_notify[sender] => move |row| {
++                            sender.input(Self::Input::WindowPeekChanged(row.selected()));
++                        },
++                    },
+                 },
+             },
+             add_bottom_bar: prof_toggle_box = &gtk::ListBox{
+@@ -695,9 +717,23 @@ impl AsyncComponent for DebugView {
+                         .expect(SENDER_IO_ERR_MSG);
+                 }
+             }
++            Self::Input::WindowPeekChanged(idx) => {
++                if idx != self.window_peek {
++                    self.set_window_peek(idx);
++                    let val = match idx {
++                        1 => Some("left".to_string()),
++                        2 => Some("both".to_string()),
++                        _ => None,
++                    };
++                    sender
++                        .output(Self::Output::SetEnvVar("XRT_WINDOW_PEEK".to_string(), val))
++                        .expect(SENDER_IO_ERR_MSG);
++                }
++            }
+             Self::Input::ReloadEnv(env) => {
+                 self.set_session_log_enabled(crate::session_log::enabled(&env));
+                 self.set_mirror_dump_enabled(env.contains_key("XRT_MIRROR_DUMP"));
++                self.set_window_peek(parse_window_peek(&env));
+             }
+         }
+     }
+@@ -821,6 +857,7 @@ impl AsyncComponent for DebugView {
+             dev_mode: init.dev_mode,
+             session_log_enabled: init.session_log_enabled,
+             mirror_dump_enabled: init.mirror_dump_enabled,
++            window_peek: init.window_peek,
+             tracker: 0,
+             dropdown: None,
+             log_level: LogLevel::Trace,
+diff --git a/src/ui/pimax_pages.rs b/src/ui/pimax_pages.rs
+index 6534150..9a89e84 100644
+--- a/src/ui/pimax_pages.rs
++++ b/src/ui/pimax_pages.rs
+@@ -330,12 +330,6 @@ impl SimpleComponent for HeadsetPage {
+             });
+             row
+         });
+-        display.add(&ctx.choice_row(
+-            "XRT_WINDOW_PEEK",
+-            "Desktop mirror window",
+-            "Shows the headset view in a desktop window for recording (uses some GPU)",
+-            &[("Off", None), ("Left eye", Some("left")), ("Both eyes", Some("both"))],
+-        ));
+         content.append(&display);
+ 
+         // Headset controls
+-- 
+2.56.0
+
