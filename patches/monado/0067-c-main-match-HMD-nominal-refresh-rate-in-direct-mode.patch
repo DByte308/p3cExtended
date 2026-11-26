@@ -1,0 +1,62 @@
+From a7ffd89b685b5a40465223b9098f5561fa85f380 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:12:10 +0100
+Subject: [PATCH 67/68] c/main: match HMD nominal refresh rate in direct-mode
+ auto selection
+
+---
+ src/xrt/compositor/main/comp_window_direct.c | 30 ++++++++++++++++++--
+ 1 file changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/compositor/main/comp_window_direct.c b/src/xrt/compositor/main/comp_window_direct.c
+index bce558c97..df1a48c0f 100644
+--- a/src/xrt/compositor/main/comp_window_direct.c
++++ b/src/xrt/compositor/main/comp_window_direct.c
+@@ -33,8 +33,16 @@ choose_best_vk_mode_auto(struct comp_target *ct, VkDisplayModePropertiesKHR *mod
+ 	COMP_DEBUG(ct->c, "Available Vk direct mode %d: %dx%d@%.2f", 0, current->visibleRegion.width,
+ 	           current->visibleRegion.height, (float)current->refreshRate / 1000.);
+ 
++	// If the HMD driver requested a specific refresh rate, prefer a mode matching it (within 1.5 Hz)
++	// at the highest pixel count instead of always picking the highest refresh rate.
++	uint32_t desired_mhz = 0;
++	if (ct->c != NULL && ct->c->xdev != NULL && ct->c->xdev->hmd != NULL &&
++	    ct->c->xdev->hmd->screens[0].nominal_frame_interval_ns > 0) {
++		desired_mhz = (uint32_t)(1000000000000ULL / ct->c->xdev->hmd->screens[0].nominal_frame_interval_ns);
++	}
++
+ 	// First priority: choose mode that maximizes rendered pixels.
+-	// Second priority: choose mode with highest refresh rate.
++	// Second priority: match the HMD's nominal refresh rate (within 1.5 Hz) if available, else highest refresh rate.
+ 	for (int i = 1; i < mode_count; i++) {
+ 		current = &mode_properties[i].parameters;
+ 
+@@ -48,8 +56,24 @@ choose_best_vk_mode_auto(struct comp_target *ct, VkDisplayModePropertiesKHR *mod
+ 		int pixels = current->visibleRegion.width * current->visibleRegion.height;
+ 		if (pixels > best_pixels) {
+ 			best_index = i;
+-		} else if (pixels == best_pixels && current->refreshRate > best.refreshRate) {
+-			best_index = i;
++		} else if (pixels == best_pixels) {
++			if (desired_mhz > 0) {
++				uint32_t cur_diff = current->refreshRate > desired_mhz
++				                        ? current->refreshRate - desired_mhz
++				                        : desired_mhz - current->refreshRate;
++				uint32_t best_diff = best.refreshRate > desired_mhz
++				                         ? best.refreshRate - desired_mhz
++				                         : desired_mhz - best.refreshRate;
++				bool cur_matches = cur_diff <= 1500;
++				bool best_matches = best_diff <= 1500;
++				if (cur_matches && (!best_matches || cur_diff < best_diff)) {
++					best_index = i;
++				} else if (!cur_matches && !best_matches && current->refreshRate > best.refreshRate) {
++					best_index = i;
++				}
++			} else if (current->refreshRate > best.refreshRate) {
++				best_index = i;
++			}
+ 		}
+ 	}
+ 	VkDisplayModeParametersKHR best = mode_properties[best_index].parameters;
+-- 
+2.56.0
+

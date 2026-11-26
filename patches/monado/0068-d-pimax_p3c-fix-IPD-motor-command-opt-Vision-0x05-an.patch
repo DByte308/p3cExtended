@@ -1,0 +1,174 @@
+From c2b3115fc8185dac0122aacc79ca63ca0bc5ce80 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:12:10 +0100
+Subject: [PATCH] d/pimax_p3c: fix IPD motor command opt (Vision 0x05) and
+ support live PIMAX_IPD_MM
+
+Crystal Super (P3C) expects cmd 0x5C with sub-device opt 0x05 (Vision),
+not 0x00 (Hmd) as sent by pimax-protocol's CmdSetIpd (which the MCU
+silently ignores with no reply).
+
+Define SetIpd targeting PimaxSubDevice::Vision (wire frame
+00 58 06 5C 05 01 <u16 LE in 0.01 mm>), use it for both startup
+apply_ipd() and live Controls::apply() updates, and add a unit test.
+---
+ .../pimax_p3c/src/device/session/controls.rs  | 67 ++++++++++++++++++-
+ .../pimax_p3c/src/device/session/extras.rs    | 12 ++--
+ 2 files changed, 71 insertions(+), 8 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs b/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+index 3f137769e..c45417aa9 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/controls.rs
+@@ -8,13 +8,48 @@
+ //!   stored setting); the headset restarts at most once per session, and only for a request newer than the
+ //!   service's start.
+ 
+-use pimax_protocol::cmd::Command;
++use pimax_protocol::cmd::{Command, Query};
+ use pimax_protocol::device::PimaxSubDevice;
+-use pimax_protocol::{CommandDevice, Error};
++use pimax_protocol::{CmdResult, CommandDevice, Error, Matcher};
+ 
+ const BRIGHTNESS_ENV: &str = "PIMAX_BRIGHTNESS";
+ const UPSCALE_ENV: &str = "PIMAX_UPSCALE";
+ const RESTART_ENV: &str = "PIMAX_RESTART_AT";
++const IPD_ENV: &str = "PIMAX_IPD_MM";
++
++/// Move the motorized lenses to the given IPD in mm (58..=72).
++///
++/// Crystal Super (P3C) wire frame: `00 58 06 5C 05 01 <u16 LE in 0.01 mm>`.
++/// `pimax_protocol::cmd::set_ipd::CmdSetIpd` sends `opt = Hmd (0x00)`, which the Crystal Super
++/// MCU ignores; targeting `PimaxSubDevice::Vision (0x05)` is required.
++pub(super) struct SetIpd(pub f32);
++
++impl Command for SetIpd {
++    const ID: u8 = 0x5C;
++
++    fn cmd_opt(&self) -> PimaxSubDevice {
++        PimaxSubDevice::Vision
++    }
++
++    fn write_payload(&self, out: &mut Vec<u8>) {
++        out.reserve(3);
++        out.push(0x01);
++        let centimm = (self.0.clamp(58.0, 72.0) * 100.0).round() as u16;
++        out.extend_from_slice(&centimm.to_le_bytes());
++    }
++
++    fn matcher(&self) -> Matcher {
++        Matcher::CmdIdAndOpt
++    }
++}
++
++impl Query for SetIpd {
++    type Response = Vec<u8>;
++
++    fn decode(result: CmdResult) -> pimax_protocol::Result<Self::Response> {
++        Ok(result.payload)
++    }
++}
+ 
+ /// Panel brightness, 1..=100.
+ struct SetBrightness(u8);
+@@ -65,10 +100,16 @@ fn parse_upscale(v: &str) -> Option<bool> {
+     }
+ }
+ 
++fn parse_ipd(v: &str) -> Option<f32> {
++    let mm: f32 = v.trim().parse().ok()?;
++    (mm.is_finite() && (58.0..=72.0).contains(&mm)).then_some(mm)
++}
++
+ pub(super) struct Controls {
+     generation: Option<u64>,
+     started_ms: u64,
+     brightness: Option<u8>,
++    ipd_mm: Option<f32>,
+     upscale: Option<bool>,
+     /// False on models where upscaling showed no effect (Crystal Super series): the setting is ignored there.
+     upscale_supported: bool,
+@@ -80,10 +121,13 @@ impl Controls {
+         // The eye-tracking bring-up sequence (extras.rs) switches upscaling off unless it was skipped.
+         let upscale_off_at_start = crate::util::option_bool("PIMAX_EYE_TRACKING", true)
+             && crate::util::option_bool("PIMAX_EYE_BRINGUP", true);
++        // Startup apply_ipd() already sent the initial env value if valid; seed it so we don't re-send on tick 0.
++        let initial_ipd = std::env::var(IPD_ENV).ok().as_deref().and_then(parse_ipd);
+         Self {
+             generation: None,
+             started_ms: crate::live::process_started_ms(),
+             brightness: None,
++            ipd_mm: initial_ipd,
+             upscale: upscale_off_at_start.then_some(false),
+             upscale_supported,
+             restarted: false,
+@@ -105,6 +149,18 @@ impl Controls {
+                 self.brightness = Some(b);
+             }
+         }
++        if let Some(mm) = crate::live::get_str(IPD_ENV).as_deref().and_then(parse_ipd) {
++            let changed = self.ipd_mm.is_none_or(|prev| (prev - mm).abs() >= 0.05);
++            if changed {
++                match cmd.query(&SetIpd(mm)) {
++                    Ok(ack) => {
++                        info!("set IPD {mm:.2} mm (live), ack {ack:02x?}");
++                        self.ipd_mm = Some(mm);
++                    }
++                    Err(e) => warn!("set IPD {mm:.2} mm (live) failed: {e}"),
++                }
++            }
++        }
+         let upscale = match crate::live::get_str(UPSCALE_ENV) {
+             _ if !self.upscale_supported => None,
+             Some(v) => parse_upscale(&v),
+@@ -142,5 +198,12 @@ mod tests {
+         assert_eq!(parse_upscale("1"), Some(true));
+         assert_eq!(parse_upscale("0"), Some(false));
+         assert_eq!(parse_upscale(""), None);
++        assert_eq!(parse_ipd("64.5"), Some(64.5));
++        assert_eq!(parse_ipd("57.9"), None);
++        assert_eq!(parse_ipd("72.1"), None);
++        let req = SetIpd(64.5).request();
++        assert_eq!(req.cmd_id, 0x5C);
++        assert_eq!(req.cmd_opt, 0x05);
++        assert_eq!(req.payload, vec![0x01, 0x32, 0x19]);
+     }
+ }
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs b/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
+index ce67e53c1..bf3f5618f 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/session/extras.rs
+@@ -2,9 +2,9 @@ use pimax_protocol::cmd::{Command, Query};
+ use pimax_protocol::device::PimaxSubDevice;
+ use pimax_protocol::{CmdResult, CommandDevice, Error};
+ use pimax_protocol::cmd::eye_track_enable::CmdEyeTrackEnable;
+-use pimax_protocol::cmd::set_ipd::CmdSetIpd;
+ use pimax_protocol::cmd::visor_ctl::CmdVisorCtl;
+ use pimax_protocol::cmd::visor_status::CmdVisorStatus;
++use super::controls::SetIpd;
+ 
+ /// Raw Vision (sub-device 0x05) command.
+ struct VisionRaw<const ID: u8>(&'static [u8]);
+@@ -29,14 +29,14 @@ impl<const ID: u8> Query for VisionRaw<ID> {
+ /// The Vision bring-up sequence the eye-tracking chip needs: without it the EyeChip enumerates and streams, but
+ /// its eye cameras/illuminators stay idle and every gaze column is constant.  Panel, level, named-parameter and licence
+ /// commands are deliberately left out.
+-/// `PIMAX_IPD_MM` (58..72): move the lens motors to this IPD at start-up (command 0x5C, semantics inferred from the
+-/// protocol crate, not yet confirmed on the device). Unset: lenses stay where they are.
++/// `PIMAX_IPD_MM` (58..72): move the lens motors to this IPD at start-up (command 0x5C, opt 0x05 Vision).
++/// Unset: lenses stay where they are.
+ pub(super) fn apply_ipd(cmd: &CommandDevice) {
+     let Ok(raw) = std::env::var("PIMAX_IPD_MM") else { return };
+     match raw.parse::<f32>() {
+-        Ok(mm) if (58.0..=72.0).contains(&mm) => match cmd.query(&CmdSetIpd(mm)) {
+-            Ok(ack) => info!("set IPD {mm} mm, ack {ack}"),
+-            Err(e) => warn!("set IPD {mm} mm failed: {e}"),
++        Ok(mm) if (58.0..=72.0).contains(&mm) => match cmd.query(&SetIpd(mm)) {
++            Ok(ack) => info!("set IPD {mm:.2} mm, ack {ack:02x?}"),
++            Err(e) => warn!("set IPD {mm:.2} mm failed: {e}"),
+         },
+         Ok(0.0) => {}
+         _ => warn!("PIMAX_IPD_MM={raw}: need 58..72 mm; lenses not moved"),
+-- 
+2.56.0
+
