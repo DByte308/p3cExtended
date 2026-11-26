@@ -1,0 +1,155 @@
+From 953c920526f39c85c67603cbb0dc919c9c9ac8e6 Mon Sep 17 00:00:00 2001
+From: DByte308 <69403407+DByte308@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:15:18 +0100
+Subject: [PATCH] d/pimax_p3c: account for displays[0].gap in
+ lens_center_separation (fixes Dream Air / Micro-OLED distortion)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Micro-OLED headsets (Dream Air SE, Dream Air, Crystal Super Micro-OLED)
+have small panels (h_size = 36.6–48.4 mm) separated by a 52.18 mm physical
+gap (displays[0].gap). Passing lens[0].separation (~69.5–75.8 mm) directly
+to u_compute_distortion_rift_fov with eye_gap_m = 0 placed the optical
+centre ~2.5x outside the panel, severely distorting the image.
+
+Compute eff = h_size - (lens.separation - displays[0].gap) (with a bounds
+guard falling back to h_size / 2, and bounds-checking PIMAX_LENS_SEP_MM),
+which matches all P3C configs through rift_panel():
+- Crystal Super 50/57PPD & Crystal Light: 0.000 (centred)
+- Crystal Super Ultrawide: -0.062 (6.2% nasal, matching measured 6.38%)
+- Dream Air SE (K10): -0.055 (5.5% nasal, instead of -2.549)
+- Dream Air (K11) & Crystal Super Micro-OLED: -0.025 / -0.033 (nasal)
+---
+ .../pimax_p3c/src/device/hmd/distortion.rs    | 89 +++++++++++++++++--
+ 1 file changed, 82 insertions(+), 7 deletions(-)
+
+diff --git a/src/xrt/drivers/pimax_p3c/src/device/hmd/distortion.rs b/src/xrt/drivers/pimax_p3c/src/device/hmd/distortion.rs
+index 1dd6db17f..b2af535b1 100644
+--- a/src/xrt/drivers/pimax_p3c/src/device/hmd/distortion.rs
++++ b/src/xrt/drivers/pimax_p3c/src/device/hmd/distortion.rs
+@@ -52,6 +52,8 @@ pub struct PimaxDeviceConfigRenderEye {
+ pub struct PimaxDeviceConfigDisplay {
+     pub v_size: f32,
+     pub h_size: f32,
++    #[serde(default)]
++    pub gap: f32,
+     pub native_width: u32,
+     pub native_height: u32,
+ }
+@@ -83,6 +85,7 @@ fn rift_panel(config: &PimaxDeviceConfig) -> u_rift_panel {
+         mut v_size,
+         mut native_width,
+         mut native_height,
++        ..
+     } = config.displays[0];
+     let view_rotation = config.render.eyes[0].rotate;
+     if view_rotation == 90 || view_rotation == 270 {
+@@ -112,21 +115,36 @@ fn rift_panel(config: &PimaxDeviceConfig) -> u_rift_panel {
+     }
+ }
+ 
+-/// Lens optical-centre separation used for the distortion model.
++/// Lens optical-centre separation passed to `u_compute_distortion_rift_fov` (with `eye_gap_m = 0`).
++///
++/// Each Pimax config specifies two eye panels of width `h_size / 2` separated by `displays[0].gap`,
++/// so the physical panel centres are `h_size / 2 + gap` apart. `lens[0].separation` is the physical
++/// distance between the two lens optical centres in that same frame:
++/// - Crystal Super 50/57PPD & Crystal Light: `separation == h_size / 2 + gap` (lens centred on panel)
++/// - Crystal Super Ultrawide: `separation` is 4.0 mm narrower (2.0 mm nasal per eye -> 6.2 %)
++/// - Dream Air SE (K10): `gap = 52.18 mm`, `separation` is 1.0 mm narrower (0.5 mm nasal -> 5.5 %)
+ ///
+-/// The optical centres are not in the middle of each half-panel: on the Crystal Super Ultrawide they sit ~2 mm towards
+-/// the nose (sboys3's native-matched profile: 6.38 % of the half width). Placing them mid-panel shifts each eye's image
+-/// ~3 deg outwards -> ~6 deg vergence error -> the eyes never fuse. `separation` plus the last level offset reproduces
+-/// the measured value (0.07331 - 0.0045 = 0.06881 m -> 6.65 %). Override: PIMAX_LENS_SEP_MM.
++/// Because `u_compute_distortion_rift_fov` computes `from_left` in the left-eye frame while `distort()`
++/// evaluates in the right-eye frame (`-x` = nasal), passing `h_size - (separation - gap)` places the
++/// optical centre at the exact physical nasal/temporal offset on all P3C models (QLED, Ultrawide,
++/// Micro-OLED, Dream Air, Dream Air SE) without inflating `tan_scale.x`. Override: `PIMAX_LENS_SEP_MM`.
+ fn lens_center_separation(config: &PimaxDeviceConfig, h_size: f32) -> f32 {
+     if let Some(mm) = std::env::var("PIMAX_LENS_SEP_MM").ok().and_then(|v| v.parse::<f32>().ok()) {
+-        return mm / 1000.;
++        let sep = mm / 1000.;
++        if sep > 0. && sep < h_size {
++            return sep;
++        }
+     }
+     let lens = &config.lens[0];
+     if lens.separation <= 0. {
+         return h_size / 2.;
+     }
+-    lens.separation + config.lens_separation_level_offsets.last().copied().unwrap_or(0.)
++    let eff = h_size - (lens.separation - config.displays[0].gap);
++    if eff > 0. && eff < h_size {
++        eff
++    } else {
++        h_size / 2.
++    }
+ }
+ 
+ fn rift_eye_profile(config: &PimaxDeviceConfig) -> u_rift_eye_profile {
+@@ -244,3 +262,60 @@ pub unsafe extern "C" fn pimax_compute_distortion(
+     unsafe { *out = distortion };
+     xrt_result::XRT_SUCCESS
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn cfg(h_size: f32, v_size: f32, gap: f32, separation: f32, rotate: u32) -> PimaxDeviceConfig {
++        PimaxDeviceConfig {
++            displays: [PimaxDeviceConfigDisplay {
++                v_size,
++                h_size,
++                gap,
++                native_width: 5088,
++                native_height: 2544,
++            }],
++            lens_separation_level_offsets: vec![0.0, -0.0045],
++            render: PimaxDeviceConfigRender {
++                eyes: [
++                    PimaxDeviceConfigRenderEye { rotate, fov_fix_degree: 0.0 },
++                    PimaxDeviceConfigRenderEye { rotate, fov_fix_degree: 0.0 },
++                ],
++            },
++            lens: [PimaxDeviceConfigLens {
++                separation,
++                meters_per_tan_angle_at_center: 0.013,
++                v_center_off: 0.0,
++                distortion_param: PimaxDeviceConfigLensDistortion {
++                    k: vec![1.0, 1.0, 1.0, 1.0],
++                    chromatic_aberration: vec![0.0, 0.0, 0.0, 0.0],
++                    max_radius: 1.0,
++                },
++            }],
++            q_d2i: [0.0, 0.0, 0.0, 1.0],
++            t_d2i: [0.0, 0.0, 0.0],
++        }
++    }
++
++    fn lcx(c: &PimaxDeviceConfig) -> f32 {
++        let p = rift_panel(c);
++        1.0 - 2.0 * p.lens_center_separation_m / p.size_m.x
++    }
++
++    #[test]
++    fn lens_center_separation_all_models() {
++        // Crystal Super 50PPD / 57PPD QLED: centered
++        assert!(lcx(&cfg(0.12902, 0.06290, 0.0128, 0.07731, 180)).abs() < 1e-4);
++        // Crystal Light (P3C9): centered (square 2880x2880 rotated 270/90)
++        assert!(lcx(&cfg(0.11404, 0.05702, 0.0128, 0.06982, 270)).abs() < 1e-4);
++        // Crystal Super Ultrawide: ~6.2% nasal (-0.062)
++        assert!((lcx(&cfg(0.12902, 0.06290, 0.0128, 0.07331, 180)) - (-0.0620)).abs() < 1e-3);
++        // Dream Air SE (K10): ~5.5% nasal (-0.055), NOT -2.55!
++        assert!((lcx(&cfg(0.036629625, 0.0183148125, 0.0521836, 0.0694984125, 270)) - (-0.0546)).abs() < 1e-3);
++        // Dream Air (K11): rotated non-square panel -> post-rot h_size=0.04838 -> ~2.5% nasal (-0.025)
++        assert!((lcx(&cfg(0.04476, 0.02419, 0.0521836, 0.07577, 90)) - (-0.0250)).abs() < 1e-3);
++        // Crystal Super Micro-OLED: rotated non-square panel -> post-rot h_size=0.04838 -> ~3.3% nasal (-0.033)
++        assert!((lcx(&cfg(0.04476, 0.02419, 0.0521836, 0.0755736, 90)) - (-0.0331)).abs() < 1e-3);
++    }
++}
+-- 
+2.56.0
+
