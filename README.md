@@ -1,3 +1,7 @@
+**Forword:**
+
+**Hello! Please go and say a big thank you to everyone who is involded in Monado, Ultradevs Basalt and Envision. Without their groundwork slopviber like me couldnt do things like these. The second their Work is at the same feature list as this the "Fork" will be closed.**
+
 # p3cExtended
 
 Run the **Pimax Crystal Super** VR headset on Linux, natively on Wayland, without proprietary software.
